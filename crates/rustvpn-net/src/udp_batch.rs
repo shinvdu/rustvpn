@@ -68,7 +68,7 @@ unsafe fn recv_sys(
         socket.as_raw_fd(),
         msgvec.as_mut_ptr(),
         count as u32,
-        libc::MSG_TRUNC,
+        libc::MSG_TRUNC as _,
         std::ptr::null_mut(),
     );
     if ret < 0 {
