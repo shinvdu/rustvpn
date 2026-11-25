@@ -59,8 +59,7 @@ The wire format is covered by byte-exact handshake/transport vectors
 regardless.
 
 Not implemented yet: portability packaging for FreeBSD/macOS (only Linux
-has been exercised), automatic effective-MTU handling for TAP interfaces,
-and per-source handshake rate limiting.
+has been exercised) and automatic effective-MTU handling for TAP interfaces.
 
 ## Quick start
 
