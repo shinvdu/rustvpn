@@ -4,6 +4,7 @@
 //! `P2 = BLAKE2b(P1) XOR r`.
 
 use subtle::ConstantTimeEq;
+use zeroize::Zeroizing;
 
 use crate::blake2b::{hash, hash_parts, Hasher};
 use crate::salsa::salsa20_xor;
@@ -24,7 +25,7 @@ pub fn encode(r: &[u8; R_SIZE], input: &[u8]) -> Result<Vec<u8>, CryptoError> {
     };
     out[input.len()..input.len() + H_SIZE].copy_from_slice(&checksum);
 
-    let mut salsa_key = [0u8; 32];
+    let mut salsa_key = Zeroizing::new([0u8; 32]);
     salsa_key[..R_SIZE].copy_from_slice(r);
     let zero_nonce = [0u8; 8];
     salsa20_xor(&salsa_key, &zero_nonce, &mut out);
@@ -40,7 +41,7 @@ pub fn decode(input: &[u8]) -> Result<Vec<u8>, CryptoError> {
     if input.len() < H_SIZE + R_SIZE {
         return Err(CryptoError::TooShort);
     }
-    let mut salsa_key = [0u8; 32];
+    let mut salsa_key = Zeroizing::new([0u8; 32]);
     let h = hash(&input[..input.len() - R_SIZE]);
     let tail = &input[input.len() - R_SIZE..];
     for i in 0..R_SIZE {
@@ -65,7 +66,7 @@ pub fn decode_parts(first: &[u8], second: &[u8]) -> Result<Vec<u8>, CryptoError>
     if first.len() + second.len() < H_SIZE + R_SIZE || second.len() < R_SIZE {
         return Err(CryptoError::TooShort);
     }
-    let mut salsa_key = [0u8; 32];
+    let mut salsa_key = Zeroizing::new([0u8; 32]);
     let digest = hash_parts(&[first, &second[..second.len() - R_SIZE]]);
     let tail = &second[second.len() - R_SIZE..];
     for i in 0..R_SIZE {

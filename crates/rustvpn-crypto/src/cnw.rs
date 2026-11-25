@@ -14,7 +14,7 @@
 //! ```
 
 use subtle::ConstantTimeEq;
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::salsa;
 use crate::salsa::hsalsa20;
@@ -123,7 +123,7 @@ pub fn chaff(auth_key: &[u8; 32], nonce_prfx: &[u8; 8], input: &[u8]) -> Vec<u8>
 
 pub fn chaff_into(auth_key: &[u8; 32], nonce_prfx: &[u8; 8], input: &[u8], out: &mut [u8]) {
     assert_eq!(out.len(), input.len() * ENLARGE_FACTOR);
-    let subkey = subkey_for(auth_key, nonce_prfx);
+    let subkey = Zeroizing::new(subkey_for(auth_key, nonce_prfx));
     let mut n = 0;
     while n + 8 <= input.len() {
         let mut nonces = [[0u8; 8]; 8];
@@ -145,8 +145,6 @@ pub fn chaff_into(auth_key: &[u8; 32], nonce_prfx: &[u8; 8], input: &[u8], out: 
         keys.zeroize();
         n += 1;
     }
-    let mut subkey = subkey;
-    subkey.zeroize();
 }
 
 fn chaff_byte(keys: &[u8; 512], b: u8, n: usize, out: &mut [u8]) {
@@ -191,7 +189,7 @@ pub fn winnow_into(
     if input.len() % ENLARGE_FACTOR != 0 || out.len() != input.len() / ENLARGE_FACTOR {
         return Err(CryptoError::TooShort);
     }
-    let subkey = subkey_for(auth_key, nonce_prfx);
+    let subkey = Zeroizing::new(subkey_for(auth_key, nonce_prfx));
     let mut n = 0;
     while n + 8 <= out.len() {
         let mut nonces = [[0u8; 8]; 8];
@@ -222,8 +220,6 @@ pub fn winnow_into(
         out[n] = result?;
         n += 1;
     }
-    let mut subkey = subkey;
-    subkey.zeroize();
     Ok(())
 }
 

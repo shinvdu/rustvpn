@@ -11,6 +11,7 @@ use chrono::{DateTime, Utc};
 use serde::Serialize;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Semaphore;
 
 struct Times {
     established: SystemTime,
@@ -220,11 +221,19 @@ impl StatsState {
 }
 
 pub async fn stats_listener(listener: TcpListener, state: Arc<StatsState>) {
+    // Bound concurrent stats handlers so a reachable stats port cannot
+    // exhaust tasks/fds with idle connections.
+    let limit = Arc::new(Semaphore::new(32));
     loop {
         match listener.accept().await {
             Ok((conn, _)) => {
+                let Ok(permit) = limit.clone().try_acquire_owned() else {
+                    drop(conn);
+                    continue;
+                };
                 let state = state.clone();
                 tokio::spawn(async move {
+                    let _permit = permit;
                     let _ = handle_stats(conn, state).await;
                 });
             }

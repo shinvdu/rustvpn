@@ -3,12 +3,28 @@
 //! 64 rounds, 128-bit key, big-endian block encoding.  Used only as a
 //! pseudo-random permutation for transport serial numbers.
 
+use std::fmt;
+
+use zeroize::Zeroize;
+
 const DELTA: u32 = 0x9E37_79B9;
 const ROUNDS: usize = 64;
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Xtea {
     table: [u32; ROUNDS],
+}
+
+impl fmt::Debug for Xtea {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Xtea(<redacted>)")
+    }
+}
+
+impl Drop for Xtea {
+    fn drop(&mut self) {
+        self.table.zeroize();
+    }
 }
 
 impl Xtea {

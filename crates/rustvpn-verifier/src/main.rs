@@ -156,7 +156,12 @@ fn main() {
             eprintln!("Unable to apply passphrase: {e}");
             process::exit(1);
         });
-        println!("{}", verifier.public == Some(public));
+        if verifier.public == Some(public) {
+            println!("true");
+        } else {
+            println!("false");
+            process::exit(1);
+        }
         return;
     }
 

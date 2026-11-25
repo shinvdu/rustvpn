@@ -41,6 +41,8 @@ pub enum HandshakeError {
     Mismatch,
     #[error("no signing key for client handshake")]
     MissingSigningKey,
+    #[error("invalid (low-order) DH point")]
+    InvalidDh,
 }
 
 #[derive(Clone, Debug)]
@@ -121,10 +123,16 @@ fn dh_keypair_gen<R: RngCore + ?Sized>(rng: &mut R) -> ([u8; 32], [u8; 32]) {
     }
 }
 
-fn dh_key_gen(private: &[u8; 32], peer_repr: &[u8; 32]) -> [u8; 32] {
+/// Derive the handshake key from a peer representative.  Low-order points
+/// (order 1/2/4/8) collapse to the all-zero shared secret after clamping,
+/// which would make the derived key a public constant; reject them.
+fn dh_key_gen(private: &[u8; 32], peer_repr: &[u8; 32]) -> Result<[u8; 32], HandshakeError> {
     let public = elligator::representative_to_public_key(peer_repr);
     let shared = MontgomeryPoint(public).mul_clamped(*private).to_bytes();
-    blake2b::hash(&shared)
+    if shared.ct_eq(&[0u8; 32]).unwrap_u8() == 1 {
+        return Err(HandshakeError::InvalidDh);
+    }
+    Ok(blake2b::hash(&shared))
 }
 
 fn r_nonce_next(r_nonce: &[u8; R_SIZE], count: u64) -> [u8; R_SIZE] {
@@ -330,7 +338,7 @@ impl ClientHandshake {
             salsa::salsa20_xor(&self.dsa_pub_h, &nonce1, &mut repr);
             repr
         };
-        let key = dh_key_gen(&self.dh_private, &sdh_repr);
+        let key = dh_key_gen(&self.dh_private, &sdh_repr)?;
         self.key = Some(key);
 
         // RS + SS
@@ -481,7 +489,7 @@ impl ServerHandshake {
 
         let (dh_private, repr) = dh_keypair_gen(rng);
         self.dh_private = dh_private;
-        self.key = dh_key_gen(&dh_private, &c_repr);
+        self.key = dh_key_gen(&dh_private, &c_repr)?;
         let nonce1 = r_nonce_next(&self.r_nonce, 1);
         // Go encodes encPub (which consumes AONT randomness in encless
         // mode) before generating R* and S*.
@@ -581,5 +589,93 @@ impl ServerHandshake {
             reply: out,
             session_key,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rand_core::OsRng;
+
+    const U1_REPR: [u8; 32] = [
+        0x1f, 0xc6, 0x93, 0xab, 0xdb, 0x36, 0xb8, 0x2d, 0xfb, 0x20, 0xd7, 0x82, 0xd3, 0xa3, 0xe4,
+        0x0b, 0xe2, 0x44, 0xa8, 0xe7, 0xc5, 0x2a, 0x45, 0xeb, 0xd3, 0xdc, 0x2c, 0xac, 0xae, 0x51,
+        0x5f, 0x62,
+    ];
+
+    fn signing_key(seed: u8) -> SigningKey {
+        let mut s = [0u8; 32];
+        for (i, b) in s.iter_mut().enumerate() {
+            *b = seed.wrapping_add(i as u8);
+        }
+        SigningKey::from_bytes(&s)
+    }
+
+    fn configs() -> (HandshakeConfig, HandshakeConfig) {
+        let sk = signing_key(1);
+        let vk = sk.verifying_key().to_bytes();
+        (
+            HandshakeConfig::client([9u8; ID_SIZE], 1515, false, false, 0, sk),
+            HandshakeConfig::server([9u8; ID_SIZE], 1515, false, false, 0, vk),
+        )
+    }
+
+    #[test]
+    fn dh_key_gen_rejects_low_order_representatives() {
+        let mut private = [0u8; 32];
+        for (i, b) in private.iter_mut().enumerate() {
+            *b = (i as u8).wrapping_mul(7).wrapping_add(1);
+        }
+        for repr in [[0u8; 32], U1_REPR] {
+            assert_eq!(
+                dh_key_gen(&private, &repr),
+                Err(HandshakeError::InvalidDh),
+                "low-order repr accepted: {repr:02x?}"
+            );
+        }
+        let (private, repr) = dh_keypair_gen(&mut OsRng);
+        assert!(dh_key_gen(&private, &repr).is_ok());
+    }
+
+    #[test]
+    fn client_rejects_low_order_server_repr() {
+        let (client_cfg, _) = configs();
+        let dsa_pub_h = client_cfg.dsa_pub_h();
+        let mut rng = OsRng;
+        let (mut hs, _msg1) = ClientHandshake::start(client_cfg, &mut rng).unwrap();
+        let nonce1 = r_nonce_next(&hs.r_nonce, 1);
+        for repr0 in [[0u8; 32], U1_REPR] {
+            let mut repr = repr0;
+            salsa::salsa20_xor(&dsa_pub_h, &nonce1, &mut repr);
+            let mut msg = Vec::with_capacity(80);
+            msg.extend_from_slice(&repr);
+            msg.extend_from_slice(&[0u8; 48]);
+            assert!(matches!(
+                hs.client(&msg, &mut rng),
+                Err(HandshakeError::InvalidDh)
+            ));
+        }
+    }
+
+    #[test]
+    fn server_rejects_low_order_client_repr() {
+        let (_, server_cfg) = configs();
+        let dsa_pub_h = server_cfg.dsa_pub_h();
+        let id = server_cfg.id;
+        let mut rng = OsRng;
+        let r_nonce = [7u8; R_SIZE];
+        for repr0 in [[0u8; 32], U1_REPR] {
+            let mut repr = repr0;
+            salsa::salsa20_xor(&dsa_pub_h, &r_nonce, &mut repr);
+            let mut msg = Vec::with_capacity(48);
+            msg.extend_from_slice(&r_nonce);
+            msg.extend_from_slice(&repr);
+            msg.extend_from_slice(&id_tag(&id, 0, &r_nonce));
+            let mut hs = ServerHandshake::new(server_cfg.clone());
+            assert!(matches!(
+                hs.server(&msg, &mut rng),
+                Err(HandshakeError::InvalidDh)
+            ));
+        }
     }
 }

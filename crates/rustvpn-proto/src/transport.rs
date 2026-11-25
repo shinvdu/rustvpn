@@ -16,11 +16,14 @@
 //! ENCLESS(AONT(PAYLOAD || 0x80 || ZEROS)) || PRP(SERIAL)(8)
 //! ```
 
+use std::fmt;
+
 use rustvpn_crypto::encless::{self, ENCLESS_ENLARGE_SIZE, MIN_ENCODED_SIZE};
 use rustvpn_crypto::{poly1305, salsa, xtea::Xtea};
 use thiserror::Error;
+use zeroize::Zeroize;
 
-use crate::{MIN_PKT_LENGTH, NONCE_SIZE, PAD_BYTE, S20_BS, TAG_SIZE};
+use crate::{MIN_PKT_LENGTH, MTU_MIN, MTU_MIN_NOISE, NONCE_SIZE, PAD_BYTE, S20_BS, TAG_SIZE};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Mode {
@@ -41,6 +44,14 @@ impl Mode {
             Mode::Plain => mtu.saturating_sub(1),
             Mode::Noise => mtu.saturating_sub(TAG_SIZE + NONCE_SIZE + 1),
             Mode::Encless => mtu.saturating_sub(NONCE_SIZE + 1),
+        }
+    }
+
+    /// Smallest accepted configured MTU for this mode.
+    pub fn min_mtu(self) -> usize {
+        match self {
+            Mode::Plain => MTU_MIN,
+            Mode::Noise | Mode::Encless => MTU_MIN_NOISE,
         }
     }
 
@@ -73,6 +84,8 @@ pub enum TransportError {
     Padding,
     #[error("replayed or out-of-window serial")]
     Replay,
+    #[error("configured MTU is too small for this mode")]
+    BadMtu,
 }
 
 /// The 257-bit sliding replay window used for UDP.
@@ -141,13 +154,27 @@ impl ReplayWindow {
     }
 }
 
-#[derive(Clone, Debug)]
 pub struct Session {
     key: [u8; 32],
     prp: Xtea,
     serial: u64,
     expect: u64,
     window: ReplayWindow,
+}
+
+impl fmt::Debug for Session {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Session")
+            .field("serial", &self.serial)
+            .field("expect", &self.expect)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        self.key.zeroize();
+    }
 }
 
 impl Session {
@@ -190,6 +217,9 @@ impl Session {
         out: &mut Vec<u8>,
         scratch: &mut Vec<u8>,
     ) -> Result<(), TransportError> {
+        if mtu < mode.min_mtu() {
+            return Err(TransportError::BadMtu);
+        }
         if payload.len() > mode.max_payload(mtu) {
             return Err(TransportError::TooLarge);
         }
@@ -239,6 +269,7 @@ impl Session {
         out.extend_from_slice(&scratch[S20_BS..]);
         out.extend_from_slice(&nonce_ct);
         let tag = poly1305::tag(&auth_key, &out[TAG_SIZE..]);
+        auth_key.zeroize();
         out[..TAG_SIZE].copy_from_slice(&tag);
         Ok(())
     }
@@ -268,6 +299,9 @@ impl Session {
         out: &mut Vec<u8>,
         scratch: &mut Vec<u8>,
     ) -> Result<(), TransportError> {
+        if mtu < mode.min_mtu() {
+            return Err(TransportError::BadMtu);
+        }
         if packet.len() < MIN_PKT_LENGTH {
             return Err(TransportError::TooShort);
         }
@@ -310,7 +344,9 @@ impl Session {
 
         let mut auth_key = [0u8; 32];
         auth_key.copy_from_slice(&scratch[..32]);
-        if !poly1305::verify(&auth_key, frame, &tag) {
+        let ok = poly1305::verify(&auth_key, frame, &tag);
+        auth_key.zeroize();
+        if !ok {
             return Err(TransportError::Authenticator);
         }
 
@@ -352,6 +388,7 @@ fn split_padding_len(frame: &[u8]) -> Option<usize> {
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
 
@@ -426,6 +463,29 @@ mod tests {
     }
 
     #[test]
+    fn small_mtu_rejected() {
+        let key = [31u8; 32];
+        let mut enc = Session::new(key, true);
+        let mut dec = Session::new(key, false);
+        for (mode, mtu) in [
+            (Mode::Plain, MTU_MIN - 1),
+            (Mode::Noise, MTU_MIN_NOISE - 1),
+            (Mode::Encless, MTU_MIN_NOISE - 1),
+        ] {
+            assert_eq!(
+                enc.encode(&[], mode, mtu),
+                Err(TransportError::BadMtu),
+                "encode {mode:?}"
+            );
+            assert_eq!(
+                dec.decode(&[0u8; 64], mode, mtu, Ordering::Reorderable),
+                Err(TransportError::BadMtu),
+                "decode {mode:?}"
+            );
+        }
+    }
+
+    #[test]
     fn in_place_matches_allocating() {
         let key = [21u8; 32];
         let mut enc_ref = Session::new(key, true);
@@ -485,9 +545,14 @@ mod tests {
 }
 
 /// One direction of a transport session (TAP -> network).
-#[derive(Clone, Debug)]
 pub struct Encoder {
     inner: Session,
+}
+
+impl fmt::Debug for Encoder {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Encoder").finish_non_exhaustive()
+    }
 }
 
 impl Encoder {
@@ -524,9 +589,14 @@ impl Encoder {
 }
 
 /// The other direction of a transport session (network -> TAP).
-#[derive(Clone, Debug)]
 pub struct Decoder {
     inner: Session,
+}
+
+impl fmt::Debug for Decoder {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Decoder").finish_non_exhaustive()
+    }
 }
 
 impl Decoder {

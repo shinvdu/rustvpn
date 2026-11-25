@@ -8,6 +8,8 @@ use salsa20::cipher::generic_array::GenericArray;
 use salsa20::cipher::{KeyIvInit, StreamCipher, StreamCipherSeek};
 use salsa20::Salsa20;
 
+use zeroize::Zeroizing;
+
 use crate::salsa_simd;
 
 fn scalar_salsa20_xor(key: &[u8; 32], nonce: &[u8; 8], data: &mut [u8], offset: usize) {
@@ -39,7 +41,7 @@ pub fn xsalsa20_xor(key: &[u8; 32], nonce: &[u8; 24], data: &mut [u8]) {
     // XSalsa20 = HSalsa20(first 16 nonce bytes) + Salsa20(last 8 bytes).
     let mut hnonce = [0u8; 16];
     hnonce.copy_from_slice(&nonce[..16]);
-    let subkey = hsalsa20(key, &hnonce);
+    let subkey = Zeroizing::new(hsalsa20(key, &hnonce));
     let mut n8 = [0u8; 8];
     n8.copy_from_slice(&nonce[16..24]);
     salsa20_xor(&subkey, &n8, data);

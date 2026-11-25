@@ -81,6 +81,7 @@ impl PeerConfig {
 }
 
 #[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 struct YamlPeer {
     #[serde(default)]
     iface: String,
@@ -112,12 +113,27 @@ pub struct ConfigSet {
 impl ConfigSet {
     pub fn from_peers(peers: Vec<PeerConfig>) -> Result<Self> {
         let mut by_id = HashMap::new();
+        let mut out = Vec::with_capacity(peers.len());
+        let mut ifaces: HashMap<String, String> = HashMap::new();
         for p in peers {
             let p = Arc::new(p);
+            if by_id.contains_key(&p.id) {
+                return Err(anyhow!("duplicate peer verifier id for {}", p.name));
+            }
+            if !p.iface.is_empty() {
+                if let Some(other) = ifaces.insert(p.iface.clone(), p.name.clone()) {
+                    return Err(anyhow!(
+                        "peers {} and {} share interface {}; one TAP per peer is required",
+                        other,
+                        p.name,
+                        p.iface
+                    ));
+                }
+            }
             by_id.insert(p.id, p.clone());
+            out.push(p);
         }
-        let peers = by_id.values().cloned().collect();
-        Ok(Self { peers, by_id })
+        Ok(Self { peers: out, by_id })
     }
 
     pub fn from_file(path: &Path) -> Result<Self> {
@@ -131,6 +147,12 @@ impl ConfigSet {
                 .map_err(|e| anyhow!("{name}: invalid verifier: {e}"))?;
             if verifier.public.is_none() {
                 return Err(anyhow!("{name}: server verifier has no public key"));
+            }
+            if y.iface.is_empty() && y.up.is_empty() {
+                return Err(anyhow!("{name}: either iface or up script is required"));
+            }
+            if y.timesync < 0 {
+                return Err(anyhow!("{name}: timesync must not be negative"));
             }
             let mut mtu = if y.mtu == 0 { MTU_DEFAULT } else { y.mtu };
             mtu = mtu.clamp(MTU_MIN, MTU_MAX);
@@ -235,6 +257,51 @@ mod tests {
         assert_eq!(found.id, id);
         data[0] ^= 0xff;
         assert!(set.find_identity(&data).is_none());
+    }
+
+    #[test]
+    fn rejects_unknown_fields() {
+        let id = [3u8; 16];
+        let mut verifier = Verifier::new(1, 1, 1, id);
+        verifier.public = Some([0x33u8; 32]);
+        let long = verifier.long_form().unwrap();
+        let path =
+            std::env::temp_dir().join(format!("rustvpn-unknown-{}.yaml", std::process::id()));
+        std::fs::write(
+            &path,
+            format!("peer:\n  iface: tap1\n  verifier: {long}\n  bogus: 1\n"),
+        )
+        .unwrap();
+        assert!(ConfigSet::from_file(&path).is_err());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn rejects_duplicate_ids_and_shared_iface() {
+        let id = [4u8; 16];
+        let a = peer(id);
+        let mut b = peer(id);
+        b.name = "b".into();
+        assert!(ConfigSet::from_peers(vec![a, b]).is_err());
+
+        let mut a = peer([5u8; 16]);
+        a.iface = "tap7".into();
+        let mut b = peer([6u8; 16]);
+        b.iface = "tap7".into();
+        assert!(ConfigSet::from_peers(vec![a, b]).is_err());
+    }
+
+    #[test]
+    fn rejects_missing_iface_and_up() {
+        let id = [7u8; 16];
+        let mut verifier = Verifier::new(1, 1, 1, id);
+        verifier.public = Some([0x44u8; 32]);
+        let long = verifier.long_form().unwrap();
+        let path =
+            std::env::temp_dir().join(format!("rustvpn-noiface-{}.yaml", std::process::id()));
+        std::fs::write(&path, format!("peer:\n  verifier: {long}\n")).unwrap();
+        assert!(ConfigSet::from_file(&path).is_err());
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

@@ -68,18 +68,18 @@ unsafe fn recv_sys(
         socket.as_raw_fd(),
         msgvec.as_mut_ptr(),
         count as u32,
-        0,
+        libc::MSG_TRUNC,
         std::ptr::null_mut(),
     );
     if ret < 0 {
         return Err(std::io::Error::last_os_error());
     }
     for i in 0..ret as usize {
-        // A datagram larger than its buffer is reported at full length
-        // with MSG_TRUNC; clamp instead of letting the caller slice out
-        // of bounds.
-        let len = (msgvec[i].msg_len as usize).min(bufs[i].len());
-        lens[i] = len;
+        // With MSG_TRUNC the kernel reports the full datagram length even
+        // when it did not fit; drop truncated packets instead of decoding
+        // a prefix that can only fail authentication.
+        let len = msgvec[i].msg_len as usize;
+        lens[i] = if len > bufs[i].len() { 0 } else { len };
         addrs[i] = sockaddr_to_socketaddr(&storages[i])
             .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::InvalidData))?;
     }
@@ -278,6 +278,45 @@ pub fn spawn_udp_batcher(socket: Arc<UdpSocket>) -> UdpBatchSender {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn oversized_datagram_is_dropped() {
+        let rx = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let tx = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let dest = rx.local_addr().unwrap();
+
+        let big = vec![0u8; 3000];
+        assert_eq!(send_batch(&tx, &[big], &[dest]).await.unwrap(), 1);
+
+        let mut bufs: Vec<Vec<u8>> = (0..4).map(|_| vec![0u8; 128]).collect();
+        let mut lens = vec![0usize; 4];
+        let mut from = vec![SocketAddr::from(([0, 0, 0, 0], 0)); 4];
+        let n = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            recv_batch(&rx, &mut bufs, &mut lens, &mut from),
+        )
+        .await
+        .expect("recv timed out")
+        .unwrap();
+        assert!(n >= 1);
+        assert_eq!(lens[0], 0, "truncated datagram must be marked dropped");
+
+        let small = b"ok".to_vec();
+        assert_eq!(send_batch(&tx, &[small], &[dest]).await.unwrap(), 1);
+        loop {
+            let n = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                recv_batch(&rx, &mut bufs, &mut lens, &mut from),
+            )
+            .await
+            .expect("recv timed out")
+            .unwrap();
+            if n > 0 && lens[0] > 0 {
+                assert_eq!(&bufs[0][..lens[0]], b"ok");
+                break;
+            }
+        }
+    }
 
     #[tokio::test]
     async fn loopback_batch_roundtrip() {

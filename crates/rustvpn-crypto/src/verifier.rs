@@ -12,6 +12,10 @@ use ed25519_dalek::SigningKey;
 use crate::CryptoError;
 
 pub const ID_SIZE: usize = 16;
+/// Upper bounds accepted for Argon2 parameters (KiB / iterations / lanes).
+pub const MAX_M: u32 = 262_144;
+pub const MAX_T: u32 = 4096;
+pub const MAX_P: u32 = 64;
 pub const DEFAULT_M: u32 = 1 << 12;
 pub const DEFAULT_T: u32 = 1 << 7;
 pub const DEFAULT_P: u32 = 1;
@@ -39,6 +43,12 @@ impl Verifier {
     /// Derive the Ed25519 key pair from the passphrase.  The 32-byte
     /// Argon2d output is the Ed25519 seed.
     pub fn password_apply(&mut self, password: &str) -> Result<SigningKey, CryptoError> {
+        if !(1..=MAX_M).contains(&self.m)
+            || !(1..=MAX_T).contains(&self.t)
+            || !(1..=MAX_P).contains(&self.p)
+        {
+            return Err(CryptoError::Argon2("parameters out of range".into()));
+        }
         let params = Params::new(self.m, self.t, self.p, Some(32))
             .map_err(|e| CryptoError::Argon2(e.to_string()))?;
         let argon = Argon2::new(Algorithm::Argon2d, Version::V0x13, params);
@@ -71,7 +81,7 @@ impl Verifier {
                 _ => return Err(CryptoError::InvalidVerifier),
             }
         }
-        if m == 0 || t == 0 || p == 0 {
+        if !(1..=MAX_M).contains(&m) || !(1..=MAX_T).contains(&t) || !(1..=MAX_P).contains(&p) {
             return Err(CryptoError::InvalidVerifier);
         }
         let salt = STANDARD_NO_PAD
@@ -120,6 +130,15 @@ impl Verifier {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejects_out_of_range_params() {
+        // m = 2^32-1 would request terabytes of Argon2 memory.
+        let bad = "$argon2d$m=4294967295,t=1,p=1$AAAAAAAAAAAAAAAAAAAAAA";
+        assert!(Verifier::from_string(bad).is_err());
+        let mut v = Verifier::new(1_000_000, 1, 1, [1u8; 16]);
+        assert!(v.password_apply("x").is_err());
+    }
 
     #[test]
     fn verifier_form_roundtrip() {

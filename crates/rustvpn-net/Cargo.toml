@@ -23,6 +23,7 @@ rand_core = { workspace = true }
 getrandom = { workspace = true }
 ed25519-dalek = { workspace = true }
 subtle = { workspace = true }
+zeroize = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = "0.7"

@@ -12,6 +12,7 @@ use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio::time::{Duration, MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
+use zeroize::Zeroizing;
 
 use crate::config::PeerConfig;
 use crate::stats::LiveStats;
@@ -30,6 +31,8 @@ pub enum PeerEvent {
     Timeout,
     Rehandshake,
     TcpClosed,
+    /// The TAP backend failed fatally (io_uring/ring death, ENODEV, ...).
+    TapClosed,
 }
 
 pub enum WireWriter {
@@ -202,6 +205,7 @@ async fn tap_reader_task(
     cfg: Arc<PeerConfig>,
     outbound: mpsc::Sender<Outbound>,
     cancel: CancellationToken,
+    events: mpsc::Sender<PeerEvent>,
 ) {
     let mut buf = vec![0u8; cfg.mtu.max(1)];
     loop {
@@ -212,6 +216,17 @@ async fn tap_reader_task(
                     Ok(n) => n,
                     Err(e) => {
                         eprintln!("TAP read failed: {e}");
+                        // A broken/closed TAP backend never recovers; tell
+                        // the peer/session instead of faking liveness.
+                        if !matches!(
+                            e.kind(),
+                            std::io::ErrorKind::WouldBlock
+                                | std::io::ErrorKind::Interrupted
+                                | std::io::ErrorKind::TimedOut
+                        ) {
+                            event(&events, PeerEvent::TapClosed);
+                            break;
+                        }
                         tokio::time::sleep(Duration::from_secs(1)).await;
                         continue;
                     }
@@ -255,8 +270,8 @@ async fn udp_receiver_task(
     client: bool,
 ) {
     let mut rekey = false;
-    let mut payload: Vec<u8> = Vec::new();
-    let mut scratch: Vec<u8> = Vec::new();
+    let mut payload: Zeroizing<Vec<u8>> = Zeroizing::new(Vec::new());
+    let mut scratch: Zeroizing<Vec<u8>> = Zeroizing::new(Vec::new());
     loop {
         tokio::select! {
             _ = cancel.cancelled() => break,
@@ -309,8 +324,8 @@ async fn tcp_receiver_task(
 ) {
     let mut buf: Vec<u8> = Vec::with_capacity(64 * 1024);
     let max_buf = 4 * cfg.mtu + 2 * rustvpn_proto::ENCLESS_ENLARGE_SIZE + 64;
-    let mut payload: Vec<u8> = Vec::new();
-    let mut scratch: Vec<u8> = Vec::new();
+    let mut payload: Zeroizing<Vec<u8>> = Zeroizing::new(Vec::new());
+    let mut scratch: Zeroizing<Vec<u8>> = Zeroizing::new(Vec::new());
     loop {
         tokio::select! {
             _ = cancel.cancelled() => break,
@@ -429,6 +444,7 @@ pub fn spawn_udp_peer(
         cfg.clone(),
         outbound_tx.clone(),
         cancel.clone(),
+        events_tx.clone(),
     ));
     tokio::spawn(udp_receiver_task(
         Decoder::new(key, is_client),
@@ -477,6 +493,7 @@ pub fn spawn_tcp(
         cfg.clone(),
         outbound_tx.clone(),
         cancel.clone(),
+        events_tx.clone(),
     ));
     tokio::spawn(tcp_receiver_task(
         Decoder::new(key, is_client),
@@ -527,6 +544,9 @@ pub fn spawn_udp_dispatch(
                     match r {
                         Ok(n) => {
                             for i in 0..n {
+                                if lens[i] == 0 {
+                                    continue;
+                                }
                                 if inbound.try_send(bufs[i][..lens[i]].to_vec()).is_err() {
                                     // bounded queue: drop under overload
                                 }

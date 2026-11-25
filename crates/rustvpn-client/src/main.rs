@@ -3,7 +3,7 @@
 use std::net::SocketAddr;
 use std::process;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use rand_core::{OsRng, RngCore};
@@ -20,6 +20,7 @@ use rustvpn_proto::{
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
+use tokio_util::sync::CancellationToken;
 
 const WARRANTY: &str = "This program is free software: you can redistribute it and/or modify
 it under the terms of the GNU General Public License as published by
@@ -311,26 +312,35 @@ async fn handshake_udp(
     let (mut hs, msg1) = ClientHandshake::start(hcfg, rng)?;
     socket.send(&msg1).await?;
     let mut buf = vec![0u8; ENCLESS_ENLARGE_SIZE + MTU_MAX + 64];
-    let mut timeouts = 0u64;
+    // Bound the handshake so a lost packet leads to a fresh attempt instead
+    // of a full `timeout` (60 s) outage.  Retransmit the last flight with
+    // exponential backoff in the meantime.
+    let deadline = Instant::now()
+        + cfg
+            .timeout
+            .min(Duration::from_secs(10))
+            .max(Duration::from_secs(3));
+    let mut last = msg1;
+    let mut wait = Duration::from_secs(1);
     loop {
-        let recv = tokio::time::timeout(Duration::from_secs(1), socket.recv(&mut buf)).await;
+        let recv = tokio::time::timeout(wait, socket.recv(&mut buf)).await;
         match recv {
             Err(_) => {
-                timeouts += 1;
-                if timeouts >= cfg.timeout.as_secs().max(1) {
+                if Instant::now() >= deadline {
                     return Err(anyhow!("handshake timeout"));
                 }
+                socket.send(&last).await?;
+                wait = (wait * 2).min(Duration::from_secs(5));
             }
             Ok(Err(e)) => return Err(e.into()),
-            Ok(Ok(n)) => {
-                timeouts = 0;
-                match hs.client(&buf[..n], rng)? {
-                    ClientOutput::Reply(m) => {
-                        socket.send(&m).await?;
-                    }
-                    ClientOutput::Complete(key) => return Ok(key),
+            Ok(Ok(n)) => match hs.client(&buf[..n], rng)? {
+                ClientOutput::Reply(m) => {
+                    last = m.clone();
+                    socket.send(&m).await?;
+                    wait = Duration::from_secs(1);
                 }
-            }
+                ClientOutput::Complete(key) => return Ok(key),
+            },
         }
     }
 }
@@ -427,6 +437,14 @@ async fn run(args: Args, proto: String) -> Result<()> {
     let proxy_auth = args.proxy_auth.clone();
     let egd = args.egd.clone();
     let mut first_up = true;
+    let shutdown = CancellationToken::new();
+    {
+        let shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            wait_signal().await;
+            shutdown.cancel();
+        });
+    }
     loop {
         let end = run_once(
             cfg.clone(),
@@ -439,6 +457,7 @@ async fn run(args: Args, proto: String) -> Result<()> {
             proxy_auth.clone(),
             egd.clone(),
             &mut first_up,
+            shutdown.clone(),
         )
         .await;
         match end {
@@ -468,6 +487,7 @@ async fn run_once(
     proxy_auth: String,
     egd: String,
     first_up: &mut bool,
+    shutdown: CancellationToken,
 ) -> Result<SessionEnd> {
     let addrs: Vec<SocketAddr> = tokio::net::lookup_host(&remote_str).await?.collect();
     let remote = *addrs.first().ok_or_else(|| anyhow!("no remote address"))?;
@@ -532,9 +552,11 @@ async fn run_once(
         ev = handle.events.recv() => match ev {
             Some(PeerEvent::Timeout) => SessionEnd::Timeout,
             Some(PeerEvent::Rehandshake) => SessionEnd::Rehandshake,
-            Some(PeerEvent::TcpClosed) | None => SessionEnd::TcpClosed,
+            Some(PeerEvent::TcpClosed) | Some(PeerEvent::TapClosed) | None => {
+                SessionEnd::TcpClosed
+            }
         },
-        _ = wait_signal() => SessionEnd::Terminated,
+        _ = shutdown.cancelled() => SessionEnd::Terminated,
     };
     handle.cancel.cancel();
     stats_state.remove(&addr);

@@ -3,6 +3,8 @@
 
 use crate::aont;
 use crate::cnw;
+use zeroize::Zeroizing;
+
 use crate::CryptoError;
 
 /// `aont.HSize + aont.RSize * cnw.EnlargeFactor`
@@ -43,9 +45,9 @@ pub fn decode(auth_key: &[u8; 32], nonce: &[u8; 8], input: &[u8]) -> Result<Vec<
         return Err(CryptoError::TooShort);
     }
     let chaff_len = aont::R_SIZE * cnw::ENLARGE_FACTOR;
-    let mut winnowed = [0u8; aont::R_SIZE];
-    cnw::winnow_into(auth_key, nonce, &input[..chaff_len], &mut winnowed)?;
-    aont::decode_parts(&winnowed, &input[chaff_len..])
+    let mut winnowed = Zeroizing::new([0u8; aont::R_SIZE]);
+    cnw::winnow_into(auth_key, nonce, &input[..chaff_len], &mut *winnowed)?;
+    aont::decode_parts(&winnowed[..], &input[chaff_len..])
 }
 
 #[cfg(test)]
