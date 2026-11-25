@@ -1,0 +1,19 @@
+[package]
+name = "rustvpn-server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "rustvpn-server"
+path = "src/main.rs"
+
+[dependencies]
+rustvpn-crypto = { path = "../rustvpn-crypto" }
+rustvpn-proto = { path = "../rustvpn-proto" }
+rustvpn-net = { path = "../rustvpn-net" }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+anyhow = { workspace = true }
+rand_core = { workspace = true }

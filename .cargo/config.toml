@@ -1,0 +1,15 @@
+# RustCrypto `poly1305` 0.8 auto-selects an AVX2 backend on x86-64.  On
+# this project's Zen3 target that backend is measurably slower than the
+# crate's software backend at every message size (about 2.5x at 798 B and
+# 4.5x at 64 B, including an ~850 ns per-message setup cost), while the
+# software backend is also constant time.  Pin the software backend until
+# the upstream AVX2 path is competitive.
+#
+# `--check-cfg` declares the cfg to every crate so the `unexpected_cfgs`
+# lint stays quiet.
+[build]
+rustflags = [
+    "--cfg",
+    "poly1305_force_soft",
+    "--check-cfg=cfg(poly1305_force_soft)",
+]

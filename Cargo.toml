@@ -1,12 +1,12 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/govpn-crypto",
-    "crates/govpn-proto",
-    "crates/govpn-verifier",
-    "crates/govpn-net",
-    "crates/govpn-server",
-    "crates/govpn-client",
+    "crates/rustvpn-crypto",
+    "crates/rustvpn-proto",
+    "crates/rustvpn-verifier",
+    "crates/rustvpn-net",
+    "crates/rustvpn-server",
+    "crates/rustvpn-client",
 ]
 
 [workspace.package]

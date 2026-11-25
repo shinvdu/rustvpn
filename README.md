@@ -1,36 +1,51 @@
-# GoVPN Rust rewrite
+# RustVPN
 
-This directory contains a wire-compatible GoVPN 5.7 implementation in
-Rust.  The original Go tree is intentionally untouched.
+RustVPN is a standalone, wire-compatible implementation of GoVPN 5.7 in
+Rust.  It interoperates with the upstream Go client/server in every
+transport mode, but lives in its own repository with its own crate and
+binary names; the original Go tree is not included or modified.
 
 ## Status
 
 Implemented and differentially tested against the Go 5.7 implementation:
 
-- `govpn-crypto`: XTEA, Salsa20/XSalsa20, Poly1305, BLAKE2b-256,
+- `rustvpn-crypto`: XTEA, Salsa20/XSalsa20, Poly1305, BLAKE2b-256,
   chaffing-and-winnowing with the specialised one-byte MAC, AONT,
   encless, Argon2d/Ed25519 verifier derivation, EGD reader, and an exact
   port of Go's extra25519 representative encoding.
-- `govpn-proto`: classic/noise/encless transport codec, 257-bit replay
+- `rustvpn-proto`: classic/noise/encless transport codec, 257-bit replay
   window, TCP exact-serial framing, and the complete PAKE handshake for
   client and server.
-- `govpn-verifier`: CLI-compatible verifier generator/validator, with
+- `rustvpn-verifier`: CLI-compatible verifier generator/validator, with
   EGD support.
-- `govpn-net`: TAP devices, YAML config + 60s hot reload, up/down
+- `rustvpn-net`: TAP devices, YAML config + 60s hot reload, up/down
   scripts, Go-compatible JSON stats, heartbeat/CPR pacing, peer timeout
   and rekey lifecycle.
-- `govpn-client` / `govpn-server`: UDP and TCP transports, HTTP CONNECT
-  proxy (both sides), noise and encless modes, stats endpoint, graceful
-  termination and down scripts.
+- `rustvpn-client` / `rustvpn-server`: UDP and TCP transports, HTTP
+  CONNECT proxy (both sides), noise and encless modes, stats endpoint,
+  graceful termination and down scripts.
+- Performance data path: `recvmmsg`/`sendmmsg` batching on the UDP
+  receive and send paths (64 datagrams per syscall, a single shared
+  batcher per socket), an io_uring TAP backend with an eventfd wakeup
+  (zero idle wakeups) and epoll fallback, and an AVX2 Salsa20 backend
+  with runtime dispatch (eight blocks, or eight independent CnW
+  keystreams, per core call).  The scalar RustCrypto path remains the
+  reference and is covered by differential tests.  The transport codec
+  also exposes `encode_into`/`decode_into`, which the peer path uses with
+  reused buffers for a zero-allocation steady state.  Poly1305 is pinned
+  to the RustCrypto software backend in `.cargo/config.toml` because the
+  crate's AVX2 backend is measurably slower on Zen3; see
+  `docs/performance-vs-go.md` for the same-machine Go-vs-Rust comparison
+  and the measurements behind that choice.
 
 Verified end-to-end against the Go binaries (loopback + TAP + network
 namespaces, ICMP through the tunnel):
 
 | Direction | UDP | TCP | Proxy | Noise | Encless |
 |---|---|---|---|---|---|
-| Rust client -> Go server | yes | yes | yes | (protocol bytes verified)* | (protocol bytes verified)* |
-| Go client -> Rust server | yes | yes | yes | yes | yes |
-| Rust client -> Rust server | yes | yes | yes | yes | yes |
+| RustVPN client -> GoVPN server | yes | yes | yes | (protocol bytes verified)* | (protocol bytes verified)* |
+| GoVPN client -> RustVPN server | yes | yes | yes | yes | yes |
+| RustVPN client -> RustVPN server | yes | yes | yes | yes | yes |
 
 \* In this environment Go's water TAP reader intermittently reports
 `not pollable`; the same Go server works when its TAP is pre-created.
@@ -40,8 +55,8 @@ tests regardless.
 Not implemented yet:
 
 - portability packaging for FreeBSD/macOS (the TUN crate supports them,
-  but only Linux has been exercised)
-- io_uring/batched syscalls, SIMD multi-buffer performance work
+  but only Linux has been exercised; set `GOVPN_IO_URING=0` to force the
+  epoll TAP backend)
 - automatic effective-MTU handling for TAP interfaces (currently the
   up script should set the interface MTU; noise/encless reduce payload
   capacity by 25/9 bytes)
@@ -53,21 +68,20 @@ Requirements: Rust >= 1.85, Linux `/dev/net/tun`, and root or
 `CAP_NET_ADMIN` for TAP creation.
 
 ```bash
-cd rust
 cargo build --release
-# binaries: target/release/govpn-{server,client,verifier}
+# binaries: target/release/rustvpn-{server,client,verifier}
 
 # verifier
-echo 'correct horse battery staple' > /tmp/govpn.pass
-target/release/govpn-verifier -key /tmp/govpn.pass
+echo 'correct horse battery staple' > /tmp/rustvpn.pass
+target/release/rustvpn-verifier -key /tmp/rustvpn.pass
 
 # server (peers.yaml uses the Go format; the long verifier above)
-target/release/govpn-server -proto udp -bind 0.0.0.0:1194 \
+target/release/rustvpn-server -proto udp -bind 0.0.0.0:1194 \
     -conf /tmp/peers.yaml -stats 127.0.0.1:1294
 
 # client (use the short verifier form)
-target/release/govpn-client -remote server:1194 -proto udp -iface tap0 \
-    -verifier '$argon2d$m=4096,t=128,p=1$...' -key /tmp/govpn.pass \
+target/release/rustvpn-client -remote server:1194 -proto udp -iface tap0 \
+    -verifier '$argon2d$m=4096,t=128,p=1$...' -key /tmp/rustvpn.pass \
     -up /path/to/up.sh -down /path/to/down.sh
 ```
 
@@ -90,11 +104,12 @@ environment; if `iface` is empty, the first line of the up script's
 stdout is used as the interface name.  Noisy/encless modes reduce the
 usable payload by 25/9 bytes, so the up script should set the TAP MTU
 accordingly (or the configured MTU should be increased).
+Environment variables keep the `GOVPN_` prefix so existing up/down
+scripts and deployment tooling remain compatible.
 
 ## Tests
 
 ```bash
-cd rust
 cargo test
 ```
 
@@ -111,40 +126,54 @@ implementation.  They verify:
 - TCP/UDP replay behaviour and roundtrips
 
 The handshake and Elligator/`extra25519` vectors are part of the
-differential tests as well.
+differential tests as well.  The performance modules have their own
+tests: AVX2 vs scalar keystream/multi-stream equivalence, a loopback
+`sendmmsg`/`recvmmsg` roundtrip, and an unprivileged socketpair
+roundtrip through the io_uring ring loop (skipped if io_uring is
+unavailable).
 
-## Regenerating the Go oracle vectors
-
-From the repository root (the Go source is only *read*, never modified):
+## Benchmarks
 
 ```bash
-GO111MODULE=off GOPATH=$(pwd) go run rust/tools/gen-vectors/main.go \
-    > rust/testdata/go_vectors.json
+cargo run --release -p rustvpn-crypto --example crypto_bench
+cargo run --release -p rustvpn-proto  --example proto_bench
+cargo run --release -p rustvpn-net    --example mmsg_bench
 ```
 
-The generator derives deterministic handshakes by replacing `govpn.Rand`
-with a SHA-256 based stream and reads the exported `Peer.Key` to capture
-transport packets.
+`crypto_bench` covers CnW/AONT/encless and the classic XTEA/Salsa20/
+Poly1305 components, `proto_bench` the transport codec (decode batches
+use increasing serials so the replay window is exercised), and
+`mmsg_bench` measures full 64-datagram `sendmmsg`+`recvmmsg` rounds over
+loopback.
+
+## Go oracle vectors
+
+`testdata/go_vectors.json` was generated from the upstream GoVPN 5.7
+tree using the vector generator shipped with that project.  The vectors
+are checked in so the Rust test suite is self-contained; running the
+generator requires the upstream Go source and is documented there.
 
 ## Verifier interoperability
 
 ```bash
-# Rust validates a Go-generated verifier:
-rust/target/debug/govpn-verifier -verifier "$LONG_FORM" -key pass.txt
+# RustVPN validates a GoVPN-generated verifier:
+target/debug/rustvpn-verifier -verifier "$LONG_FORM" -key pass.txt
 
-# Go validates a Rust-generated verifier:
-./govpn-verifier -verifier "$(rust/target/debug/govpn-verifier \
+# GoVPN validates a RustVPN-generated verifier:
+./govpn-verifier -verifier "$(target/debug/rustvpn-verifier \
     -key pass.txt -m 1024 -t 4 -p 1 | head -1)" -key pass.txt
 ```
 
 Both directions currently print `true`.
 
-## Design
+## Design and performance
 
-See `../docs/rust-rewrite-design.md` for the target architecture and
-`../docs/performance-optimization.md` for the Go-side measurements that
-motivate it.
+- `docs/design.md`: target architecture and design rationale.
+- `docs/upstream-go-performance.md`: Go-side optimisation record that
+  motivated the Rust data path.
+- `docs/performance-vs-go.md`: same-machine Go-vs-Rust measurements,
+  including the Poly1305 backend investigation.
 
 ## License
 
-GPL-3.0-or-later, matching the Go project.
+GPL-3.0-or-later, matching the Go project.  See `COPYING`.

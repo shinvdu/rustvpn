@@ -1,0 +1,28 @@
+[package]
+name = "rustvpn-net"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+rustvpn-crypto = { path = "../rustvpn-crypto" }
+rustvpn-proto = { path = "../rustvpn-proto" }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tun = { workspace = true }
+libc = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml_ng = { workspace = true }
+chrono = { workspace = true }
+base64 = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+rand_core = { workspace = true }
+getrandom = { workspace = true }
+ed25519-dalek = { workspace = true }
+subtle = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+io-uring = "0.7"

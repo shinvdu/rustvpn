@@ -464,108 +464,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "govpn-client"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "base64",
- "ed25519-dalek",
- "govpn-crypto",
- "govpn-net",
- "govpn-proto",
- "rand_core",
- "rpassword",
- "tokio",
- "tokio-util",
-]
-
-[[package]]
-name = "govpn-crypto"
-version = "0.1.0"
-dependencies = [
- "argon2",
- "base64",
- "blake2",
- "curve25519-dalek",
- "ed25519-dalek",
- "fiat-crypto 0.3.0",
- "getrandom",
- "hex",
- "poly1305",
- "rand_core",
- "salsa20",
- "serde",
- "serde_json",
- "subtle",
- "thiserror",
- "zeroize",
-]
-
-[[package]]
-name = "govpn-net"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "base64",
- "chrono",
- "ed25519-dalek",
- "getrandom",
- "govpn-crypto",
- "govpn-proto",
- "libc",
- "rand_core",
- "serde",
- "serde_json",
- "serde_yaml_ng",
- "subtle",
- "thiserror",
- "tokio",
- "tokio-util",
- "tun",
-]
-
-[[package]]
-name = "govpn-proto"
-version = "0.1.0"
-dependencies = [
- "curve25519-dalek",
- "ed25519-dalek",
- "govpn-crypto",
- "hex",
- "poly1305",
- "rand_core",
- "salsa20",
- "serde",
- "serde_json",
- "sha2",
- "subtle",
- "thiserror",
-]
-
-[[package]]
-name = "govpn-server"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "govpn-crypto",
- "govpn-net",
- "govpn-proto",
- "rand_core",
- "tokio",
- "tokio-util",
-]
-
-[[package]]
-name = "govpn-verifier"
-version = "0.1.0"
-dependencies = [
- "getrandom",
- "govpn-crypto",
- "rand_core",
- "rpassword",
-]
-
-[[package]]
 name = "hashbrown"
 version = "0.17.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -618,6 +516,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "879f10e63c20629ecabbb64a8010319738c66a5cd0c29b02d63d272b03751d01"
 dependencies = [
  "generic-array",
+]
+
+[[package]]
+name = "io-uring"
+version = "0.7.16"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "878c26bc5e45fe089ce2ca25689260c152a87ce1d7de2ca86101efeea6973932"
+dependencies = [
+ "bitflags",
+ "cfg-if",
+ "libc",
 ]
 
 [[package]]
@@ -826,6 +735,109 @@ name = "rustversion"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
+
+[[package]]
+name = "rustvpn-client"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64",
+ "ed25519-dalek",
+ "rand_core",
+ "rpassword",
+ "rustvpn-crypto",
+ "rustvpn-net",
+ "rustvpn-proto",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
+name = "rustvpn-crypto"
+version = "0.1.0"
+dependencies = [
+ "argon2",
+ "base64",
+ "blake2",
+ "curve25519-dalek",
+ "ed25519-dalek",
+ "fiat-crypto 0.3.0",
+ "getrandom",
+ "hex",
+ "poly1305",
+ "rand_core",
+ "salsa20",
+ "serde",
+ "serde_json",
+ "subtle",
+ "thiserror",
+ "zeroize",
+]
+
+[[package]]
+name = "rustvpn-net"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64",
+ "chrono",
+ "ed25519-dalek",
+ "getrandom",
+ "io-uring",
+ "libc",
+ "rand_core",
+ "rustvpn-crypto",
+ "rustvpn-proto",
+ "serde",
+ "serde_json",
+ "serde_yaml_ng",
+ "subtle",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+ "tun",
+]
+
+[[package]]
+name = "rustvpn-proto"
+version = "0.1.0"
+dependencies = [
+ "curve25519-dalek",
+ "ed25519-dalek",
+ "hex",
+ "poly1305",
+ "rand_core",
+ "rustvpn-crypto",
+ "salsa20",
+ "serde",
+ "serde_json",
+ "sha2",
+ "subtle",
+ "thiserror",
+]
+
+[[package]]
+name = "rustvpn-server"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "rand_core",
+ "rustvpn-crypto",
+ "rustvpn-net",
+ "rustvpn-proto",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
+name = "rustvpn-verifier"
+version = "0.1.0"
+dependencies = [
+ "getrandom",
+ "rand_core",
+ "rpassword",
+ "rustvpn-crypto",
+]
 
 [[package]]
 name = "ryu"

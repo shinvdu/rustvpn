@@ -1,0 +1,16 @@
+[package]
+name = "rustvpn-verifier"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "rustvpn-verifier"
+path = "src/main.rs"
+
+[dependencies]
+rustvpn-crypto = { path = "../rustvpn-crypto" }
+getrandom = { workspace = true }
+rpassword = { workspace = true }
+rand_core = { workspace = true }
