@@ -7,6 +7,18 @@ members = [
     "crates/rustvpn-net",
     "crates/rustvpn-server",
     "crates/rustvpn-client",
+    "crates/rustvpn-admin",
+]
+# `cargo build` at the workspace root stays free of the optional admin
+# dependency; build it explicitly with `-p rustvpn-admin` or
+# `-p rustvpn-server --features admin`.
+default-members = [
+    "crates/rustvpn-crypto",
+    "crates/rustvpn-proto",
+    "crates/rustvpn-verifier",
+    "crates/rustvpn-net",
+    "crates/rustvpn-server",
+    "crates/rustvpn-client",
 ]
 
 [workspace.package]

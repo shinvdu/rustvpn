@@ -14,7 +14,14 @@
 | `-stats ADDR` | 在 `host:port` 上启动 JSON 统计 HTTP 端点。 | 禁用 |
 | `-proxy ADDR` | 在 `host:port` 上启动简易 HTTP CONNECT 代理。 | 禁用 |
 | `-egd PATH` | 从 EGD unix socket 而非操作系统 RNG 读取随机性。 | 操作系统 RNG |
+| `-admin ADDR` | **可选**：管理端 Web UI 监听地址（需 `--features admin` 构建）。 | 禁用 |
+| `-admin-db PATH` | 管理端 SQLite 数据库（账号、历史、审计）。 | `/var/lib/rustvpn/admin.db` |
+| `-admin-disabled-conf PATH` | 禁用客户端 YAML；默认与 `peers.yaml` 同目录。 | `peers.disabled.yaml` |
+| `-admin-cookie-secure` | 设置 `Secure`/`__Host-` Cookie；经 TLS 反代时启用。 | 关闭 |
+| `-admin-script-dir PATH` | 可重复；限制 up/down 脚本路径前缀。 | 不限制 |
 | `-warranty` | 打印许可证担保声明并退出。 | — |
+
+管理端参数只在 `--features admin` 构建中生效；未启用时传入 `-admin` 会报错。部署、权限与安全说明见 [`admin-web-ui.md`](../admin-web-ui.md)。
 
 ```bash
 sudo rustvpn-server -proto all -bind 0.0.0.0:1194 \

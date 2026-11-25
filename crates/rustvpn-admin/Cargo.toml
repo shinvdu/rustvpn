@@ -1,0 +1,38 @@
+[package]
+name = "rustvpn-admin"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "rustvpn-admin-passwd"
+path = "src/bin/rustvpn-admin-passwd.rs"
+
+[dependencies]
+rustvpn-crypto = { path = "../rustvpn-crypto" }
+rustvpn-net = { path = "../rustvpn-net" }
+rustvpn-proto = { path = "../rustvpn-proto" }
+axum = "0.8"
+rust-embed = "8"
+async-trait = "0.1"
+tokio = { workspace = true }
+tokio-stream = { version = "0.1", features = ["time"] }
+futures-util = "0.3"
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml_ng = { workspace = true }
+argon2 = { workspace = true }
+getrandom = { workspace = true }
+subtle = { workspace = true }
+chrono = { workspace = true }
+hex = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+rusqlite = { version = "0.43", features = ["bundled"] }
+rpassword = { workspace = true }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+tempfile = "3"

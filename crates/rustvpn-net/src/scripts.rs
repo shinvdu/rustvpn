@@ -16,8 +16,10 @@ use crate::{ENV_IFACE, ENV_REMOTE};
 /// Upper bound for a single up/down script invocation.
 #[cfg(not(test))]
 const SCRIPT_TIMEOUT: Duration = Duration::from_secs(10);
+// Keep the test bound short but not so tight that `cargo test --workspace`
+// parallel scheduling can starve a trivial `echo` script.
 #[cfg(test)]
-const SCRIPT_TIMEOUT: Duration = Duration::from_millis(300);
+const SCRIPT_TIMEOUT: Duration = Duration::from_secs(2);
 /// Per-stream output cap; the interface name is the only expected output.
 const MAX_OUTPUT: u64 = 64 * 1024;
 

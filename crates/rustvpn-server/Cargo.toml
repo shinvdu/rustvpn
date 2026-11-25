@@ -9,10 +9,16 @@ license.workspace = true
 name = "rustvpn-server"
 path = "src/main.rs"
 
+[features]
+default = []
+admin = ["dep:rustvpn-admin", "dep:async-trait"]
+
 [dependencies]
 rustvpn-crypto = { path = "../rustvpn-crypto" }
 rustvpn-proto = { path = "../rustvpn-proto" }
 rustvpn-net = { path = "../rustvpn-net" }
+rustvpn-admin = { path = "../rustvpn-admin", optional = true }
+async-trait = { version = "0.1", optional = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 anyhow = { workspace = true }

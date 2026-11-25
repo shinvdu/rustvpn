@@ -201,6 +201,29 @@ ssh root@server journalctl -u rustvpn-server -f
 ssh root@server 'curl -s 127.0.0.1:1294/ | jq .'
 ```
 
+## 管理端 Web UI（可选）
+
+管理端通过 `--features admin` 编译进 `rustvpn-server`，不启用时默认构建与 GoVPN 部署完全一致：
+
+```bash
+cargo build --release -p rustvpn-server --features admin
+cargo build --release -p rustvpn-admin --bin rustvpn-admin-passwd
+sudo rustvpn-admin-passwd -db /var/lib/rustvpn/admin.db -user admin
+```
+
+启动时增加：
+
+```bash
+-admin 127.0.0.1:8080 -admin-db /var/lib/rustvpn/admin.db
+```
+
+要点：
+
+- 默认只绑回环；远程访问用 SSH 隧道或 TLS 反代，并在启用了 TLS 时加 `-admin-cookie-secure`。
+- 管理端要写 `peers.yaml`/备份，unit 需允许 `ReadWritePaths=/etc/rustvpn /var/lib/rustvpn`，目录组可写（见[管理端文档](../admin-web-ui.md)）。
+- 管理端可禁用/轮换/踢下线，但**不能编辑 `up`/`down` 脚本内容**；脚本仍以服务权限执行。
+- 详细用法、API、统计口径与限制见 [`admin-web-ui.md`](../admin-web-ui.md)。
+
 <a id="passphrase-rotation"></a>
 ## 口令轮换
 

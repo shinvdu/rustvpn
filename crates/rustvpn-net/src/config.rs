@@ -1,6 +1,6 @@
 //! Server `peers.yaml` and shared peer configuration.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -9,7 +9,7 @@ use anyhow::{anyhow, Context, Result};
 use rustvpn_crypto::verifier::Verifier;
 use rustvpn_crypto::xtea::Xtea;
 use rustvpn_proto::{Mode, MTU_DEFAULT, MTU_MAX, MTU_MIN, MTU_MIN_NOISE};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
 
 use crate::DEFAULT_TIMEOUT;
@@ -78,30 +78,54 @@ impl PeerConfig {
             self.timeout / 4
         }
     }
+
+    /// Render this runtime peer back into the GoVPN 5.7 YAML schema.
+    ///
+    /// The long-form verifier is required: a server configuration without the
+    /// public key cannot be written back without changing its meaning.
+    pub fn to_yaml(&self) -> Result<PeerYaml> {
+        Ok(PeerYaml {
+            iface: self.iface.clone(),
+            mtu: self.mtu,
+            up: self.up.clone(),
+            down: self.down.clone(),
+            timeout: self.timeout.as_secs() as i64,
+            noise: self.noise,
+            cpr: self.cpr,
+            encless: self.encless,
+            timesync: self.time_sync,
+            verifier: self.verifier.long_form()?,
+        })
+    }
 }
 
-#[derive(Deserialize, Default)]
+/// One `peers.yaml` entry.
+///
+/// This is the exact GoVPN 5.7 schema.  It is public so the admin service can
+/// render and edit configurations without duplicating the field list, while
+/// `deny_unknown_fields` keeps the strict-compatibility guarantee.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
-struct YamlPeer {
+pub struct PeerYaml {
     #[serde(default)]
-    iface: String,
+    pub iface: String,
     #[serde(default)]
-    mtu: usize,
+    pub mtu: usize,
     #[serde(default)]
-    up: String,
+    pub up: String,
     #[serde(default)]
-    down: String,
+    pub down: String,
     #[serde(default)]
-    timeout: i64,
+    pub timeout: i64,
     #[serde(default)]
-    noise: bool,
+    pub noise: bool,
     #[serde(default)]
-    cpr: u32,
+    pub cpr: u32,
     #[serde(default)]
-    encless: bool,
+    pub encless: bool,
     #[serde(default)]
-    timesync: i64,
-    verifier: String,
+    pub timesync: i64,
+    pub verifier: String,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -139,8 +163,20 @@ impl ConfigSet {
     pub fn from_file(path: &Path) -> Result<Self> {
         let data =
             std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
-        let raw: HashMap<String, YamlPeer> =
-            serde_yaml_ng::from_str(&data).context("parse peers.yaml")?;
+        Self::from_str(&data)
+    }
+
+    /// Parse the same YAML accepted by [`ConfigSet::from_file`].  Used by the
+    /// admin service to validate rendered configurations before they touch
+    /// disk.
+    ///
+    /// The name mirrors the existing constructor style in this module; it is
+    /// intentionally not the `FromStr` trait because parsing needs `anyhow`
+    /// context and is fallible with more than one error shape.
+    #[allow(clippy::should_implement_trait)]
+    pub fn from_str(data: &str) -> Result<Self> {
+        let raw: BTreeMap<String, PeerYaml> =
+            serde_yaml_ng::from_str(data).context("parse peers.yaml")?;
         let mut peers = Vec::with_capacity(raw.len());
         for (name, y) in raw {
             let verifier = Verifier::from_string(&y.verifier)
@@ -183,6 +219,20 @@ impl ConfigSet {
             });
         }
         Self::from_peers(peers)
+    }
+
+    /// Deterministically render the enabled peers as a `peers.yaml` map.
+    pub fn to_yaml_map(&self) -> Result<BTreeMap<String, PeerYaml>> {
+        let mut out = BTreeMap::new();
+        for peer in &self.peers {
+            out.insert(peer.name.clone(), peer.to_yaml()?);
+        }
+        Ok(out)
+    }
+
+    /// Render a complete `peers.yaml` document.
+    pub fn render_yaml(&self) -> Result<String> {
+        Ok(serde_yaml_ng::to_string(&self.to_yaml_map()?)?)
     }
 
     pub fn find_identity(&self, data: &[u8]) -> Option<&Arc<PeerConfig>> {
@@ -302,6 +352,28 @@ mod tests {
         std::fs::write(&path, format!("peer:\n  verifier: {long}\n")).unwrap();
         assert!(ConfigSet::from_file(&path).is_err());
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn renders_and_reparses_yaml() {
+        let id = [8u8; 16];
+        let mut verifier = Verifier::new(1024, 4, 1, id);
+        verifier.password_apply("passphrase").unwrap();
+        let mut p = peer(id);
+        p.name = "alice".into();
+        p.iface = "tap3".into();
+        p.mtu = 1540;
+        p.noise = true;
+        p.verifier = verifier;
+        let set = ConfigSet::from_peers(vec![p]).unwrap();
+        let yaml = set.render_yaml().unwrap();
+        assert!(yaml.contains("alice:"));
+        let parsed = ConfigSet::from_str(&yaml).unwrap();
+        assert_eq!(parsed.peers.len(), 1);
+        assert_eq!(parsed.peers[0].name, "alice");
+        assert_eq!(parsed.peers[0].iface, "tap3");
+        assert_eq!(parsed.peers[0].mtu, 1540);
+        assert!(parsed.peers[0].noise);
     }
 
     #[test]

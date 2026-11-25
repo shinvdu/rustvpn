@@ -25,8 +25,17 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      - name: Clippy (admin feature)
+        run: cargo clippy -p rustvpn-server --features admin --all-targets -- -D warnings
+
       - name: Test
         run: cargo test --workspace
 
+      - name: Test (admin feature)
+        run: cargo test -p rustvpn-server --features admin
+
       - name: Release build
         run: cargo build --release --workspace
+
+      - name: Release build (admin feature)
+        run: cargo build --release -p rustvpn-server --features admin

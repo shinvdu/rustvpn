@@ -42,43 +42,43 @@ pub struct LiveStats {
 #[derive(Serialize)]
 pub struct PeerStats {
     #[serde(rename = "BytesIn")]
-    bytes_in: u64,
+    pub bytes_in: u64,
     #[serde(rename = "BytesOut")]
-    bytes_out: u64,
+    pub bytes_out: u64,
     #[serde(rename = "BytesPayloadIn")]
-    payload_in: u64,
+    pub payload_in: u64,
     #[serde(rename = "BytesPayloadOut")]
-    payload_out: u64,
+    pub payload_out: u64,
     #[serde(rename = "FramesIn")]
-    frames_in: u64,
+    pub frames_in: u64,
     #[serde(rename = "FramesOut")]
-    frames_out: u64,
+    pub frames_out: u64,
     #[serde(rename = "FramesUnauth")]
-    unauth: u64,
+    pub unauth: u64,
     #[serde(rename = "FramesDup")]
-    dup: u64,
+    pub dup: u64,
     #[serde(rename = "HeartbeatRecv")]
-    heartbeat_recv: u64,
+    pub heartbeat_recv: u64,
     #[serde(rename = "HeartbeatSent")]
-    heartbeat_sent: u64,
+    pub heartbeat_sent: u64,
     #[serde(rename = "Addr")]
-    addr: String,
+    pub addr: String,
     #[serde(rename = "Id")]
-    id: String,
+    pub id: String,
     #[serde(rename = "NoiseEnable")]
-    noise: bool,
+    pub noise: bool,
     #[serde(rename = "CPR")]
-    cpr: u32,
+    pub cpr: u32,
     #[serde(rename = "Encless")]
-    encless: bool,
+    pub encless: bool,
     #[serde(rename = "MTU")]
-    mtu: usize,
+    pub mtu: usize,
     #[serde(rename = "Established")]
-    established: DateTime<Utc>,
+    pub established: DateTime<Utc>,
     #[serde(rename = "LastPing")]
-    last_ping: DateTime<Utc>,
+    pub last_ping: DateTime<Utc>,
     #[serde(rename = "LastSent")]
-    last_sent: DateTime<Utc>,
+    pub last_sent: DateTime<Utc>,
 }
 
 impl LiveStats {
