@@ -106,10 +106,11 @@ the server answers replayed first messages, which reveals its presence.
 ## Can I DoS the daemon?
 
 Each transport packet is authenticated before expensive work, and the
-implementation bounds queues and handshake states. TCP/UDP stack costs
-usually dominate. However, there is **no per-source handshake rate
-limiting yet**, so a flood of first handshake messages still costs
-CPU. Firewall the port where possible.
+implementation bounds queues and handshake states. First handshake
+messages are rate-limited to **5/s per source IP** (burst 10) and
+**200/s globally** (burst 400); excess messages are dropped, and TCP
+handshakes also pass a concurrency semaphore. TCP/UDP stack costs usually
+dominate in practice. Still firewall the port where possible.
 
 ## Why YAML?
 

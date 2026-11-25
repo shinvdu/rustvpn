@@ -36,6 +36,7 @@ Design goals, inherited from GoVPN:
 - Noise padding and optional constant packet rate (CPR).
 - Optional timestamp windows for handshake replay resistance.
 - Built-in rehandshake, heartbeat, timeout and JSON statistics.
+- Built-in handshake rate limiting (5/s per source, 200/s global).
 - UDP and TCP transports, plus HTTP CONNECT proxy on both sides.
 - IPv4 and IPv6.
 - EGD entropy-daemon support for systems with weak `/dev/urandom`.
@@ -83,7 +84,6 @@ Known limitations:
   TAP backend.
 - Effective MTU is not adjusted automatically. In noise/encless modes the
   up script should raise the interface MTU (or accept a smaller payload).
-- There is no per-source handshake rate limiting yet.
 - The client only supports encryptionless mode over TCP, matching Go.
 
 Next: [Getting started](getting-started.md).

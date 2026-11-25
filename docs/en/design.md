@@ -49,6 +49,8 @@ The daemons run on Tokio:
 
 - TCP sessions and the HTTP CONNECT proxy are Tokio tasks.
 - Handshakes, TAP opening, scripts and stats are control-plane work.
+- Handshake admission uses token buckets: 5/s per source IP (burst 10)
+  and 200/s globally (burst 400); TCP also uses a concurrency semaphore.
 - Configuration is held in an `RwLock<ConfigSet>` and refreshed every
   60 seconds; a failed parse keeps the previous set.
 
@@ -163,7 +165,6 @@ byte equality. See [Performance](performance.md).
 - No thread-per-core `SO_REUSEPORT` sharding; one socket per protocol with
   a shared batcher. Simpler, and the measured wins came from batching and
   SIMD rather than sharding.
-- No per-source handshake rate limiting.
 - No automatic effective-MTU configuration.
 - FreeBSD/macOS builds are untested.
 - The encless path still allocates; a buffer-pooled AONT/CnW encoder is

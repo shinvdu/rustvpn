@@ -24,6 +24,7 @@ RustVPN 是一个小型虚拟专用网守护进程，通过加密、认证的隧
 - 噪声填充（noise）与可选恒定包速率（CPR）。
 - 可选时间戳窗口，用于抵御握手重放。
 - 内置重握手、心跳、超时与 JSON 统计。
+- 内置握手限速（每来源 5/s，全局 200/s）。
 - UDP 和 TCP 传输，两侧均支持 HTTP CONNECT 代理。
 - 支持 IPv4 和 IPv6。
 - 为 `/dev/urandom` 较弱的系统提供 EGD 熵守护进程支持。
@@ -64,7 +65,6 @@ RustVPN 是一个小型虚拟专用网守护进程，通过加密、认证的隧
 
 - 仅在 Linux 上验证过。FreeBSD 和 macOS 可能通过 `tun` crate 工作，但未测试；设置 `GOVPN_IO_URING=0` 可强制使用 epoll TAP 后端。
 - 有效 MTU 不会自动调整。在 noise/encless 模式下，`up` 脚本应提高接口 MTU（或接受较小的载荷）。
-- 目前尚无按来源（per-source）的握手速率限制。
 - 客户端仅在 TCP 上支持无加密模式，与 Go 保持一致。
 
 下一步：[快速上手](getting-started.md)。

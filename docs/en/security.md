@@ -86,9 +86,11 @@ secrecy.
 
 ## Known gaps and operational risks
 
-- **No per-source handshake rate limiting yet.** An attacker can force
-  handshake work by sending many first messages. Keep the port
-  firewalled where possible and monitor `FramesUnauth`.
+- **Handshake flooding is rate-limited.** First handshake messages are
+  capped at 5/s per source IP (burst 10) and 200/s globally (burst 400);
+  excess messages are dropped. TCP handshakes also pass through a
+  concurrency semaphore. Keep the port firewalled and monitor
+  `FramesUnauth`.
 - **Denial of service is always possible at the network layer.** The
   daemon authenticates transport packets before doing expensive work and
   bounds internal queues, but it cannot prevent link saturation.
