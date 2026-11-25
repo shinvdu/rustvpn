@@ -3,6 +3,10 @@
 
 > 注：本文档写于项目重命名为 **RustVPN** 之前。文中 Rust crate / 二进制名为旧名 `govpn-*`，
 > 当前对应 `rustvpn-*`；Go 侧路径（如 `cmd/govpn-server/`）指上游 GoVPN 实现，保持不变。
+>
+> **三语维护版：** [`docs/en/design.md`](en/design.md) ·
+> [`docs/zh/design.md`](zh/design.md) · [`docs/ru/design.md`](ru/design.md)。
+> 本文作为历史设计记录保留。
 > 目标版本：GoVPN 5.7（GPLv3+）
 > 文档状态：Draft v0.1（2026-11-25）
 > 适用范围：Linux 数据面重写；FreeBSD 作为第二阶段

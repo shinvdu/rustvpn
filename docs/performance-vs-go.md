@@ -3,6 +3,10 @@
 > 日期：2026-11-25
 > 对象：`RustVPN`（Rust 实现，release） vs `src/cypherpunks.ru/govpn`（Go 5.7 优化版）
 > 关联：`docs/upstream-go-performance.md`（Go 侧优化记录）、`docs/design.md`（设计）
+>
+> **三语维护版：** [`docs/en/performance.md`](en/performance.md) ·
+> [`docs/zh/performance.md`](zh/performance.md) · [`docs/ru/performance.md`](ru/performance.md)。
+> 本文保留为原始对比记录。
 
 ---
 

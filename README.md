@@ -1,68 +1,68 @@
-# RustVPN
+# RustVPN — a wire-compatible GoVPN 5.7 rewrite in Rust
 
-RustVPN is a standalone, wire-compatible implementation of GoVPN 5.7 in
-Rust.  It interoperates with the upstream Go client/server in every
-transport mode, but lives in its own repository with its own crate and
-binary names; the original Go tree is not included or modified.
+**English** | [中文](README.zh.md) | [Русский](README.ru.md)
+
+RustVPN is a from-scratch Rust implementation of the GoVPN 5.7 protocol.
+It is not a new VPN design: it speaks the exact same wire format, so its
+`rustvpn-server`, `rustvpn-client` and `rustvpn-verifier` binaries can replace
+the Go ones on either side of an existing deployment.
+
+This repository contains the standalone RustVPN implementation. The
+upstream GoVPN tree is not included or modified; it is used only as a
+differential-testing oracle.
+
+## Highlights
+
+- **PAKE handshake** — passphrase-authenticated, augmented Diffie-Hellman
+  key agreement (DH A-EKE) with zero-knowledge mutual authentication.
+- **Strong verifiers** — Argon2d + Ed25519 tokens that resist offline
+  dictionary attacks; a compromised server verifier cannot impersonate a
+  client.
+- **Authenticated transport** — Salsa20 + Poly1305, XTEA-based serial
+  obfuscation, a 257-bit replay window, and perfect forward secrecy.
+- **Censorship resistance** — handshake and transport bytes are
+  indistinguishable from random data; optional `noise` padding hides
+  packet lengths.
+- **Encryptionless mode** — AONT + Chaffing-and-Winnowing provide
+  confidentiality without encryption functions (TCP only on the client).
+- **Operational parity** — same CLI flags and defaults, same `peers.yaml`
+  format and 60-second hot reload, same `up`/`down` script environment,
+  same JSON stats fields, same UDP/TCP/HTTP-CONNECT proxy behavior.
+- **Performance work** — zero-allocation steady-state codec, `recvmmsg`/
+  `sendmmsg` batching, an io_uring TAP backend with epoll fallback, and an
+  AVX2 Salsa20 backend with runtime dispatch.
 
 ## Status
 
-Implemented and differentially tested against the Go 5.7 implementation:
+Implemented and differentially tested against the Go 5.7 code:
 
-- `rustvpn-crypto`: XTEA, Salsa20/XSalsa20, Poly1305, BLAKE2b-256,
-  chaffing-and-winnowing with the specialised one-byte MAC, AONT,
-  encless, Argon2d/Ed25519 verifier derivation, EGD reader, and an exact
-  port of Go's extra25519 representative encoding.
-- `rustvpn-proto`: classic/noise/encless transport codec, 257-bit replay
-  window, TCP exact-serial framing, and the complete PAKE handshake for
-  client and server.
-- `rustvpn-verifier`: CLI-compatible verifier generator/validator, with
-  EGD support.
-- `rustvpn-net`: TAP devices, YAML config + 60s hot reload, up/down
-  scripts, Go-compatible JSON stats, heartbeat/CPR pacing, peer timeout
-  and rekey lifecycle.
-- `rustvpn-client` / `rustvpn-server`: UDP and TCP transports, HTTP
-  CONNECT proxy (both sides), noise and encless modes, stats endpoint,
-  graceful termination and down scripts.
-- Performance data path: `recvmmsg`/`sendmmsg` batching on the UDP
-  receive and send paths (64 datagrams per syscall, a single shared
-  batcher per socket), an io_uring TAP backend with an eventfd wakeup
-  (zero idle wakeups) and epoll fallback, and an AVX2 Salsa20 backend
-  with runtime dispatch (eight blocks, or eight independent CnW
-  keystreams, per core call).  The scalar RustCrypto path remains the
-  reference and is covered by differential tests.  The transport codec
-  also exposes `encode_into`/`decode_into`, which the peer path uses with
-  reused buffers for a zero-allocation steady state.  Poly1305 is pinned
-  to the RustCrypto software backend in `.cargo/config.toml` because the
-  crate's AVX2 backend is measurably slower on Zen3; see
-  `docs/performance-vs-go.md` for the same-machine Go-vs-Rust comparison
-  and the measurements behind that choice.
+| Crate | Contents |
+|---|---|
+| `rustvpn-crypto` | XTEA, Salsa20/XSalsa20, Poly1305, BLAKE2b-256, Chaffing-and-Winnowing, AONT, encless, Argon2d/Ed25519 verifiers, EGD reader, `extra25519` representative encoding |
+| `rustvpn-proto` | Classic/noise/encless transport codec, replay window, TCP framing, complete PAKE handshake for both roles |
+| `rustvpn-net` | TAP devices, YAML config + hot reload, scripts, stats, heartbeat/CPR/rekey lifecycle, UDP batching, io_uring TAP |
+| `rustvpn-client` / `rustvpn-server` | UDP and TCP transports, HTTP CONNECT proxy, noise and encless modes, stats endpoint, graceful shutdown |
+| `rustvpn-verifier` | CLI-compatible verifier generator/validator |
 
-Verified end-to-end against the Go binaries (loopback + TAP + network
-namespaces, ICMP through the tunnel):
+Interoperability verified end-to-end (loopback + TAP + network namespaces,
+ICMP through the tunnel):
 
 | Direction | UDP | TCP | Proxy | Noise | Encless |
 |---|---|---|---|---|---|
-| RustVPN client -> GoVPN server | yes | yes | yes | (protocol bytes verified)* | (protocol bytes verified)* |
-| GoVPN client -> RustVPN server | yes | yes | yes | yes | yes |
-| RustVPN client -> RustVPN server | yes | yes | yes | yes | yes |
+| Rust client → Go server | yes | yes | yes | (protocol bytes verified)* | (protocol bytes verified)* |
+| Go client → Rust server | yes | yes | yes | yes | yes |
+| Rust client → Rust server | yes | yes | yes | yes | yes |
 
 \* In this environment Go's water TAP reader intermittently reports
 `not pollable`; the same Go server works when its TAP is pre-created.
-The wire format is covered by the byte-exact handshake/transport vector
-tests regardless.
+The wire format is covered by byte-exact handshake/transport vectors
+regardless.
 
-Not implemented yet:
+Not implemented yet: portability packaging for FreeBSD/macOS (only Linux
+has been exercised), automatic effective-MTU handling for TAP interfaces,
+and per-source handshake rate limiting.
 
-- portability packaging for FreeBSD/macOS (the TUN crate supports them,
-  but only Linux has been exercised; set `GOVPN_IO_URING=0` to force the
-  epoll TAP backend)
-- automatic effective-MTU handling for TAP interfaces (currently the
-  up script should set the interface MTU; noise/encless reduce payload
-  capacity by 25/9 bytes)
-- per-source handshake rate limiting
-
-## Build and run
+## Quick start
 
 Requirements: Rust >= 1.85, Linux `/dev/net/tun`, and root or
 `CAP_NET_ADMIN` for TAP creation.
@@ -71,23 +71,22 @@ Requirements: Rust >= 1.85, Linux `/dev/net/tun`, and root or
 cargo build --release
 # binaries: target/release/rustvpn-{server,client,verifier}
 
-# verifier
+# 1. Generate a verifier (prints the long form then the short form)
 echo 'correct horse battery staple' > /tmp/rustvpn.pass
 target/release/rustvpn-verifier -key /tmp/rustvpn.pass
 
-# server (peers.yaml uses the Go format; the long verifier above)
+# 2. Start the server (peers.yaml uses the Go format)
 target/release/rustvpn-server -proto udp -bind 0.0.0.0:1194 \
     -conf /tmp/peers.yaml -stats 127.0.0.1:1294
 
-# client (use the short verifier form)
+# 3. Start the client (short verifier form)
 target/release/rustvpn-client -remote server:1194 -proto udp -iface tap0 \
     -verifier '$argon2d$m=4096,t=128,p=1$...' -key /tmp/rustvpn.pass \
     -up /path/to/up.sh -down /path/to/down.sh
 ```
 
-Minimal `peers.yaml` entry:
-
 ```yaml
+# /tmp/peers.yaml
 alice:
   iface: tap0
   mtu: 1515
@@ -99,59 +98,46 @@ alice:
   down: /path/to/down.sh
 ```
 
-The up script receives `GOVPN_IFACE` and `GOVPN_REMOTE` in its
-environment; if `iface` is empty, the first line of the up script's
-stdout is used as the interface name.  Noisy/encless modes reduce the
-usable payload by 25/9 bytes, so the up script should set the TAP MTU
-accordingly (or the configured MTU should be increased).
-Environment variables keep the `GOVPN_` prefix so existing up/down
-scripts and deployment tooling remain compatible.
+The server runs `up` **before** opening the TAP device, so the script must
+create a persistent TAP itself (`ip tuntap add ... mode tap`); the client
+opens its TAP first and runs `up` after the session is established. See
+[Getting started](docs/en/getting-started.md) for a complete walkthrough.
 
-## Tests
+## Documentation
+
+The manual is available in three languages, each in its own directory:
+
+| Language | Entry point |
+|---|---|
+| English | [`docs/en/index.md`](docs/en/index.md) |
+| 中文 | [`docs/zh/index.md`](docs/zh/index.md) |
+| Русский | [`docs/ru/index.md`](docs/ru/index.md) |
+
+English pages:
+
+- [Overview and concepts](docs/en/index.md)
+- [Getting started](docs/en/getting-started.md)
+- [Configuration reference](docs/en/configuration.md)
+- [Protocol](docs/en/protocol.md)
+- [Operations and deployment](docs/en/operations.md)
+- [Security](docs/en/security.md)
+- [FAQ](docs/en/faq.md)
+- [Design](docs/en/design.md)
+- [Performance](docs/en/performance.md)
+
+## Tests and benchmarks
 
 ```bash
 cargo test
-```
-
-The tests consume `testdata/go_vectors.json`, generated by the real Go
-implementation.  They verify:
-
-- every primitive byte-for-byte
-- classic/noise transport packets byte-for-byte in both directions
-- encless packets decode correctly
-- all four handshake messages byte-for-byte in plain/noise/encless modes,
-  including the resulting master key, with a deterministic RNG stream that
-  matches the Go oracle
-- verifier seed/public key and forms match Go
-- TCP/UDP replay behaviour and roundtrips
-
-The handshake and Elligator/`extra25519` vectors are part of the
-differential tests as well.  The performance modules have their own
-tests: AVX2 vs scalar keystream/multi-stream equivalence, a loopback
-`sendmmsg`/`recvmmsg` roundtrip, and an unprivileged socketpair
-roundtrip through the io_uring ring loop (skipped if io_uring is
-unavailable).
-
-## Benchmarks
-
-```bash
 cargo run --release -p rustvpn-crypto --example crypto_bench
 cargo run --release -p rustvpn-proto  --example proto_bench
 cargo run --release -p rustvpn-net    --example mmsg_bench
 ```
 
-`crypto_bench` covers CnW/AONT/encless and the classic XTEA/Salsa20/
-Poly1305 components, `proto_bench` the transport codec (decode batches
-use increasing serials so the replay window is exercised), and
-`mmsg_bench` measures full 64-datagram `sendmmsg`+`recvmmsg` rounds over
-loopback.
-
-## Go oracle vectors
-
-`testdata/go_vectors.json` was generated from the upstream GoVPN 5.7
-tree using the vector generator shipped with that project.  The vectors
-are checked in so the Rust test suite is self-contained; running the
-generator requires the upstream Go source and is documented there.
+The tests consume `testdata/go_vectors.json`, generated from the upstream
+GoVPN 5.7 tree and checked in so the suite is self-contained. Regenerating
+it requires the upstream Go source and the vector generator shipped with
+that project; this repository does not include the Go tree.
 
 ## Verifier interoperability
 
@@ -164,16 +150,15 @@ target/debug/rustvpn-verifier -verifier "$LONG_FORM" -key pass.txt
     -key pass.txt -m 1024 -t 4 -p 1 | head -1)" -key pass.txt
 ```
 
-Both directions currently print `true`.
+Both directions print `true`.
 
-## Design and performance
+## Relationship to GoVPN
 
-- `docs/design.md`: target architecture and design rationale.
-- `docs/upstream-go-performance.md`: Go-side optimisation record that
-  motivated the Rust data path.
-- `docs/performance-vs-go.md`: same-machine Go-vs-Rust measurements,
-  including the Poly1305 backend investigation.
+RustVPN is an independent implementation of the same protocol and is
+released under **GPL-3.0-or-later**, matching the Go project. It does not
+modify the Go tree; both implementations can run side by side on
+different ports/networks.
 
 ## License
 
-GPL-3.0-or-later, matching the Go project.  See `COPYING`.
+GPL-3.0-or-later.

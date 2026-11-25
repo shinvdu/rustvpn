@@ -2,6 +2,10 @@
 
 
 > 注：本文记录的是**上游 GoVPN（Go 实现）**的性能优化；保留在 RustVPN 仓库中作为对比背景。
+>
+> **三语维护版：** [`docs/en/performance.md`](en/performance.md) ·
+> [`docs/zh/performance.md`](zh/performance.md) · [`docs/ru/performance.md`](ru/performance.md)。
+> 本文保留为 Go 侧原始记录。
 
 > 日期：2026-11-25
 > 范围：Go 版 `govpn`（GOPATH 工程）热路径、encless 编解码、UDP 服务端数据面
