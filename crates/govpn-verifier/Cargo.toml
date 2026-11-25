@@ -13,3 +13,4 @@ path = "src/main.rs"
 govpn-crypto = { path = "../govpn-crypto" }
 getrandom = { workspace = true }
 rpassword = { workspace = true }
+rand_core = { workspace = true }

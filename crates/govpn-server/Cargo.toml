@@ -1,0 +1,19 @@
+[package]
+name = "govpn-server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "govpn-server"
+path = "src/main.rs"
+
+[dependencies]
+govpn-crypto = { path = "../govpn-crypto" }
+govpn-proto = { path = "../govpn-proto" }
+govpn-net = { path = "../govpn-net" }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+anyhow = { workspace = true }
+rand_core = { workspace = true }

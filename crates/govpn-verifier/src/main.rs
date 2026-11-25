@@ -5,7 +5,9 @@ use std::fs;
 use std::io::{self, Write};
 use std::process;
 
+use govpn_crypto::egd::EgDRng;
 use govpn_crypto::verifier::{Verifier, DEFAULT_M, DEFAULT_P, DEFAULT_T, ID_SIZE};
+use rand_core::RngCore;
 
 const WARRANTY: &str = r#"This program is free software: you can redistribute it and/or modify
 it under the terms of the GNU General Public License as published by
@@ -119,14 +121,13 @@ fn read_passphrase(path: &Option<String>) -> String {
 
 fn random_id(egd: &Option<String>) -> [u8; ID_SIZE] {
     let mut id = [0u8; ID_SIZE];
-    if egd.is_some() {
-        eprintln!("-egd is not implemented in the Rust port yet");
-        process::exit(1);
+    match egd {
+        Some(path) => EgDRng::new(path).fill_bytes(&mut id),
+        None => getrandom::getrandom(&mut id).unwrap_or_else(|e| {
+            eprintln!("Unable to obtain random identity: {e}");
+            process::exit(1);
+        }),
     }
-    getrandom::getrandom(&mut id).unwrap_or_else(|e| {
-        eprintln!("Unable to obtain random identity: {e}");
-        process::exit(1);
-    });
     id
 }
 

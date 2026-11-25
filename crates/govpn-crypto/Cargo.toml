@@ -15,6 +15,7 @@ base64 = { workspace = true }
 subtle = { workspace = true }
 zeroize = { workspace = true }
 getrandom = { workspace = true }
+rand_core = { workspace = true }
 fiat-crypto = { version = "0.3", default-features = false }
 curve25519-dalek = { version = "4.1", default-features = false, features = ["alloc", "precomputed-tables"] }
 thiserror = { workspace = true }

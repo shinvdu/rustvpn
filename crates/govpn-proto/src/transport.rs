@@ -377,3 +377,60 @@ mod tests {
         );
     }
 }
+
+/// One direction of a transport session (TAP -> network).
+#[derive(Clone, Debug)]
+pub struct Encoder {
+    inner: Session,
+}
+
+impl Encoder {
+    pub fn new(key: [u8; 32], is_client: bool) -> Self {
+        Self {
+            inner: Session::new(key, is_client),
+        }
+    }
+
+    pub fn encode(
+        &mut self,
+        payload: &[u8],
+        mode: Mode,
+        mtu: usize,
+    ) -> Result<Vec<u8>, TransportError> {
+        let wire = self.inner.encode(payload, mode, mtu)?;
+        Ok(wire)
+    }
+
+    pub fn serial(&self) -> u64 {
+        self.inner.serial()
+    }
+}
+
+/// The other direction of a transport session (network -> TAP).
+#[derive(Clone, Debug)]
+pub struct Decoder {
+    inner: Session,
+}
+
+impl Decoder {
+    pub fn new(key: [u8; 32], is_client: bool) -> Self {
+        Self {
+            inner: Session::new(key, is_client),
+        }
+    }
+
+    pub fn decode(
+        &mut self,
+        packet: &[u8],
+        mode: Mode,
+        mtu: usize,
+        ordering: Ordering,
+    ) -> Result<Vec<u8>, TransportError> {
+        self.inner.decode(packet, mode, mtu, ordering)
+    }
+
+    /// The encrypted serial expected next, used to delimit TCP packets.
+    pub fn expected_nonce(&self) -> [u8; 8] {
+        self.inner.prp.encrypt_u64(self.inner.expect)
+    }
+}

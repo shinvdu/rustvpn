@@ -1,37 +1,95 @@
 # GoVPN Rust rewrite
 
-This directory is the beginning of a wire-compatible GoVPN 5.7 rewrite in
+This directory contains a wire-compatible GoVPN 5.7 implementation in
 Rust.  The original Go tree is intentionally untouched.
 
 ## Status
 
-Implemented and differentially tested against the Go implementation:
+Implemented and differentially tested against the Go 5.7 implementation:
 
-- `govpn-crypto`
-  - XTEA-as-PRP (Go byte order)
-  - Salsa20 / XSalsa20 / HSalsa20
-  - Poly1305
-  - BLAKE2b-256
-  - Chaffing-and-Winnowing with the specialised one-byte Poly1305 formula
-  - SAEP/OAEP-style AONT
-  - encless mode (CnW over AONT)
-  - Argon2d v1.3 + Ed25519 verifier derivation (Go verifier strings)
-- `govpn-proto`
-  - classic, noise and encless transport packet encode/decode
-  - 257-bit sliding anti-replay window
-  - TCP exact-serial mode
-  - the full PAKE handshake (DH A-EKE), including the exact extra25519
-    representative encoding, Ed25519 signatures, IDtag and all four
-    message layouts
-- `govpn-verifier`
-  - CLI-compatible verifier generator/validator (`-key`, `-verifier`, `-m`,
-    `-t`, `-p`, `-warranty`; `-egd` is not implemented yet)
+- `govpn-crypto`: XTEA, Salsa20/XSalsa20, Poly1305, BLAKE2b-256,
+  chaffing-and-winnowing with the specialised one-byte MAC, AONT,
+  encless, Argon2d/Ed25519 verifier derivation, EGD reader, and an exact
+  port of Go's extra25519 representative encoding.
+- `govpn-proto`: classic/noise/encless transport codec, 257-bit replay
+  window, TCP exact-serial framing, and the complete PAKE handshake for
+  client and server.
+- `govpn-verifier`: CLI-compatible verifier generator/validator, with
+  EGD support.
+- `govpn-net`: TAP devices, YAML config + 60s hot reload, up/down
+  scripts, Go-compatible JSON stats, heartbeat/CPR pacing, peer timeout
+  and rekey lifecycle.
+- `govpn-client` / `govpn-server`: UDP and TCP transports, HTTP CONNECT
+  proxy (both sides), noise and encless modes, stats endpoint, graceful
+  termination and down scripts.
 
-Not implemented yet (next milestones):
+Verified end-to-end against the Go binaries (loopback + TAP + network
+namespaces, ICMP through the tunnel):
 
-- UDP/TCP networking, HTTP proxy, TAP devices, configuration, stats
-- CPR, heartbeat scheduling, rekey lifecycle, scripts
-- packaging and CLI-compatible client/server binaries
+| Direction | UDP | TCP | Proxy | Noise | Encless |
+|---|---|---|---|---|---|
+| Rust client -> Go server | yes | yes | yes | (protocol bytes verified)* | (protocol bytes verified)* |
+| Go client -> Rust server | yes | yes | yes | yes | yes |
+| Rust client -> Rust server | yes | yes | yes | yes | yes |
+
+\* In this environment Go's water TAP reader intermittently reports
+`not pollable`; the same Go server works when its TAP is pre-created.
+The wire format is covered by the byte-exact handshake/transport vector
+tests regardless.
+
+Not implemented yet:
+
+- portability packaging for FreeBSD/macOS (the TUN crate supports them,
+  but only Linux has been exercised)
+- io_uring/batched syscalls, SIMD multi-buffer performance work
+- automatic effective-MTU handling for TAP interfaces (currently the
+  up script should set the interface MTU; noise/encless reduce payload
+  capacity by 25/9 bytes)
+- per-source handshake rate limiting
+
+## Build and run
+
+Requirements: Rust >= 1.85, Linux `/dev/net/tun`, and root or
+`CAP_NET_ADMIN` for TAP creation.
+
+```bash
+cd rust
+cargo build --release
+# binaries: target/release/govpn-{server,client,verifier}
+
+# verifier
+echo 'correct horse battery staple' > /tmp/govpn.pass
+target/release/govpn-verifier -key /tmp/govpn.pass
+
+# server (peers.yaml uses the Go format; the long verifier above)
+target/release/govpn-server -proto udp -bind 0.0.0.0:1194 \
+    -conf /tmp/peers.yaml -stats 127.0.0.1:1294
+
+# client (use the short verifier form)
+target/release/govpn-client -remote server:1194 -proto udp -iface tap0 \
+    -verifier '$argon2d$m=4096,t=128,p=1$...' -key /tmp/govpn.pass \
+    -up /path/to/up.sh -down /path/to/down.sh
+```
+
+Minimal `peers.yaml` entry:
+
+```yaml
+alice:
+  iface: tap0
+  mtu: 1515
+  timeout: 60
+  noise: false
+  encless: false
+  verifier: $argon2d$m=4096,t=128,p=1$...$...
+  up: /path/to/up.sh
+  down: /path/to/down.sh
+```
+
+The up script receives `GOVPN_IFACE` and `GOVPN_REMOTE` in its
+environment; if `iface` is empty, the first line of the up script's
+stdout is used as the interface name.  Noisy/encless modes reduce the
+usable payload by 25/9 bytes, so the up script should set the TAP MTU
+accordingly (or the configured MTU should be increased).
 
 ## Tests
 

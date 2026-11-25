@@ -10,7 +10,7 @@ pub mod transport;
 pub use handshake::{
     ClientHandshake, ClientOutput, HandshakeConfig, HandshakeError, ServerHandshake, ServerOutput,
 };
-pub use transport::{Mode, Ordering, Session, TransportError};
+pub use transport::{Decoder, Encoder, Mode, Ordering, Session, TransportError};
 
 pub const NONCE_SIZE: usize = 8;
 pub const TAG_SIZE: usize = 16;

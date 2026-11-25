@@ -8,6 +8,7 @@
 pub mod aont;
 pub mod blake2b;
 pub mod cnw;
+pub mod egd;
 pub mod elligator;
 pub mod encless;
 mod field;
