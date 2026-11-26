@@ -1,13 +1,14 @@
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use rustvpn_client_ipc::transport::{self, ListenOptions};
 use rustvpn_client_ipc::{
     read_frame, write_frame, Client, EngineStatus, Event, Request, Response, PROTOCOL_VERSION,
 };
-use tokio::net::UnixListener;
 
 static NEXT: AtomicU64 = AtomicU64::new(0);
 
+#[cfg(unix)]
 fn socket_path() -> PathBuf {
     std::env::temp_dir().join(format!(
         "rustvpn-ipc-test-{}-{}",
@@ -16,10 +17,19 @@ fn socket_path() -> PathBuf {
     ))
 }
 
+#[cfg(windows)]
+fn socket_path() -> PathBuf {
+    PathBuf::from(format!(
+        r"\\.\pipe\rustvpn-ipc-test-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ))
+}
+
 async fn fake_daemon(path: PathBuf) -> tokio::task::JoinHandle<()> {
-    let listener = UnixListener::bind(&path).unwrap();
+    let mut listener = transport::Listener::bind(&path, &ListenOptions::default()).unwrap();
     tokio::spawn(async move {
-        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut stream = listener.accept().await.unwrap();
         let hello: Request = read_frame(&mut stream).await.unwrap().unwrap();
         assert!(matches!(hello, Request::Hello { version } if version == PROTOCOL_VERSION));
         write_frame(
@@ -58,15 +68,15 @@ async fn client_handshakes_and_requests_status() {
     assert_eq!(status.state, "connected");
     assert_eq!(status.profile.as_deref(), Some("office"));
     server.await.unwrap();
-    let _ = std::fs::remove_file(path);
+    cleanup(&path);
 }
 
 #[tokio::test]
 async fn subscribe_receives_events() {
     let path = socket_path();
-    let listener = UnixListener::bind(&path).unwrap();
+    let mut listener = transport::Listener::bind(&path, &ListenOptions::default()).unwrap();
     let server = tokio::spawn(async move {
-        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut stream = listener.accept().await.unwrap();
         let _: Request = read_frame(&mut stream).await.unwrap().unwrap();
         write_frame(
             &mut stream,
@@ -98,5 +108,15 @@ async fn subscribe_receives_events() {
     let event = stream.next().await.unwrap().unwrap();
     assert!(matches!(event, Event::Log(line) if line.line == "connected"));
     server.await.unwrap();
+    cleanup(&path);
+}
+
+#[cfg(unix)]
+fn cleanup(path: &PathBuf) {
     let _ = std::fs::remove_file(path);
+}
+
+#[cfg(windows)]
+fn cleanup(_path: &PathBuf) {
+    // The pipe disappears when the last handle is closed.
 }

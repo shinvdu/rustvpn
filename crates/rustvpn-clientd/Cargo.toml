@@ -16,5 +16,10 @@ tokio = { workspace = true }
 tokio-util = { workspace = true }
 anyhow = { workspace = true }
 zeroize = { workspace = true }
-libc = { workspace = true }
 serde = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-service = "0.8"

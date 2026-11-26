@@ -238,50 +238,88 @@ Wintun 适配器 MTU 设置为 `ip_mtu`。Windows 应在 `ip_mtu < 576` 时拒�
 
 ---
 
-## 5. Windows 服务与 IPC
+## 5. Windows 服务与 IPC（M2 实装状态）
+
+> 本节描述 `feature/client-ui` 上 M2 的实际实现。安装/注册服务仍属 M5，
+> 当前没有 `-install`/`-uninstall` 命令，也不修改宿主服务。
 
 ### 5.1 服务
 
-- `rustvpn-clientd.exe` 用 `windows-service` 接入 SCM。
-- 正式模式以 `LocalSystem` 运行；开发模式提供 `--console`。
-- 服务名建议 `rustvpn-clientd`，显示名 `RustVPN Client Daemon`。
-- 启动类型：Automatic (Delayed Start)。
-- 失败恢复：重启服务。
-- 停止流程：取消 Engine → 关闭适配器 → 恢复路由/DNS/NRPT/防火墙规则 →
-  退出。
-- 启动流程：先清理上次崩溃遗留的网络状态，再启动 IPC。
+- `rustvpn-clientd.exe` 用 `windows-service` 0.8 接入 SCM，服务名
+  `rustvpn-clientd`。
+- 运行模式：
+  - `-console`：前台模式，适合 SSH/开发；Windows 上未指定 `-service`
+    时默认也是前台。
+  - `-service`：SCM 分发器模式。M5 的 MSI 需把镜像路径写成
+    `rustvpn-clientd.exe --service`。
+- 正式模式以 `LocalSystem` 运行；服务进程不链接 GUI/Tauri。
+- 控制处理：接受 `STOP` 与 `SHUTDOWN`，取消与 SIGTERM 相同的
+  `CancellationToken`，由同一 `run` 路径执行 Engine 关闭、监听器关闭和
+  （Unix）clean marker 写入。服务状态序列为
+  `StartPending` → `Running` → `Stopped`。
+- 服务启动失败（配置错误、监听失败、运行时创建失败）写日志并以非零
+  退出码结束，便于 M5 的失败恢复策略识别。
+- 服务日志：stderr + `%ProgramData%\RustVPN\clientd.log`；可用
+  `RUSTVPN_CLIENTD_LOG` 覆盖路径。Event Log 集成留到 M5。
+- Linux 的 kill-switch marker/firewall 启动清理逻辑保持不变；Windows 在
+  M3 实现防火墙/NRPT 前不做该类清理。
 
 ### 5.2 命名管道
 
-- 管道名：`\\.\pipe\rustvpn-clientd`。
-- 字节模式；`PIPE_REJECT_REMOTE_CLIENTS`。
-- 4 字节大端长度 + JSON 的帧格式保持不变。
-- 实例数上限与现有 IPC 一致（16）。
-- Hello 超时、空闲超时、写超时沿用现有实现。
-- `Subscribe` 连接只推送事件，不处理其他请求。
+- 管道名：`\\.\pipe\rustvpn-clientd`；`-socket` 或
+  `RUSTVPN_CLIENTD_SOCKET` 可覆盖，裸名称会展开为 `\\.\pipe\<name>`。
+- 字节模式；`PIPE_REJECT_REMOTE_CLIENTS`；首次实例用
+  `FILE_FLAG_FIRST_PIPE_INSTANCE`，已存在同名管道（抢占/重复实例）直接
+  失败。
+- 4 字节大端长度 + JSON 的帧格式、Hello、空闲/写超时和 `Subscribe`
+  语义与 Unix 完全一致，`PROTOCOL_VERSION` 仍为 2。
+- 实例上限 17：最多 16 个并发连接 + 1 个始终待命的监听实例。daemon 的
+  `Semaphore(16)` 上限不变。
+- 客户端连接遇到 `ERROR_PIPE_BUSY` 最多重试 2 秒。
 
-### 5.3 访问控制
+### 5.3 访问控制与威胁模型
 
-- 用 `windows` crate 构造安全描述符，通过 Tokio
-  `ServerOptions::create_with_security_attributes_raw` 创建管道。
-- DACL 至少包含：
-  - `SYSTEM`
-  - `Administrators`
-  - 一个专用本地组（推荐）或 `INTERACTIVE`（MVP）
-- 服务端用 `GetNamedPipeClientProcessId` 获取客户端 PID，再校验用户/会话。
-- GUI 在发送口令前必须验证服务端身份：
-  - 用 `GetNamedPipeServerProcessId` 获取 PID；
-  - 读取镜像路径，确认是已安装的 `rustvpn-clientd.exe`；
-  - 校验 Authenticode 签名。
-  否则本地恶意进程可以抢占同名管道骗取口令。
+- 用 `windows-sys` 构造 SDDL，通过 Tokio
+  `ServerOptions::create_with_security_attributes_raw` 创建管道。默认
+  DACL 为 `SYSTEM + Administrators + INTERACTIVE`，并额外显式加入运行
+  daemon 的当前用户 SID（这样通过 SSH 启动的 `-console` 守护进程即使
+  token 不含 INTERACTIVE 也能被本用户连接）。显式拒绝 Everyone /
+  Anonymous；没有 null DACL。
+- 专用组：`-pipe-group <name>` 指定本地组时，DACL 用该组的 SID 取代
+  `INTERACTIVE`。Windows 服务模式下若本机存在 `RustVPN` 本地组则自动
+  启用；M5 安装器创建该组并把用户加入。控制台模式默认仍允许
+  `INTERACTIVE`，避免安装器尚未存在时把开发者锁在外面。
+- 服务端在 Hello 之前用 `GetNamedPipeClientProcessId` 取客户端 PID，并
+  `OpenProcessToken(TOKEN_QUERY)` 校验：
+  - 与 daemon 自身用户 SID 相同，或
+  - token 组包含 Administrators，以及 INTERACTIVE（未配置专用组时）
+    或配置的专用组（此时不再把 INTERACTIVE 计入）。
+  Deny-only 组（UAC 过滤 token 里的 Administrators）不计为放行；任何
+  API 失败按拒绝处理。
+- 已知限制：同用户的恶意进程仍在信任集合内；DACL + PID 校验无法区分它。
+  另外，管道对象上的 GENERIC_WRITE 映射包含 `FILE_CREATE_PIPE_INSTANCE`
+  （同一个 0x4 位），所以被允许的同用户进程仍能创建额外实例；首次实例
+  标志只能挡住 daemon 启动前已存在的抢占，启动后的竞态要等 M4 的服务端
+  镜像/签名校验。
+- 服务端身份校验（GUI 发送口令前）留到 M4：IPC 已提供
+  `Client::server_pid()`（Windows），后续还需读镜像路径 + Authenticode
+  校验。管道抢占由首次实例标志和 DACL 先挡住一部分。
+- 控制台管道的 `Local\`/`Global\` 与多用户策略：请勿在共享机上以普通
+  用户长期运行；生产以服务 + 专用组为准。
 
 ### 5.4 隧道锁
 
-- 现有 `flock` 锁在 Windows 上改为命名互斥量：
-  `CreateMutexW(L"Global\\RustVPNTunnel", ...)`。
-- 服务以 SYSTEM 创建；CLI 如未来支持，再处理 `Local\` 回退。
-- 元数据文件只用于显示占用者，不作为锁的真源。
-- 崩溃时由 OS 释放互斥量。
+- Windows 使用 `CreateMutexW` 的命名互斥量 `Global\RustVPNTunnel`。
+  `TunnelLock` 的 `acquire`/`acquire_at`/`path()` API 与 Unix 相同。
+- 互斥量所有权按线程计算，而 Tokio 任务会跨 await 迁移线程；因此
+  获取与释放放在专用 OS 线程上，`Drop` 发送释放信号并 join。
+- 进程崩溃时 OS 自动释放（下一次等待得到 `WAIT_ABANDONED`），不会留下
+  永久锁。
+- 普通用户无法创建 Global 对象且本机没有服务持锁时，回退到
+  `Local\RustVPNTunnel` 供开发使用；服务持锁时通过
+  `OpenMutexW` 检测为 busy。多用户共享机器的单隧道保证以正式服务为准。
+- 元数据文件 `%ProgramData%\RustVPN\tunnel.lock` 仅供错误信息显示，不是
+  锁的真源；`RUSTVPN_TUNNEL_LOCK` 覆盖名称/路径。Linux `flock` 行为未变。
 
 ---
 

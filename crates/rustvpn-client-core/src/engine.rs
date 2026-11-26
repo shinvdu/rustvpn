@@ -20,7 +20,6 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use zeroize::Zeroizing;
 
-#[cfg(unix)]
 use crate::lock::TunnelLock;
 use crate::mtu;
 #[cfg(unix)]
@@ -297,7 +296,6 @@ async fn run_connection(
     }
 
     // Share the tunnel lock with the CLI before touching TAP/routes.
-    #[cfg(unix)]
     let _lock = match TunnelLock::acquire(&spec.name, &spec.remote, "daemon") {
         Ok(lock) => lock,
         Err(error) => {
@@ -306,20 +304,11 @@ async fn run_connection(
             return;
         }
     };
-    #[cfg(unix)]
     emit_log(
         &events,
         "info",
         format!("tunnel lock acquired: {}", _lock.path().display()),
     );
-    if cfg!(not(unix)) {
-        emit_log(
-            &events,
-            "warn",
-            "Windows tunnel lock (Global\\RustVPNTunnel) is deferred to M2; \
-             M1 runs without the process-wide single-tunnel lock",
-        );
-    }
     #[cfg(unix)]
     crate::netcfg::cleanup_stale_ipv6_blackhole().await;
 

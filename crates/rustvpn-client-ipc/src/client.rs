@@ -2,10 +2,9 @@
 
 use std::path::Path;
 
-use tokio::net::UnixStream;
-
 use crate::frame::{read_frame, write_frame, FrameError};
 use crate::proto::{Request, Response};
+use crate::transport::{self, AsyncStream, DefaultStream};
 use crate::PROTOCOL_VERSION;
 
 #[derive(Debug, thiserror::Error)]
@@ -20,13 +19,23 @@ pub enum ClientError {
     Protocol(String),
 }
 
-pub struct Client {
-    stream: UnixStream,
+/// IPC client.  The default transport is a Unix socket on Unix and a named
+/// pipe on Windows; [`Client::connect_stream`] accepts any stream that
+/// implements [`AsyncStream`] (used by tests and future transports).
+pub struct Client<S = DefaultStream> {
+    stream: S,
 }
 
-impl Client {
+impl Client<DefaultStream> {
     pub async fn connect(path: impl AsRef<Path>) -> Result<Self, ClientError> {
-        let mut stream = UnixStream::connect(path).await?;
+        let stream = transport::connect(path.as_ref()).await?;
+        Self::connect_stream(stream).await
+    }
+}
+
+impl<S: AsyncStream> Client<S> {
+    /// Perform the Hello handshake on an already connected stream.
+    pub async fn connect_stream(mut stream: S) -> Result<Self, ClientError> {
         write_frame(
             &mut stream,
             &Request::Hello {
@@ -106,13 +115,29 @@ impl Client {
     }
 }
 
-pub struct EventStream {
-    stream: UnixStream,
+#[cfg(windows)]
+impl Client<DefaultStream> {
+    /// PID of the daemon that accepted this pipe.  M4 uses this to verify the
+    /// server image before the GUI sends a password.
+    pub fn server_pid(&self) -> std::io::Result<u32> {
+        transport::pipe_server_pid(&self.stream)
+    }
 }
 
-impl EventStream {
+pub struct EventStream<S = DefaultStream> {
+    stream: S,
+}
+
+impl EventStream<DefaultStream> {
     pub async fn subscribe(path: impl AsRef<Path>) -> Result<Self, ClientError> {
-        let mut stream = UnixStream::connect(path).await?;
+        let stream = transport::connect(path.as_ref()).await?;
+        Self::subscribe_stream(stream).await
+    }
+}
+
+impl<S: AsyncStream> EventStream<S> {
+    /// Perform Hello + Subscribe on an already connected stream.
+    pub async fn subscribe_stream(mut stream: S) -> Result<Self, ClientError> {
         write_frame(
             &mut stream,
             &Request::Hello {

@@ -1,23 +1,28 @@
 //! RustVPN client daemon.
 //!
 //! Runs the tunnel with the privileges needed for TAP/routes and exposes a
-//! local Unix socket to the GUI.  It does not link Tauri or any web view.
+//! local IPC endpoint to the GUI.  On Unix this is a Unix domain socket; on
+//! Windows it is a named pipe and the process can run as an SCM service.  It
+//! does not link Tauri or any web view.
 
 use std::collections::VecDeque;
+#[cfg(unix)]
 use std::os::unix::fs::FileTypeExt;
-use std::path::{Path, PathBuf};
+#[cfg(unix)]
+use std::path::Path;
+use std::path::PathBuf;
 use std::process;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use rustvpn_client_core::{Command, Engine, EngineOptions, ValidatedProfile};
+use rustvpn_client_ipc::transport::{self, Connection};
 use rustvpn_client_ipc::{
     read_frame, write_frame, EngineStatus, Event, LogLine, ProfileSpec, Request, Response,
     PROTOCOL_VERSION, SOCKET_ENV,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{broadcast, mpsc, Semaphore};
 use tokio_util::sync::CancellationToken;
 use zeroize::Zeroizing;
@@ -31,31 +36,99 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Content that proves the previous daemon removed its network state on a
 /// clean shutdown.  A missing or truncated marker is treated as a crash so
 /// the kill switch stays fail-closed.
+#[cfg(unix)]
 const CLEAN_SHUTDOWN_MARKER: &[u8] = b"rustvpn-clientd clean shutdown v1\n";
+
+static LOG_FILE: OnceLock<Mutex<std::fs::File>> = OnceLock::new();
+
+/// Write one daemon log line to stderr and, when configured, to a file.  In
+/// Windows service mode stderr is not visible, so the file is the primary
+/// sink until Event Log integration is added in M5.
+macro_rules! dlog {
+    ($($arg:tt)*) => {{
+        let line = format!($($arg)*);
+        eprintln!("{line}");
+        $crate::write_log_file(&line);
+    }};
+}
+
+fn write_log_file(line: &str) {
+    use std::io::Write;
+    if let Some(file) = LOG_FILE.get() {
+        if let Ok(mut file) = file.lock() {
+            let _ = writeln!(file, "{line}");
+            let _ = file.flush();
+        }
+    }
+}
+
+fn init_log_file(path: Option<PathBuf>) {
+    let Some(path) = path else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        if std::fs::create_dir_all(parent).is_err() {
+            return;
+        }
+    }
+    if let Ok(file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = LOG_FILE.set(Mutex::new(file));
+    }
+}
+
+fn init_console_log() {
+    if let Some(path) = std::env::var_os("RUSTVPN_CLIENTD_LOG") {
+        init_log_file(Some(PathBuf::from(path)));
+    }
+}
+
+/// Default service log: `%ProgramData%\RustVPN\clientd.log`.
+#[cfg(windows)]
+fn init_service_log() {
+    let path = std::env::var_os("RUSTVPN_CLIENTD_LOG")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("ProgramData")
+                .map(|dir| PathBuf::from(dir).join("RustVPN").join("clientd.log"))
+        });
+    init_log_file(path);
+}
+
+#[cfg(windows)]
+mod service;
 
 /// Sibling state file next to the IPC socket (for systemd this lives in the
 /// writable `RuntimeDirectory`).  Appending instead of `with_extension` keeps
 /// the socket name intact and avoids clashing with `client.clean`.
+#[cfg(unix)]
 fn clean_marker_path(socket: &Path) -> PathBuf {
     let mut name = socket.as_os_str().to_os_string();
     name.push(".clean");
     PathBuf::from(name)
 }
 
+#[cfg(unix)]
 fn previous_shutdown_was_clean(marker: &Path) -> bool {
     std::fs::read(marker)
         .map(|content| content == CLEAN_SHUTDOWN_MARKER)
         .unwrap_or(false)
 }
 
+#[cfg(unix)]
 fn write_clean_marker(marker: &Path) -> std::io::Result<()> {
     std::fs::write(marker, CLEAN_SHUTDOWN_MARKER)
 }
 
+#[cfg(unix)]
 fn remove_clean_marker(marker: &Path) {
     let _ = std::fs::remove_file(marker);
 }
 
+#[cfg(unix)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum StartupFirewallCleanup {
     /// The previous daemon shut down cleanly: remove all of this instance's
@@ -66,6 +139,7 @@ enum StartupFirewallCleanup {
     AfterCrash,
 }
 
+#[cfg(unix)]
 fn startup_firewall_cleanup(previous_shutdown_was_clean: bool) -> StartupFirewallCleanup {
     if previous_shutdown_was_clean {
         StartupFirewallCleanup::Clean
@@ -76,7 +150,14 @@ fn startup_firewall_cleanup(previous_shutdown_was_clean: bool) -> StartupFirewal
 
 struct Args {
     socket: PathBuf,
+    #[cfg_attr(windows, allow(dead_code))]
     socket_group: String,
+    #[cfg_attr(unix, allow(dead_code))]
+    pipe_group: Option<String>,
+    #[cfg_attr(unix, allow(dead_code))]
+    service: bool,
+    #[cfg_attr(unix, allow(dead_code))]
+    console: bool,
     hello_timeout: Duration,
     idle_timeout: Duration,
     no_host_dns: bool,
@@ -88,21 +169,25 @@ fn usage() -> ! {
     eprintln!(
         "Usage of rustvpn-clientd:\n\
          \x20 -socket path (default {})\n\
-         \x20 -socket-group group (optional; socket becomes 0660)\n\
+         \x20 -socket-group group (Unix; socket becomes 0660)\n\
+         \x20 -pipe-group group (Windows; restrict the pipe to a local group)\n\
          \x20 -hello-timeout seconds (default {DEFAULT_HELLO_TIMEOUT_SECS}; 0 disables)\n\
          \x20 -idle-timeout seconds (default {DEFAULT_IDLE_TIMEOUT_SECS}; 0 disables)\n\
          \x20 -no-host-dns (leave DNS to the caller; for netns/containers)\n\
+         \x20 -console (run in the foreground; the default on Unix)\n\
+         \x20 -service (Windows SCM service mode)\n\
          \x20 -version\n\
          \x20 -help\n\
          \n\
          The idle timeout closes connections that send no request; event\n\
          subscriptions are kept open for as long as the daemon runs.\n\
-         The socket can also be chosen with {SOCKET_ENV}.",
+         The endpoint can also be chosen with {SOCKET_ENV}.",
         default_socket().display()
     );
     process::exit(2);
 }
 
+#[cfg(unix)]
 fn default_socket() -> PathBuf {
     if let Some(path) = std::env::var_os(SOCKET_ENV) {
         return PathBuf::from(path);
@@ -114,10 +199,18 @@ fn default_socket() -> PathBuf {
     }
 }
 
+#[cfg(windows)]
+fn default_socket() -> PathBuf {
+    rustvpn_client_ipc::default_socket_path()
+}
+
 fn parse_args() -> Args {
     let mut args = Args {
         socket: default_socket(),
         socket_group: String::new(),
+        pipe_group: None,
+        service: false,
+        console: false,
         hello_timeout: Duration::from_secs(DEFAULT_HELLO_TIMEOUT_SECS),
         idle_timeout: Duration::from_secs(DEFAULT_IDLE_TIMEOUT_SECS),
         no_host_dns: false,
@@ -144,6 +237,7 @@ fn parse_args() -> Args {
         match name.as_str() {
             "socket" => args.socket = PathBuf::from(take("socket")),
             "socket-group" => args.socket_group = take("socket-group"),
+            "pipe-group" => args.pipe_group = Some(take("pipe-group")),
             "hello-timeout" => {
                 let value = take("hello-timeout");
                 args.hello_timeout = Duration::from_secs(parse_secs(&value, "hello-timeout"));
@@ -153,6 +247,8 @@ fn parse_args() -> Args {
                 args.idle_timeout = Duration::from_secs(parse_secs(&value, "idle-timeout"));
             }
             "no-host-dns" => args.no_host_dns = true,
+            "console" => args.console = true,
+            "service" | "windows-service" => args.service = true,
             "version" => args.version = true,
             "h" | "help" => args.help = true,
             "" => usage(),
@@ -175,6 +271,64 @@ fn parse_secs(value: &str, flag: &str) -> u64 {
     })
 }
 
+/// Everything `run` needs.  Built from the command line in both console and
+/// service mode so both share the same shutdown path.
+pub(crate) struct RunConfig {
+    socket: PathBuf,
+    #[cfg_attr(windows, allow(dead_code))]
+    gid: Option<u32>,
+    #[cfg_attr(unix, allow(dead_code))]
+    pipe_group: Option<String>,
+    hello_timeout: Duration,
+    idle_timeout: Duration,
+    no_host_dns: bool,
+    wait_for_signals: bool,
+}
+
+pub(crate) fn build_config(args: &Args, wait_for_signals: bool) -> Result<RunConfig> {
+    #[cfg(unix)]
+    let gid = if args.socket_group.is_empty() {
+        None
+    } else {
+        Some(resolve_gid(&args.socket_group)?)
+    };
+    #[cfg(not(unix))]
+    let gid = None;
+    Ok(RunConfig {
+        socket: args.socket.clone(),
+        gid,
+        pipe_group: resolve_pipe_group(args),
+        hello_timeout: args.hello_timeout,
+        idle_timeout: args.idle_timeout,
+        no_host_dns: args.no_host_dns,
+        wait_for_signals,
+    })
+}
+
+/// Explicit group wins.  In Windows service mode, prefer an existing
+/// `RustVPN` local group over INTERACTIVE users; console mode keeps the
+/// INTERACTIVE default so a developer is not locked out before M5 creates the
+/// group and adds members.
+#[cfg(windows)]
+fn resolve_pipe_group(args: &Args) -> Option<String> {
+    if let Some(group) = &args.pipe_group {
+        return Some(group.clone());
+    }
+    if args.service
+        && rustvpn_client_ipc::windows::local_group_exists(
+            rustvpn_client_ipc::windows::DEDICATED_GROUP,
+        )
+    {
+        return Some(rustvpn_client_ipc::windows::DEDICATED_GROUP.into());
+    }
+    None
+}
+
+#[cfg(not(windows))]
+fn resolve_pipe_group(_args: &Args) -> Option<String> {
+    None
+}
+
 #[derive(Clone)]
 struct Shared {
     status: Arc<RwLock<EngineStatus>>,
@@ -184,52 +338,63 @@ struct Shared {
     shutdown: CancellationToken,
 }
 
-#[tokio::main]
-async fn main() {
+fn main() {
     let args = parse_args();
     if args.version {
         println!("rustvpn-clientd {DAEMON_VERSION}");
         return;
     }
 
-    let gid = if args.socket_group.is_empty() {
-        None
-    } else {
-        match resolve_gid(&args.socket_group) {
-            Ok(gid) => Some(gid),
-            Err(error) => {
-                eprintln!("{error:#}");
-                process::exit(1);
-            }
+    #[cfg(windows)]
+    if args.service && !args.console {
+        if let Err(error) = service::run_dispatcher() {
+            eprintln!("cannot start the Windows service dispatcher: {error}");
+            process::exit(1);
+        }
+        return;
+    }
+    #[cfg(not(windows))]
+    if args.service {
+        eprintln!("-service is only supported on Windows; use -console");
+        process::exit(2);
+    }
+
+    init_console_log();
+    let config = match build_config(&args, true) {
+        Ok(config) => config,
+        Err(error) => {
+            dlog!("{error:#}");
+            process::exit(1);
         }
     };
-
-    if let Err(error) = run(
-        args.socket,
-        gid,
-        args.hello_timeout,
-        args.idle_timeout,
-        args.no_host_dns,
-    )
-    .await
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
     {
-        eprintln!("{error:#}");
+        Ok(runtime) => runtime,
+        Err(error) => {
+            dlog!("cannot create async runtime: {error}");
+            process::exit(1);
+        }
+    };
+    let shutdown = CancellationToken::new();
+    if let Err(error) = runtime.block_on(run(config, shutdown)) {
+        dlog!("{error:#}");
         process::exit(1);
     }
 }
 
-async fn run(
-    socket_path: PathBuf,
-    gid: Option<u32>,
-    hello_timeout: Duration,
-    idle_timeout: Duration,
-    no_host_dns: bool,
-) -> Result<()> {
-    if socket_path.as_os_str().len() >= 100 {
-        bail!("socket path is too long: {}", socket_path.display());
+async fn run(config: RunConfig, shutdown: CancellationToken) -> Result<()> {
+    let socket_path = &config.socket;
+
+    #[cfg(unix)]
+    {
+        if socket_path.as_os_str().len() >= 100 {
+            bail!("socket path is too long: {}", socket_path.display());
+        }
+        prepare_socket_parent(socket_path)?;
+        remove_stale_socket(socket_path).await?;
     }
-    prepare_socket_parent(&socket_path)?;
-    remove_stale_socket(&socket_path).await?;
 
     // Kill-switch crash policy.  Table names are scoped by the socket path, so
     // another RustVPN daemon in the same netns is not touched.
@@ -242,38 +407,50 @@ async fn run(
     //
     // The marker is removed before cleanup so a crash during startup is still
     // classified as a crash on the next start.
-    let firewall_scope = rustvpn_client_core::firewall::instance_scope(&socket_path);
-    let marker = clean_marker_path(&socket_path);
-    let clean = previous_shutdown_was_clean(&marker);
-    remove_clean_marker(&marker);
-    match startup_firewall_cleanup(clean) {
-        StartupFirewallCleanup::Clean => {
-            rustvpn_client_core::netcfg::cleanup_stale_firewall(&firewall_scope).await;
-        }
-        StartupFirewallCleanup::AfterCrash => {
-            rustvpn_client_core::netcfg::cleanup_stale_mss(&firewall_scope).await;
-            // Keep the table and guarantee its drop-policy chain exists even if
-            // the crash happened mid-create.  No DNS is allowed while idle.
-            match rustvpn_client_core::firewall::bootstrap_kill_switch(&firewall_scope, None, false)
+    let firewall_scope = rustvpn_client_core::firewall::instance_scope(socket_path);
+    #[cfg(unix)]
+    let marker = clean_marker_path(socket_path);
+    #[cfg(unix)]
+    {
+        let clean = previous_shutdown_was_clean(&marker);
+        remove_clean_marker(&marker);
+        match startup_firewall_cleanup(clean) {
+            StartupFirewallCleanup::Clean => {
+                rustvpn_client_core::netcfg::cleanup_stale_firewall(&firewall_scope).await;
+            }
+            StartupFirewallCleanup::AfterCrash => {
+                rustvpn_client_core::netcfg::cleanup_stale_mss(&firewall_scope).await;
+                // Keep the table and guarantee its drop-policy chain exists even
+                // if the crash happened mid-create.  No DNS is allowed while busy.
+                match rustvpn_client_core::firewall::bootstrap_kill_switch(
+                    &firewall_scope,
+                    None,
+                    false,
+                )
                 .await
-            {
-                Ok(true) => eprintln!(
-                    "previous run did not shut down cleanly; preserving this instance's \
-                     kill-switch table (fail-closed) until a connection replaces it or an \
-                     explicit disconnect removes it"
-                ),
-                Ok(false) => {}
-                Err(error) => eprintln!(
-                    "previous run did not shut down cleanly; cannot verify this instance's \
-                     kill-switch table: {error:#}"
-                ),
+                {
+                    Ok(true) => dlog!(
+                        "previous run did not shut down cleanly; preserving this instance's \
+                         kill-switch table (fail-closed) until a connection replaces it or an \
+                         explicit disconnect removes it"
+                    ),
+                    Ok(false) => {}
+                    Err(error) => dlog!(
+                        "previous run did not shut down cleanly; cannot verify this instance's \
+                         kill-switch table: {error:#}"
+                    ),
+                }
             }
         }
     }
+    #[cfg(not(unix))]
+    dlog!(
+        "Windows M2: firewall/kill-switch state is not installed yet (deferred to M3); \
+         the service shares the Linux clean shutdown path for IPC and the engine"
+    );
 
     let (commands_tx, commands_rx) = mpsc::channel(8);
     let (events_tx, _) = broadcast::channel(256);
-    let shutdown = CancellationToken::new();
     let status = Arc::new(RwLock::new(EngineStatus {
         state: "idle".into(),
         ..EngineStatus::default()
@@ -291,29 +468,46 @@ async fn run(
         commands_rx,
         events_tx.clone(),
         EngineOptions {
-            no_host_dns,
+            no_host_dns: config.no_host_dns,
             firewall_scope: firewall_scope.clone(),
         },
     );
     spawn_collector(events_tx.clone(), status.clone(), logs.clone());
 
-    let listener = UnixListener::bind(&socket_path)
-        .with_context(|| format!("bind {}", socket_path.display()))?;
-    apply_socket_permissions(&socket_path, gid)?;
-    eprintln!(
-        "rustvpn-clientd {DAEMON_VERSION} listening on {} (mode {})",
-        socket_path.display(),
-        if gid.is_some() { "0660" } else { "0600" }
+    let listener = transport::Listener::bind(
+        socket_path,
+        &transport::ListenOptions {
+            group: config.pipe_group.clone(),
+        },
+    )
+    .with_context(|| format!("bind {}", socket_path.display()))?;
+
+    #[cfg(unix)]
+    {
+        apply_socket_permissions(socket_path, config.gid)?;
+        eprintln!(
+            "rustvpn-clientd {DAEMON_VERSION} listening on {} (mode {})",
+            socket_path.display(),
+            if config.gid.is_some() { "0660" } else { "0600" }
+        );
+    }
+    #[cfg(not(unix))]
+    dlog!(
+        "rustvpn-clientd {DAEMON_VERSION} listening on {}",
+        socket_path.display()
     );
 
+    let policy = make_peer_policy(&config)?;
     let accept_shared = shared.clone();
+    let hello_timeout = config.hello_timeout;
+    let idle_timeout = config.idle_timeout;
     let accept = tokio::spawn(async move {
-        accept_loop(listener, accept_shared, gid, hello_timeout, idle_timeout).await;
+        accept_loop(listener, accept_shared, policy, hello_timeout, idle_timeout).await;
     });
 
     tokio::select! {
         _ = shutdown.cancelled() => {}
-        _ = wait_signal() => shutdown.cancel(),
+        _ = wait_signal(), if config.wait_for_signals => shutdown.cancel(),
     }
     let _ = shared.commands.send(Command::Shutdown).await;
     let _ = engine.await;
@@ -323,15 +517,18 @@ async fn run(
     // was stopped while idle; a clean stop restores connectivity.  Record that
     // so the next start removes any leftovers instead of treating them as a
     // crash.
-    rustvpn_client_core::netcfg::cleanup_stale_firewall(&firewall_scope).await;
-    if let Err(error) = write_clean_marker(&marker) {
-        eprintln!(
-            "warning: cannot write clean-shutdown marker {}: {error}",
-            marker.display()
-        );
+    #[cfg(unix)]
+    {
+        rustvpn_client_core::netcfg::cleanup_stale_firewall(&firewall_scope).await;
+        if let Err(error) = write_clean_marker(&marker) {
+            dlog!(
+                "warning: cannot write clean-shutdown marker {}: {error}",
+                marker.display()
+            );
+        }
+        let _ = std::fs::remove_file(socket_path);
     }
-    let _ = std::fs::remove_file(&socket_path);
-    eprintln!("rustvpn-clientd stopped");
+    dlog!("rustvpn-clientd stopped");
     Ok(())
 }
 
@@ -355,7 +552,7 @@ fn spawn_collector(
                     }
                 }
                 Ok(Event::Log(line)) => {
-                    eprintln!("[{}] {}", line.level, line.line);
+                    dlog!("[{}] {}", line.level, line.line);
                     if let Ok(mut ring) = logs.lock() {
                         if ring.len() >= MAX_LOG_LINES {
                             ring.pop_front();
@@ -364,10 +561,10 @@ fn spawn_collector(
                     }
                 }
                 Ok(Event::Lagged { missed }) => {
-                    eprintln!("client event collector lagged by {missed} event(s)");
+                    dlog!("client event collector lagged by {missed} event(s)");
                 }
                 Err(broadcast::error::RecvError::Lagged(missed)) => {
-                    eprintln!("client event collector lagged by {missed} event(s)");
+                    dlog!("client event collector lagged by {missed} event(s)");
                 }
                 Err(broadcast::error::RecvError::Closed) => break,
             }
@@ -375,29 +572,45 @@ fn spawn_collector(
     });
 }
 
+#[cfg(unix)]
+type PeerPolicy = Option<u32>;
+#[cfg(windows)]
+type PeerPolicy = rustvpn_client_ipc::windows::ClientPolicy;
+
+#[cfg(unix)]
+fn make_peer_policy(config: &RunConfig) -> Result<PeerPolicy> {
+    Ok(config.gid)
+}
+
+#[cfg(windows)]
+fn make_peer_policy(config: &RunConfig) -> Result<PeerPolicy> {
+    rustvpn_client_ipc::windows::ClientPolicy::new(config.pipe_group.as_deref())
+        .context("build the pipe client policy")
+}
+
 async fn accept_loop(
-    listener: UnixListener,
+    mut listener: transport::Listener,
     shared: Shared,
-    gid: Option<u32>,
+    policy: PeerPolicy,
     hello_timeout: Duration,
     idle_timeout: Duration,
 ) {
     let limit = Arc::new(Semaphore::new(16));
     loop {
-        let (stream, _) = match listener.accept().await {
-            Ok(pair) => pair,
+        let stream = match listener.accept().await {
+            Ok(stream) => stream,
             Err(error) => {
-                eprintln!("accept failed: {error}");
+                dlog!("accept failed: {error}");
                 tokio::time::sleep(Duration::from_secs(1)).await;
                 continue;
             }
         };
-        if !peer_allowed(&stream, gid) {
-            eprintln!("rejected unauthorized IPC client");
+        if !peer_allowed(&stream, &policy) {
+            dlog!("rejected unauthorized IPC client");
             continue;
         }
         let Ok(permit) = limit.clone().try_acquire_owned() else {
-            eprintln!("too many IPC connections; dropping client");
+            dlog!("too many IPC connections; dropping client");
             continue;
         };
         let shared = shared.clone();
@@ -405,14 +618,14 @@ async fn accept_loop(
             let _permit = permit;
             if let Err(error) = handle_connection(stream, shared, hello_timeout, idle_timeout).await
             {
-                eprintln!("IPC client failed: {error:#}");
+                dlog!("IPC client failed: {error:#}");
             }
         });
     }
 }
 
 async fn handle_connection(
-    mut stream: UnixStream,
+    mut stream: Connection,
     shared: Shared,
     hello_timeout: Duration,
     idle_timeout: Duration,
@@ -511,7 +724,7 @@ async fn handle_connection(
             }
             Request::Subscribe => {
                 write_value(&mut stream, &Response::Subscribed).await?;
-                let (read, write) = stream.into_split();
+                let (read, write) = tokio::io::split(stream);
                 subscribe_loop(read, write, &shared).await?;
                 return Ok(());
             }
@@ -557,11 +770,11 @@ async fn connect(profile: ProfileSpec, password: String, shared: &Shared) -> Res
     }
 }
 
-async fn subscribe_loop(
-    mut read: tokio::net::unix::OwnedReadHalf,
-    mut write: tokio::net::unix::OwnedWriteHalf,
-    shared: &Shared,
-) -> Result<()> {
+async fn subscribe_loop<R, W>(mut read: R, mut write: W, shared: &Shared) -> Result<()>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
     let mut rx = shared.events.subscribe();
     loop {
         tokio::select! {
@@ -608,74 +821,15 @@ async fn wait_signal() {
     }
 }
 
-fn prepare_socket_parent(path: &Path) -> Result<()> {
-    let Some(parent) = path.parent() else {
-        return Ok(());
-    };
-    let existed = parent.exists();
-    std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
-    #[cfg(unix)]
-    if !existed {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = std::fs::metadata(parent)?.permissions();
-        let system = parent == Path::new("/run/rustvpn-client");
-        perms.set_mode(if system { 0o755 } else { 0o700 });
-        std::fs::set_permissions(parent, perms)?;
-    }
-    Ok(())
-}
-
-async fn remove_stale_socket(path: &Path) -> Result<()> {
-    let meta = match std::fs::symlink_metadata(path) {
-        Ok(meta) => meta,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error.into()),
-    };
-    if !meta.file_type().is_socket() {
-        bail!("{} exists and is not a socket", path.display());
-    }
-    match UnixStream::connect(path).await {
-        Ok(_) => bail!(
-            "another rustvpn-clientd is already listening on {}",
-            path.display()
-        ),
-        Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => {
-            std::fs::remove_file(path)
-                .with_context(|| format!("remove stale socket {}", path.display()))?;
-        }
-        Err(error) => {
-            return Err(error).with_context(|| format!("probe existing socket {}", path.display()));
-        }
-    }
-    Ok(())
-}
-
-fn apply_socket_permissions(path: &Path, gid: Option<u32>) -> Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = std::fs::metadata(path)?.permissions();
-        perms.set_mode(if gid.is_some() { 0o660 } else { 0o600 });
-        std::fs::set_permissions(path, perms)?;
-        if let Some(gid) = gid {
-            use std::os::unix::fs::MetadataExt;
-            if std::fs::metadata(path)?.gid() != gid {
-                std::os::unix::fs::chown(path, None, Some(gid))
-                    .with_context(|| format!("chown socket to gid {gid}"))?;
-            }
-        }
-    }
-    Ok(())
-}
-
-fn peer_allowed(stream: &UnixStream, gid: Option<u32>) -> bool {
+#[cfg(unix)]
+fn peer_allowed(stream: &Connection, gid: &PeerPolicy) -> bool {
     let Ok(cred) = stream.peer_cred() else {
         return false;
     };
     if cred.uid() == 0 || cred.uid() == unsafe { libc::geteuid() } {
         return true;
     }
-    if let Some(gid) = gid {
+    if let Some(gid) = *gid {
         if cred.gid() == gid {
             return true;
         }
@@ -687,8 +841,17 @@ fn peer_allowed(stream: &UnixStream, gid: Option<u32>) -> bool {
     cred.uid() == unsafe { libc::geteuid() }
 }
 
+#[cfg(windows)]
+fn peer_allowed(stream: &Connection, policy: &PeerPolicy) -> bool {
+    match stream.peer_pid() {
+        Ok(pid) => policy.allows(pid),
+        Err(_) => false,
+    }
+}
+
 /// `SO_PEERCRED` only reports the primary gid; desktop users join the
 /// service group as a supplementary group, so consult `/proc/<pid>/status`.
+#[cfg(unix)]
 fn supplementary_has_gid(pid: i32, gid: u32) -> bool {
     let path = format!("/proc/{pid}/status");
     let Ok(status) = std::fs::read_to_string(path) else {
@@ -703,6 +866,7 @@ fn supplementary_has_gid(pid: i32, gid: u32) -> bool {
         .any(|value| value == gid)
 }
 
+#[cfg(unix)]
 fn resolve_gid(name: &str) -> Result<u32> {
     if let Ok(gid) = name.parse::<u32>() {
         return Ok(gid);
@@ -722,16 +886,78 @@ fn resolve_gid(name: &str) -> Result<u32> {
     bail!("group {name} not found in /etc/group")
 }
 
+#[cfg(unix)]
+fn prepare_socket_parent(path: &Path) -> Result<()> {
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
+    let existed = parent.exists();
+    std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    use std::os::unix::fs::PermissionsExt;
+    if !existed {
+        let mut perms = std::fs::metadata(parent)?.permissions();
+        let system = parent == Path::new("/run/rustvpn-client");
+        perms.set_mode(if system { 0o755 } else { 0o700 });
+        std::fs::set_permissions(parent, perms)?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+async fn remove_stale_socket(path: &Path) -> Result<()> {
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    if !meta.file_type().is_socket() {
+        bail!("{} exists and is not a socket", path.display());
+    }
+    match transport::connect(path).await {
+        Ok(_) => bail!(
+            "another rustvpn-clientd is already listening on {}",
+            path.display()
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => {
+            std::fs::remove_file(path)
+                .with_context(|| format!("remove stale socket {}", path.display()))?;
+        }
+        Err(error) => {
+            return Err(error).with_context(|| format!("probe existing socket {}", path.display()));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn apply_socket_permissions(path: &Path, gid: Option<u32>) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let mut perms = std::fs::metadata(path)?.permissions();
+    perms.set_mode(if gid.is_some() { 0o660 } else { 0o600 });
+    std::fs::set_permissions(path, perms)?;
+    if let Some(gid) = gid {
+        use std::os::unix::fs::MetadataExt;
+        if std::fs::metadata(path)?.gid() != gid {
+            std::os::unix::fs::chown(path, None, Some(gid))
+                .with_context(|| format!("chown socket to gid {gid}"))?;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
+    #[cfg(unix)]
     #[test]
     fn numeric_gid_is_accepted() {
         assert_eq!(resolve_gid("12345").unwrap(), 12345);
     }
 
+    #[cfg(unix)]
     #[test]
     fn supplementary_groups_include_primary_group() {
         let gid = unsafe { libc::getegid() };
@@ -764,6 +990,7 @@ mod tests {
             .is_none());
     }
 
+    #[cfg(unix)]
     #[test]
     fn clean_shutdown_marker_requires_exact_complete_content() {
         let dir =
@@ -786,6 +1013,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[cfg(unix)]
     #[test]
     fn startup_policy_preserves_the_kill_switch_only_after_a_crash() {
         assert_eq!(
@@ -798,6 +1026,26 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unix_peer_policy_allows_the_same_user_and_group() {
+        let path =
+            std::env::temp_dir().join(format!("rustvpn-clientd-peer-{}", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let mut listener =
+            transport::Listener::bind(&path, &transport::ListenOptions::default()).unwrap();
+        let _client = transport::connect(&path).await.unwrap();
+        let connection = listener.accept().await.unwrap();
+        // Same-user is allowed regardless of group configuration.
+        assert!(peer_allowed(&connection, &None));
+        assert!(peer_allowed(&connection, &Some(u32::MAX)));
+        let own_gid = unsafe { libc::getegid() };
+        assert!(peer_allowed(&connection, &Some(own_gid)));
+        drop(connection);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(unix)]
     #[test]
     fn socket_permissions_are_owner_only_without_group() {
         let path =
