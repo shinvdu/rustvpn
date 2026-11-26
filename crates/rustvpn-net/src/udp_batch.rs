@@ -202,7 +202,19 @@ pub async fn recv_batch(
     if bufs.is_empty() || lens.is_empty() || addrs.is_empty() {
         return Ok(0);
     }
-    let (n, addr) = socket.recv_from(&mut bufs[0]).await?;
+    let (n, addr) = match socket.recv_from(&mut bufs[0]).await {
+        Ok(value) => value,
+        // Windows reports an undersized receive buffer as WSAEMSGSIZE and
+        // discards the datagram.  Mirror the Linux MSG_TRUNC contract: the
+        // caller sees a truncated entry (`lens[0] == 0`) and drops it.
+        #[cfg(target_os = "windows")]
+        Err(e) if e.raw_os_error() == Some(10040) => {
+            lens[0] = 0;
+            addrs[0] = SocketAddr::from(([0, 0, 0, 0], 0));
+            return Ok(1);
+        }
+        Err(e) => return Err(e),
+    };
     lens[0] = n;
     addrs[0] = addr;
     Ok(1)

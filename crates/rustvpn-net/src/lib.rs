@@ -6,6 +6,7 @@ pub mod config;
 pub mod network;
 pub mod peer;
 pub mod scripts;
+pub mod shim;
 pub mod stats;
 pub mod tap;
 pub mod udp_batch;

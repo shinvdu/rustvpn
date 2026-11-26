@@ -4,8 +4,17 @@
 //! It sends full `MAX_BATCH` batches and drains them with `recv_batch`,
 //! reporting the combined per-datagram cost.  Use it to compare batching
 //! against a plain `send_to`/`recv_from` loop on the same host.
+//!
+//! The real benchmark is Linux-only; other targets build a stub so
+//! `cargo check --all-targets` works on Windows.
+
+#![cfg_attr(
+    not(target_os = "linux"),
+    allow(dead_code, unused_imports, unused_variables)
+)]
 
 use std::net::SocketAddr;
+#[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
 use std::time::{Duration, Instant};
 
@@ -47,6 +56,7 @@ async fn round(
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
 fn bump_socket_buffer(sock: &UdpSocket, name: i32) {
     let bytes: i32 = 4 * 1024 * 1024;
     unsafe {
@@ -60,6 +70,7 @@ fn bump_socket_buffer(sock: &UdpSocket, name: i32) {
     }
 }
 
+#[cfg(target_os = "linux")]
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
     let rx = UdpSocket::bind("127.0.0.1:0").await?;
@@ -95,4 +106,9 @@ async fn main() -> std::io::Result<()> {
         total * PAYLOAD as f64 / secs / 1e6,
     );
     Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn main() {
+    println!("mmsg_bench is a Linux-only benchmark");
 }

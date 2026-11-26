@@ -5,21 +5,29 @@
 //! exponential backoff.
 
 use std::future::Future;
+use std::net::Ipv4Addr;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use anyhow::Context;
+use ipnet::IpNet;
 use rustvpn_client_ipc::{EngineStatus, Event, LogLine, ProfileSpec, TrafficSample};
 use rustvpn_net::stats::StatsState;
-use rustvpn_net::tap::Tap;
-use rustvpn_proto::MAX_BYTES_PER_KEY;
+use rustvpn_net::tap::{Tap, TapConfig};
+use rustvpn_proto::{Mode, MAX_BYTES_PER_KEY};
 use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use zeroize::Zeroizing;
 
+#[cfg(unix)]
 use crate::lock::TunnelLock;
-use crate::mtu::{self, OuterFamily};
-use crate::netcfg::{FirewallOptions, NetOptions, NetworkGuard};
+use crate::mtu;
+#[cfg(unix)]
+use crate::mtu::OuterFamily;
+use crate::netcfg::NetworkGuard;
+#[cfg(unix)]
+use crate::netcfg::{FirewallOptions, NetOptions};
 use crate::profile::ValidatedProfile;
 use crate::session::{resolve_endpoints, start_session, Endpoints, Session, SessionEnd};
 
@@ -104,6 +112,7 @@ impl Engine {
                             // An explicit disconnect restores connectivity even
                             // when the daemon is idle with a crash-preserved
                             // kill-switch table (no connection guard to remove).
+                            #[cfg(unix)]
                             crate::firewall::cleanup_stale(&options.firewall_scope).await;
                             let _ = events.send(Event::State(EngineStatus {
                                 state: "idle".into(),
@@ -180,6 +189,10 @@ impl BootstrapState {
 
     /// A preserved table exists but its DNS allowance is not confirmed open
     /// (the initial bootstrap has not succeeded yet).
+    ///
+    /// The crash-preserved kill switch is Unix/nftables-only; Windows keeps
+    /// the neutral state machine compiled but does not use this constructor.
+    #[cfg_attr(target_os = "windows", allow(dead_code))]
     fn pending() -> Self {
         Self {
             active: true,
@@ -241,6 +254,9 @@ impl BootstrapState {
 
     /// A successful handshake installed the full rule set (or removed the
     /// table).  The temporary allowance is gone in either case.
+    ///
+    /// Unix/nftables-only path; see [`Self::pending`].
+    #[cfg_attr(target_os = "windows", allow(dead_code))]
     fn replaced(&mut self) {
         *self = Self::inactive();
     }
@@ -268,7 +284,20 @@ async fn run_connection(
         }
     };
 
+    // The Windows M1 client does not implement the nftables/firewall kill
+    // switch.  Refuse an opt-in kill-switch profile instead of silently
+    // leaving the host fail-open while the profile claims otherwise.
+    if cfg!(not(unix)) && spec.kill_switch {
+        let message = "kill_switch is not implemented in the Windows M1 client; \
+                       refusing to connect rather than silently leaving the host fail-open \
+                       (deferred to M3)";
+        emit_error(&events, &spec, message.to_string());
+        emit_log(&events, "error", message);
+        return;
+    }
+
     // Share the tunnel lock with the CLI before touching TAP/routes.
+    #[cfg(unix)]
     let _lock = match TunnelLock::acquire(&spec.name, &spec.remote, "daemon") {
         Ok(lock) => lock,
         Err(error) => {
@@ -277,11 +306,21 @@ async fn run_connection(
             return;
         }
     };
+    #[cfg(unix)]
     emit_log(
         &events,
         "info",
         format!("tunnel lock acquired: {}", _lock.path().display()),
     );
+    if cfg!(not(unix)) {
+        emit_log(
+            &events,
+            "warn",
+            "Windows tunnel lock (Global\\RustVPNTunnel) is deferred to M2; \
+             M1 runs without the process-wide single-tunnel lock",
+        );
+    }
+    #[cfg(unix)]
     crate::netcfg::cleanup_stale_ipv6_blackhole().await;
 
     // Argon2d is intentionally expensive.  Keep it off the async workers so
@@ -317,6 +356,7 @@ async fn run_connection(
     // leave a temporary DNS hole in a preserved table.
     let scope = options.firewall_scope.clone();
     let mut bootstrap = BootstrapState::inactive();
+    #[cfg(unix)]
     if crate::firewall::kill_switch_present(&scope).await {
         bootstrap = BootstrapState::pending();
         match crate::firewall::bootstrap_kill_switch(&scope, None, true).await {
@@ -387,8 +427,11 @@ async fn run_connection(
     };
 
     // Encless is the only case where the outer path capacity still matters
-    // for a warning.  This never changes the configured wire MTU.
+    // for a warning.  This never changes the configured wire MTU.  The probe
+    // uses Linux `ip`, so it is Unix-only; Windows gets the same v1 MTU
+    // contract without a path-MTU check.
     let mut endpoints: Option<Endpoints> = None;
+    #[cfg(unix)]
     if spec.encless {
         match resolve_endpoints(&spec.remote, &spec.proxy).await {
             Ok(resolved) => endpoints = Some(resolved),
@@ -424,7 +467,26 @@ async fn run_connection(
         mss_v6,
     };
 
-    let tap = match Tap::open(&spec.iface, daemon_mtu) {
+    // Build the platform-neutral interface config.  Linux ignores the
+    // Windows-only fields; Windows uses the verifier id for a stable synthetic
+    // MAC and the derived inner IP MTU (never the wire budget).
+    let tap_config = match tap_config_for(&validated, &spec, mode, daemon_mtu, link_mtu) {
+        Ok(config) => config,
+        Err(error) => {
+            emit_error(
+                &events,
+                &spec,
+                format!("configure TAP {}: {error:#}", spec.iface),
+            );
+            emit_log(
+                &events,
+                "error",
+                format!("configure TAP {}: {error:#}", spec.iface),
+            );
+            return;
+        }
+    };
+    let tap = match Tap::open_with_config(&tap_config).await {
         Ok(tap) => Arc::new(tap),
         Err(error) => {
             emit_error(&events, &spec, format!("open TAP {}: {error}", spec.iface));
@@ -437,10 +499,30 @@ async fn run_connection(
         }
     };
     emit_log(&events, "info", format!("TAP {} opened", spec.iface));
+    #[cfg(unix)]
     if let Err(error) = crate::netcfg::bring_link_up(&spec.iface, link_mtu).await {
         emit_error(&events, &spec, format!("bring up TAP: {error:#}"));
         emit_log(&events, "error", format!("bring up TAP: {error:#}"));
         return;
+    }
+    if cfg!(not(unix)) {
+        emit_log(
+            &events,
+            "info",
+            format!(
+                "Windows Wintun adapter {} configured with test address {} and interface MTU {}; \
+                 gateway/DNS/routes/NRPT are not installed in M1 (deferred to M3)",
+                spec.iface, spec.address, link_mtu
+            ),
+        );
+        if spec.mss_clamp {
+            emit_log(
+                &events,
+                "warn",
+                "MSS clamping is not implemented on Windows M1; TCP segmentation relies on the \
+                 configured wire-MTU contract (deferred to M3)",
+            );
+        }
     }
 
     let stats_state = StatsState::new();
@@ -449,6 +531,7 @@ async fn run_connection(
     // attempt cannot black-hole the host.  After the first success the address
     // is pinned for reconnects (the tunnel may own the default route at that
     // point, which would make a fresh DNS lookup unreliable).
+    #[cfg_attr(target_os = "windows", allow(unused_mut))]
     let mut guard: Option<NetworkGuard> = None;
     let mut attempt: u32 = 0;
     let mut last_status = base_status(&validated, resolved, applied_from_guard(guard.as_ref()));
@@ -514,6 +597,7 @@ async fn run_connection(
             Attempt::Succeeded(mut session) => {
                 let mut connected_status =
                     base_status(&validated, resolved, applied_from_guard(guard.as_ref()));
+                #[cfg(unix)]
                 if guard.is_none() {
                     let outer = endpoints.as_ref().and_then(Endpoints::outer);
                     let net_options = NetOptions {
@@ -572,6 +656,17 @@ async fn run_connection(
                             return;
                         }
                     }
+                }
+                if !cfg!(unix) && guard.is_none() {
+                    // M1 deliberately does not install routes, DNS, NRPT or
+                    // firewall rules.  The Wintun adapter itself only carries
+                    // the isolated test address/MTU; full network setup is M3.
+                    emit_log(
+                        &events,
+                        "warn",
+                        "Windows M1: no default/split routes, DNS or NRPT were installed; \
+                         only the isolated Wintun test adapter is configured (deferred to M3)",
+                    );
                 }
 
                 attempt = 0;
@@ -691,6 +786,57 @@ async fn run_connection(
     }
     drop(tap);
     emit_log(&events, "info", "tunnel stopped");
+}
+
+/// Build the platform-neutral interface config from a validated profile.
+///
+/// Only the numeric wire MTU is carried into the transport; the interface MTU
+/// is derived by [`TapConfig`] and cross-checked against the engine's own
+/// `mtu::from_wire` result so the two can never drift.
+fn tap_config_for(
+    validated: &ValidatedProfile,
+    spec: &ProfileSpec,
+    mode: Mode,
+    wire_mtu: usize,
+    expected_inner_mtu: usize,
+) -> anyhow::Result<TapConfig> {
+    let address: IpNet = spec
+        .address
+        .parse()
+        .with_context(|| format!("invalid address {:?}", spec.address))?;
+    let gateway = if spec.gateway.trim().is_empty() {
+        None
+    } else {
+        Some(
+            spec.gateway
+                .parse::<Ipv4Addr>()
+                .with_context(|| format!("invalid gateway {:?}", spec.gateway))?,
+        )
+    };
+    let dns = spec
+        .dns
+        .iter()
+        .map(|server| {
+            server
+                .parse::<Ipv4Addr>()
+                .with_context(|| format!("invalid DNS server {server:?}"))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+
+    let config = TapConfig::new(&spec.iface, wire_mtu, mode, address)
+        .with_gateway(gateway)
+        .with_dns(dns)
+        .with_verifier_id(validated.verifier().id);
+    let derived = config
+        .inner_ip_mtu()
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    if derived != expected_inner_mtu {
+        return Err(anyhow::anyhow!(
+            "platform interface MTU {derived} disagrees with the engine-derived inner MTU \
+             {expected_inner_mtu}"
+        ));
+    }
+    Ok(config)
 }
 
 /// Result of one attempt's bootstrap, resolution and handshake phases.
@@ -1029,6 +1175,37 @@ mod tests {
             mss_v4: Some(1460),
             mss_v6: Some(1440),
         }
+    }
+
+    #[test]
+    fn tap_config_from_profile_uses_verifier_id_and_derived_mtu() {
+        let validated = validated_profile();
+        let cfg = tap_config_for(&validated, validated.spec(), Mode::Plain, 1515, 1500)
+            .expect("platform config");
+        assert_eq!(cfg.name, "rsvpn0");
+        assert_eq!(cfg.wire_mtu, 1515);
+        assert_eq!(cfg.inner_ip_mtu().unwrap(), 1500);
+        assert_eq!(cfg.verifier_id, validated.verifier().id);
+        assert_eq!(cfg.address.to_string(), "10.88.0.2/24");
+        assert_eq!(cfg.gateway, Some(Ipv4Addr::new(10, 88, 0, 1)));
+        assert_eq!(cfg.dns, vec![Ipv4Addr::new(10, 88, 0, 1)]);
+
+        // A disagreement with the engine's own derivation is rejected instead
+        // of silently re-deriving a platform-specific MTU.
+        assert!(tap_config_for(&validated, validated.spec(), Mode::Plain, 1515, 1499).is_err());
+    }
+
+    #[test]
+    fn tap_config_from_noise_profile_reserves_padding() {
+        let mut spec = validated_profile().spec().clone();
+        spec.noise = true;
+        spec.mtu = 1539;
+        let validated = ValidatedProfile::new(&spec).unwrap();
+        let cfg =
+            tap_config_for(&validated, &spec, Mode::Noise, 1539, 1500).expect("platform config");
+        assert_eq!(cfg.wire_mtu, 1539);
+        assert_eq!(cfg.inner_ip_mtu().unwrap(), 1500);
+        assert_eq!(cfg.verifier_id, validated.verifier().id);
     }
 
     #[test]

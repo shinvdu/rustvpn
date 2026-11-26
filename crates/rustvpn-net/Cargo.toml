@@ -10,8 +10,6 @@ rustvpn-crypto = { path = "../rustvpn-crypto" }
 rustvpn-proto = { path = "../rustvpn-proto" }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
-tun = { workspace = true }
-libc = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml_ng = { workspace = true }
@@ -30,5 +28,14 @@ ipnet = "2"
 tokio = { workspace = true, features = ["test-util"] }
 tempfile = "3"
 
+[target.'cfg(not(target_os = "windows"))'.dependencies]
+tun = { workspace = true }
+
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = "0.7"
+libc = { workspace = true }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+# Wintun L3 adapter + the absolute-path/SHA-256 DLL policy.
+wintun-bindings = "0.7.40"
+sha2 = { workspace = true }

@@ -91,7 +91,7 @@ pub async fn call_down(path: &str, iface: &str, remote: &str) {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;

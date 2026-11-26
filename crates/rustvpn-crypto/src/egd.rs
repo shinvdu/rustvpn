@@ -3,7 +3,9 @@
 //! Implements GoVPN's `EGDRand`: connect, send {0x02, len}, read exactly
 //! len bytes, close.
 
+#[cfg(unix)]
 use std::io::{Read, Write};
+#[cfg(unix)]
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 
@@ -18,6 +20,7 @@ impl EgDRng {
         Self { path: path.into() }
     }
 
+    #[cfg(unix)]
     fn fill(&self, dest: &mut [u8]) -> Result<(), Error> {
         let mut off = 0;
         while off < dest.len() {
@@ -33,6 +36,19 @@ impl EgDRng {
             off += chunk;
         }
         Ok(())
+    }
+
+    /// EGD is a Unix-domain-socket protocol and has no Windows transport.
+    ///
+    /// Windows builds still compile the type so shared session code links, but
+    /// every read fails instead of silently substituting another entropy
+    /// source.  EGD is optional and not used by the Windows client.
+    #[cfg(not(unix))]
+    fn fill(&self, _dest: &mut [u8]) -> Result<(), Error> {
+        // Keep the configured path observable so the field is not dead code on
+        // Windows; the error is intentionally generic (no entropy substituted).
+        let _ = &self.path;
+        Err(Error::from(core::num::NonZeroU32::new(1).unwrap()))
     }
 }
 

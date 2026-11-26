@@ -6,6 +6,7 @@
 
 pub mod engine;
 pub mod firewall;
+#[cfg(unix)]
 pub mod lock;
 pub mod mtu;
 pub mod netcfg;
@@ -13,6 +14,7 @@ pub mod profile;
 pub mod session;
 
 pub use engine::{Command, Engine, EngineOptions};
+#[cfg(unix)]
 pub use lock::TunnelLock;
 pub use mtu::WireMtu;
 pub use netcfg::NetworkGuard;
