@@ -234,6 +234,24 @@ rustvpn-admind -listen 127.0.0.1:8080 -control /run/rustvpn/control.sock \
 - 管理端可禁用/轮换/踢下线，但**不能编辑 `up`/`down` 脚本内容**；server 侧 `-script-dir` 是最终校验。
 - 详细用法、权限、API、统计口径与限制见 [`admin-web-ui.md`](../admin-web-ui.md)。
 
+## 桌面客户端 UI（可选）
+
+Linux 上可以使用 Tauri 桌面客户端，与 `rustvpn-client` CLI 完全独立：
+
+```bash
+cargo build --release -p rustvpn-clientd -p rustvpn-client-gui
+sudo install -m 0755 target/release/rustvpn-clientd /usr/local/bin/
+sudo install -m 0755 target/release/rustvpn-client-ui /usr/local/bin/
+```
+
+要点：
+
+- GUI 以普通用户运行；`rustvpn-clientd` 使用 `CAP_NET_ADMIN`/`CAP_NET_RAW` 和本地 Unix socket。
+- GUI profile 必须有 IPv4 `address`；全隧道（`routes` 含 `default`）还必须同时提供 `gateway` 和 IPv4 `dns`。
+- 首次握手成功后才安装路由/DNS，失败握手不会把主机默认路由指向未建立的隧道；全隧道会阻断 IPv6 默认路由以避免泄漏。
+- daemon 与 CLI 共用 `/run/rustvpn-client/tunnel.lock`，同一时刻只允许一个活动隧道。
+- GUI 用户需加入 `rustvpn` 组；systemd unit、安装和迁移步骤见[客户端文档](../client-ui.md)。
+
 <a id="passphrase-rotation"></a>
 ## 口令轮换
 

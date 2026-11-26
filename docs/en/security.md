@@ -99,6 +99,12 @@ secrecy.
 - **No automatic MTU adjustment.** Misconfigured MTU causes large frames
   to be rejected; it is not a confidentiality issue, but it can look like
   an outage.
+- **Desktop client leak boundary (optional).** The GUI's `rustvpn-clientd`
+  blocks the IPv6 default route and requires IPv4 DNS only for a full tunnel
+  (`routes` containing `default`). Split-tunnel profiles do not block IPv6 or
+  system DNS and may leak. Routes/DNS are installed only after the first
+  successful handshake; the daemon and CLI share a tunnel lock. See the
+  [desktop client guide](../client-ui.md) (currently in Chinese).
 - **Only Linux is tested.** Run on platforms you can audit and test.
 
 ## Hardening checklist

@@ -52,6 +52,20 @@ Validation performed at startup:
 - `-encless` requires `-proto tcp` (or `-proxy`, which forces TCP).
 - An unknown `-proto` value is rejected.
 
+## Desktop client profile (optional)
+
+The Tauri client does not read CLI flags; it uses
+`~/.config/rustvpn/profiles/*.yaml`. Differences from the CLI:
+
+- An IPv4 `address` is required. A full tunnel (`routes` containing
+  `default`/`0.0.0.0/0`) also needs `gateway` and at least one IPv4 `dns`.
+- The default `iface` is `rsvpn-gui`, avoiding a collision with a local
+  `rustvpn-client` using `tap0`/`rsvpn0`.
+- `up`/`down` scripts are not supported; `rustvpn-clientd` manages addresses,
+  routes, DNS and IPv6 leak protection itself.
+- Full fields, build, systemd, migration and troubleshooting are in the
+  [desktop client guide](../client-ui.md) (currently in Chinese).
+
 ## `rustvpn-verifier` flags
 
 | Flag | Meaning | Default |

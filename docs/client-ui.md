@@ -95,11 +95,14 @@ ipv6: false                # 暂不支持
   路由指向未建立的隧道，避免“连不上还断网”。
 - 默认路由以 metric 50 安装；安装前先为服务器/代理地址添加 `/32` 防环路由，
   断开时按相反顺序清理。远程地址只在需要时解析一次，重连复用。
-- 全隧道连接期间会添加 `ip -6 route blackhole default metric 50`，阻断 IPv6
-  默认路由以避免泄漏；断开时删除。IPv6 本身仍不支持隧道。
+- 全隧道连接期间会添加带标记的 IPv6 黑洞路由
+  `ip -6 route add blackhole default proto 66 metric 50`，阻断 IPv6 默认路由
+  以避免泄漏；断开时删除。IPv6 本身仍不支持隧道。
 - DNS 通过 `resolvectl` 设置并 `domain ~.`；全隧道配置下缺少 `resolvectl` 会
   拒绝连接，而不是静默泄漏 DNS。非标准路径可用
   `RUSTVPN_RESOLVECTL_BIN=/path/to/resolvectl` 指定。
+- 若系统已有 metric 50 的同目标默认路由，安装会**失败关闭**，不会把“已连接”
+  显示成实际接管了默认路由。
 
 ## systemd 与权限
 
@@ -169,6 +172,32 @@ cargo clippy --workspace --all-targets -- -D warnings
 > （`User=rustvpn` + ambient `CAP_NET_ADMIN`/`CAP_NET_RAW`）运行时 TAP 创建与
 > SIGTERM 清理正常；daemon/CLI 隧道锁单测通过。
 
+## 从旧版本升级
+
+- 旧 profile 若 `address` 为空，现在会被 daemon 拒绝。编辑 profile 填写
+  `address`（以及全隧道的 `gateway`/`dns`）。
+- 旧 profile 若仍使用 `iface: rsvpn0`，请改成 `rsvpn-gui` 或 `rsvpn1`，
+  避免与本机 CLI 服务冲突。
+- 全隧道 profile 必须同时提供 `gateway` 和至少一个 IPv4 `dns`。
+- daemon 与 CLI 现在共用隧道锁。若同时部署 `rustvpn-client.service`，
+  给它补上 `RuntimeDirectory=rustvpn-client` 和
+  `RuntimeDirectoryMode=0750`，否则锁目录可能由 daemon 之外的对象创建。
+- socket 与锁默认位于 `/run/rustvpn-client/`，不再使用 `/run/rustvpn`。
+
+## 故障排查
+
+| 现象 | 处理 |
+|---|---|
+| `profile has no address` | profile 必须填写 TAP `address`；GUI 和 daemon 都会拒绝 |
+| `full-tunnel profile requires ...` | 全隧道补 `gateway` 和 IPv4 `dns` |
+| `another RustVPN tunnel is already active` | 关闭另一个 GUI/CLI；查看锁文件元数据，确认没有残留进程 |
+| `default route metric 50 already exists` | 已有其他路由占用；停止冲突的 VPN/路由后再连接 |
+| `resolvectl not found` / `resolvectl domain ~. failed` | 安装并启用 systemd-resolved，或设置 `RUSTVPN_RESOLVECTL_BIN` |
+| `Device or resource busy` | profile `iface` 与本机接口（常见是 `rsvpn0`）冲突，换名 |
+| 连接失败且主机断网 | 复查 daemon 日志；正常实现应在握手成功前不动路由。若日志显示 network setup 失败，检查网关/DNS |
+| IPv6 被阻断但隧道已断开 | 仅在没有活动 RustVPN 隧道时执行 `ip -6 route del blackhole default proto 66 metric 50` |
+| GUI 显示守护进程离线、`Permission denied` | 用户加入 `rustvpn` 组并重新登录；检查 socket `0660` 与 `/run/rustvpn-client` 目录权限 |
+
 ## 回滚 / 卸载
 
 ```bash
@@ -178,4 +207,5 @@ sudo systemctl daemon-reload
 ```
 
 GUI 与 profiles 都在用户目录，删除 `~/.config/rustvpn` 即可；CLI 与
-`rustvpn-client.service` 不受影响。
+`rustvpn-client.service` 不受影响。若卸载前 daemon 异常退出，确认没有残留的
+`ip -6 route ... proto 66` 黑洞路由。

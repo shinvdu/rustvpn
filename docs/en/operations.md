@@ -211,6 +211,24 @@ ssh root@server journalctl -u rustvpn-server -f
 ssh root@server 'curl -s 127.0.0.1:1294/ | jq .'
 ```
 
+## Desktop client UI (Linux, optional)
+
+The Tauri client (`rustvpn-clientd` plus `rustvpn-client-ui`) is independent of
+the `rustvpn-client` CLI and uses its own local Unix socket:
+
+- The GUI runs unprivileged; `rustvpn-clientd` keeps only
+  `CAP_NET_ADMIN`/`CAP_NET_RAW`.
+- Every profile needs an IPv4 `address`. A full-tunnel profile (`routes`
+  containing `default`/`0.0.0.0/0`) also needs `gateway` and IPv4 `dns`.
+- Routes and DNS are installed only after the first successful handshake.
+  Full-tunnel connections install an IPv6 blackhole default route; split
+  tunnels do not block IPv6/DNS.
+- The daemon and CLI share `/run/rustvpn-client/tunnel.lock`, so only one
+  tunnel can be active.
+- Users running the GUI must be members of the `rustvpn` group. See the
+  [client guide](../client-ui.md) (currently in Chinese) for the systemd unit,
+  migration and troubleshooting details.
+
 ## Passphrase rotation
 
 Rotate by generating a new verifier and **using both lines from the same

@@ -54,6 +54,18 @@ correctly. Like an Ethernet cable, the VPN is a layer: the administrator
 assigns addresses, routes, MTU, NAT and so on. This keeps the daemon
 small and auditable.
 
+## Is there a GUI?
+
+Linux has an optional desktop client (Tauri UI plus `rustvpn-clientd`). It is a
+separate program from the CLI and shares only libraries; the GUI itself is
+unprivileged. It manages static addresses, routes and DNS: a profile needs an
+IPv4 `address`, and a full tunnel also needs a `gateway` and IPv4 `dns`.
+Routes are installed only after the first successful handshake, and a full
+tunnel blocks the IPv6 default route to avoid leaks. The daemon and CLI share
+a tunnel lock so only one tunnel owns the host routes. See the
+[desktop client guide](../client-ui.md) (currently in Chinese). Windows and
+macOS do not have a GUI yet.
+
 ## Why no Windows or macOS support?
 
 Closed, proprietary systems do not let you control the computing device

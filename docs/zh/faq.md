@@ -35,6 +35,10 @@ RustVPN 需要的是一种固定、最小化的隧道格式，而非通用传输
 
 要由一个工具正确配置的部署方式和协议实在太多。如同以太网线缆，VPN 是一层：地址、路由、MTU、NAT 等由管理员分配。这使守护进程保持小巧且可审计。
 
+## 有图形界面吗？
+
+Linux 上有可选的桌面客户端（Tauri UI + `rustvpn-clientd`），它与 CLI 是两个独立程序、只共享库；GUI 不持有特权。它内置了静态地址/路由/DNS 管理：profile 必须有 `address`，全隧道还需 `gateway` 和 IPv4 `dns`；首次握手成功后才安装路由，全隧道会阻断 IPv6 默认路由以避免泄漏。daemon 与 CLI 通过隧道锁保证只有一个活动隧道。详见[客户端桌面 UI](../client-ui.md)。Windows/macOS 暂无 GUI。
+
 ## 为什么不支持 Windows 或 macOS？
 
 封闭的专有系统无法让你充分控制计算设备，难以满足以密码学为核心的安全需求。仅在 Linux 上测试；FreeBSD/macOS 支持可能通过 `tun` crate 工作（`GOVPN_IO_URING=0` 强制使用 epoll TAP 后端），但未经验证。

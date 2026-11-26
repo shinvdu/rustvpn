@@ -68,6 +68,7 @@ Design goals, inherited from GoVPN:
 | [FAQ](faq.md) | Design questions and "when should I use X" answers. |
 | [Design](design.md) | Architecture, data path, compatibility invariants, tests. |
 | [Performance](performance.md) | Go-side optimizations and same-machine Rust-vs-Go results. |
+| [Desktop client UI (Linux, optional)](../client-ui.md) | Tauri GUI + clientd; currently documented in Chinese. |
 
 ## Status and limitations
 

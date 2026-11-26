@@ -55,6 +55,16 @@ sudo rustvpn-server -proto all -bind 0.0.0.0:1194 \
 - `-encless` 要求 `-proto tcp`（或 `-proxy`，后者强制 TCP）。
 - 未知的 `-proto` 值会被拒绝。
 
+## 桌面客户端 profile（可选）
+
+Tauri 客户端不读取 CLI 参数，而是使用
+`~/.config/rustvpn/profiles/*.yaml`。与 CLI 的主要差异：
+
+- 必须有 IPv4 `address`；全隧道（`routes` 含 `default` 或 `0.0.0.0/0`）还必须提供 `gateway` 和至少一个 IPv4 `dns`。
+- 默认 `iface` 为 `rsvpn-gui`，避免与本机 `rustvpn-client` 的 `tap0/rsvpn0` 冲突。
+- 不支持 `up`/`down` 脚本；地址、路由、DNS 和 IPv6 防护由 `rustvpn-clientd` 内置管理。
+- 完整字段、构建、systemd、迁移和排障见[客户端桌面 UI](../client-ui.md)。
+
 ## `rustvpn-verifier` 标志
 
 | 标志 | 含义 | 默认值 |
