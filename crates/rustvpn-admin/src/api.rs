@@ -653,6 +653,9 @@ async fn create_peer(
     Json(request): Json<CreatePeerRequest>,
 ) -> Result<Json<CredentialResponse>, ApiError> {
     config_edit::validate_peer_name(&request.name)?;
+    if request.mtu == Some(0) {
+        return Err(ApiError::bad("mtu must be positive; 0 is invalid"));
+    }
     let mut snapshot = state.backend.config_snapshot().await?;
     if snapshot.files.enabled.contains_key(&request.name)
         || snapshot.files.disabled.contains_key(&request.name)
@@ -677,6 +680,7 @@ async fn create_peer(
         cpr: request.cpr,
         encless,
         timesync: request.timesync,
+        network: None,
         verifier: String::new(),
     };
 
@@ -821,6 +825,9 @@ async fn update_peer(
         peer.iface = value;
     }
     if let Some(value) = request.mtu {
+        if value == 0 {
+            return Err(ApiError::bad("mtu must be positive; 0 is invalid"));
+        }
         peer.mtu = value;
     }
     if let Some(value) = request.timeout {

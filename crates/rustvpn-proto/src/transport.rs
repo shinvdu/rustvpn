@@ -447,6 +447,35 @@ mod tests {
         );
     }
 
+    /// Regression for the v1 MTU contract: the client and server must agree on
+    /// the numeric wire MTU.  A locally derived value (for example 1472) makes the
+    /// peer reject otherwise valid handshake/transport packets with `TooLarge`.
+    #[test]
+    fn same_numeric_mtu_is_required_on_both_sides() {
+        for mode in [Mode::Plain, Mode::Noise, Mode::Encless] {
+            let key = [21u8; 32];
+            let payload = vec![0x44u8; mode.max_payload(1515)];
+            let mut client = Session::new(key, true);
+            let wire = client.encode(&payload, mode, 1515).unwrap();
+
+            let mut matching = Session::new(key, false);
+            assert_eq!(
+                matching
+                    .decode(&wire, mode, 1515, Ordering::Reorderable)
+                    .unwrap(),
+                payload,
+                "{mode:?} must decode at the shared wire MTU"
+            );
+
+            let mut mismatched = Session::new(key, false);
+            assert_eq!(
+                mismatched.decode(&wire, mode, 1472, Ordering::Reorderable),
+                Err(TransportError::TooLarge),
+                "{mode:?} must reject a different wire MTU"
+            );
+        }
+    }
+
     #[test]
     fn replay_rejected() {
         let key = [14u8; 32];

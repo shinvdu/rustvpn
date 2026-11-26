@@ -20,6 +20,8 @@ const state = {
   logKeys: new Set(),
   samples: [],
   editingName: null,
+  // Fields the current form does not edit but must preserve on save.
+  profileExtra: { mss_clamp: false, kill_switch: false, keepalive: 0, rekey_time: 1800, rekey_jitter: 0 },
   pendingProfile: null,
   pendingHadSavedPassword: false,
   daemonOnline: false,
@@ -397,7 +399,7 @@ function renderProfiles() {
             <div class="profile-meta">
               <span>${escapeHtml(profile.remote)}</span>
               <span>${escapeHtml((profile.proxy ? "tcp(proxy)" : profile.proto).toUpperCase())} · ${mode}</span>
-              <span>MTU ${Number(profile.mtu) || "—"}</span>
+              <span>MTU ${profile.mtu === 0 || profile.mtu === "auto" ? "auto (unsupported)" : Number(profile.mtu) || "—"}</span>
               ${profile.address ? `<span><code>${escapeHtml(profile.address)}</code></span>` : ""}
             </div>
           </div>
@@ -434,6 +436,8 @@ function renderHome() {
     document.getElementById("meta-remote").textContent = offlineRemote;
     document.getElementById("meta-proto").textContent = "—";
     document.getElementById("meta-iface").textContent = status.iface || profile?.iface || "—";
+    document.getElementById("meta-mtu").textContent = "—";
+    document.getElementById("meta-security").textContent = "—";
     document.getElementById("meta-uptime").textContent = "—";
     I18n.apply(document.querySelector(".topbar"));
     I18n.apply(document.getElementById("page-home"));
@@ -508,6 +512,14 @@ function renderHome() {
   const mode = status.mode || (profile ? (profile.encless ? "encless" : profile.noise ? "noise" : "plain") : "—");
   document.getElementById("meta-proto").textContent = `${String(proto).toUpperCase()} · ${mode}`;
   document.getElementById("meta-iface").textContent = status.iface || profile?.iface || "—";
+  const wireMtu = status.mtu != null ? status.mtu : profile?.mtu;
+  document.getElementById("meta-mtu").textContent =
+    wireMtu == null
+      ? "—"
+      : status.inner_mtu != null
+      ? t("{wire} / {inner}", { wire: wireMtu, inner: status.inner_mtu })
+      : String(wireMtu);
+  document.getElementById("meta-security").textContent = securitySummary(status, profile);
   updateUptime();
 
   const traffic = status.traffic || {};
@@ -682,6 +694,13 @@ function validateProfileForConnect(profile) {
     return "请填写 TAP 地址（例如 10.88.0.2/24）";
   }
   if (!String(profile.iface || "").trim()) return "接口名为空";
+  const mtu = Number(profile.mtu);
+  if (!Number.isInteger(mtu) || mtu === 0) {
+    return "MTU 必须是与服务端一致的数值（例如 1515）；v1 不支持 auto 或 0";
+  }
+  if (mtu < 68 || mtu > 9015) {
+    return "MTU 必须在 68 到 9015 之间";
+  }
   const routes = (profile.routes || []).map((route) => String(route).trim().toLowerCase());
   const fullTunnel = routes.includes("default") || routes.includes("0.0.0.0/0");
   if (fullTunnel && !String(profile.gateway || "").trim()) {
@@ -692,6 +711,9 @@ function validateProfileForConnect(profile) {
   }
   if (profile.encless && profile.proto !== "tcp") {
     return "Encless 只能配合 TCP";
+  }
+  if (profile.kill_switch && !fullTunnel) {
+    return "kill switch 仅支持全隧道配置";
   }
   return null;
 }
@@ -797,6 +819,15 @@ async function disconnect() {
 
 function openProfileModal(profile) {
   state.editingName = profile ? profile.name : null;
+  state.profileExtra = {
+    mss_clamp: Boolean(profile && profile.mss_clamp),
+    kill_switch: Boolean(profile && profile.kill_switch),
+    keepalive: Number((profile && profile.keepalive) || 0),
+    // New profiles get a time-driven rekey default; existing profiles keep
+// whatever they had (including 0 = off, the daemon default).
+    rekey_time: profile ? Number(profile.rekey_time || 0) : 1800,
+    rekey_jitter: Number((profile && profile.rekey_jitter) || 0),
+  };
   document.getElementById("profile-title").textContent = t(
     profile ? "编辑配置" : "添加配置"
   );
@@ -823,7 +854,7 @@ function openProfileModal(profile) {
   setValue("f-name", spec.name);
   setValue("f-remote", spec.remote);
   setValue("f-proto", spec.proto || "udp");
-  setValue("f-mtu", spec.mtu);
+  setValue("f-mtu", spec.mtu === 0 || spec.mtu === "auto" ? "auto" : spec.mtu);
   setValue("f-timeout", spec.timeout);
   setValue("f-timesync", spec.timesync);
   setValue("f-verifier", spec.verifier);
@@ -852,12 +883,19 @@ function readProfileForm() {
       .split(/[\n,]/)
       .map((item) => item.trim())
       .filter(Boolean);
+  const mtuRaw = String(document.getElementById("f-mtu").value || "").trim();
+  const mtuValue = mtuRaw === "" ? 1515 : Number(mtuRaw);
   return {
     name: document.getElementById("f-name").value.trim(),
     remote: document.getElementById("f-remote").value.trim(),
     proto: document.getElementById("f-proto").value,
     verifier: document.getElementById("f-verifier").value.trim(),
-    mtu: Number(document.getElementById("f-mtu").value) || 1515,
+    mtu: mtuValue,
+    mss_clamp: Boolean(state.profileExtra.mss_clamp),
+    kill_switch: Boolean(state.profileExtra.kill_switch),
+    keepalive: Number(state.profileExtra.keepalive) || 0,
+    rekey_time: Number(state.profileExtra.rekey_time) || 0,
+    rekey_jitter: Number(state.profileExtra.rekey_jitter) || 0,
     timeout: Number(document.getElementById("f-timeout").value) || 60,
     timesync: Number(document.getElementById("f-timesync").value) || 0,
     noise: document.getElementById("f-noise").checked,
@@ -976,6 +1014,32 @@ function formatLogTime(ms) {
     2,
     "0"
   )}:${String(date.getSeconds()).padStart(2, "0")}.${String(date.getMilliseconds()).padStart(3, "0")}`;
+}
+
+function securitySummary(status, profile) {
+  let killSwitch = "off";
+  if (status.kill_switch != null) {
+    killSwitch = status.kill_switch
+      ? status.kill_switch_applied === false
+        ? "on (not applied)"
+        : "on"
+      : "off";
+  } else if (profile && profile.kill_switch) {
+    killSwitch = "on (configured)";
+  }
+  let mss = "off";
+  if (status.mss != null) {
+    if (status.mss_applied === false) {
+      mss = "skipped (nft unavailable)";
+    } else {
+      mss = `v4 ${status.mss}`;
+      if (status.mss_v6 != null) mss += ` / v6 ${status.mss_v6}`;
+    }
+  } else if (profile && profile.mss_clamp) {
+    mss = "configured";
+  }
+  const rekey = status.rekey_time_sec ? `${status.rekey_time_sec}s` : "off";
+  return `kill-switch ${killSwitch} · MSS ${mss} · rekey ${rekey}`;
 }
 
 function formatBytes(value) {

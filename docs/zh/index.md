@@ -42,7 +42,7 @@ RustVPN 是一个小型虚拟专用网守护进程，通过加密、认证的隧
 | **Noise（噪声填充）** | 将每个出站数据包填充至配置的 MTU。 |
 | **Encless（无加密模式）** | 用 AONT + Chaffing-and-Winnowing 代替流加密。 |
 | **CPR（恒定包速率）** | 以配置的 KiB/s 速率发出填充流量。 |
-| **MTU** | 配置的最大 TAP 帧大小。在 noise/encless 模式下可用载荷更小。 |
+| **MTU** | 双方一致的数值线路 MTU。只从它推导 TAP 接口 IP MTU 与 MSS；noise/encless 模式下可用载荷更小。 |
 
 ## 文档地图
 
@@ -65,7 +65,7 @@ RustVPN 是一个小型虚拟专用网守护进程，通过加密、认证的隧
 已知限制：
 
 - 仅在 Linux 上验证过。FreeBSD 和 macOS 可能通过 `tun` crate 工作，但未测试；设置 `GOVPN_IO_URING=0` 可强制使用 epoll TAP 后端。
-- 有效 MTU 不会自动调整。在 noise/encless 模式下，`up` 脚本应提高接口 MTU（或接受较小的载荷）。
+- v1 的 `mtu` 是双方一致的数值线路契约，`auto`/`0` 会被拒绝；`up` 脚本或声明式路径应按模式把 TAP **接口 IP MTU** 设为 `max_payload(wire) - 14`（plain 1515→1500、noise→1476、encless→1492），不能直接使用线路/帧预算。自动路径 MTU 协商推迟到 v2。
 - 客户端仅在 TCP 上支持无加密模式，与 Go 保持一致。
 
 下一步：[快速上手](getting-started.md)。

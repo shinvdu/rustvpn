@@ -175,6 +175,7 @@ Maintainer: $MAINTAINER
 Installed-Size: $size
 Depends: libwebkit2gtk-4.1-0, libgtk-3-0, libayatana-appindicator3-1,
  librsvg2-2, libssl3, libdbus-1-3
+Recommends: nftables
 Homepage: $HOMEPAGE
 Description: RustVPN desktop client
  RustVPN client stack: the rustvpn-client command-line client, the

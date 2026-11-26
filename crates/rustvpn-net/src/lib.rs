@@ -3,6 +3,7 @@
 use std::time::Duration;
 
 pub mod config;
+pub mod network;
 pub mod peer;
 pub mod scripts;
 pub mod stats;

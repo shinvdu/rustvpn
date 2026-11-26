@@ -10,13 +10,15 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use rustvpn_client_ipc::{EngineStatus, Event, LogLine, ProfileSpec, TrafficSample};
 use rustvpn_net::stats::StatsState;
 use rustvpn_net::tap::Tap;
+use rustvpn_proto::MAX_BYTES_PER_KEY;
 use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use zeroize::Zeroizing;
 
 use crate::lock::TunnelLock;
-use crate::netcfg::NetworkGuard;
+use crate::mtu::{self, OuterFamily};
+use crate::netcfg::{FirewallOptions, NetOptions, NetworkGuard};
 use crate::profile::ValidatedProfile;
 use crate::session::{resolve_endpoints, start_session, Endpoints, Session, SessionEnd};
 
@@ -29,6 +31,33 @@ pub enum Command {
     Shutdown,
 }
 
+/// Daemon-wide options that are not part of a profile.
+#[derive(Clone, Debug)]
+pub struct EngineOptions {
+    /// Leave DNS configuration to the caller (network namespace/container).
+    pub no_host_dns: bool,
+    /// Per-daemon nftables table scope (see [`crate::firewall::instance_scope`]).
+    pub firewall_scope: String,
+}
+
+impl Default for EngineOptions {
+    fn default() -> Self {
+        Self {
+            no_host_dns: false,
+            firewall_scope: "rustvpn-clientd".into(),
+        }
+    }
+}
+
+/// Effective MTUs used for this connection.
+#[derive(Clone, Copy, Debug)]
+struct MtuInfo {
+    daemon: usize,
+    inner: usize,
+    mss_v4: Option<usize>,
+    mss_v6: Option<usize>,
+}
+
 pub struct Engine;
 
 impl Engine {
@@ -36,10 +65,22 @@ impl Engine {
         commands: mpsc::Receiver<Command>,
         events: broadcast::Sender<Event>,
     ) -> JoinHandle<()> {
-        tokio::spawn(async move { Self::run(commands, events).await })
+        Self::spawn_with_options(commands, events, EngineOptions::default())
     }
 
-    pub async fn run(mut commands: mpsc::Receiver<Command>, events: broadcast::Sender<Event>) {
+    pub fn spawn_with_options(
+        commands: mpsc::Receiver<Command>,
+        events: broadcast::Sender<Event>,
+        options: EngineOptions,
+    ) -> JoinHandle<()> {
+        tokio::spawn(async move { Self::run(commands, events, options).await })
+    }
+
+    pub async fn run(
+        mut commands: mpsc::Receiver<Command>,
+        events: broadcast::Sender<Event>,
+        options: EngineOptions,
+    ) {
         let mut current: Option<(CancellationToken, JoinHandle<()>)> = None;
         loop {
             tokio::select! {
@@ -53,6 +94,7 @@ impl Engine {
                                 password,
                                 cancel.clone(),
                                 events.clone(),
+                                options.clone(),
                             ));
                             current = Some((cancel, handle));
                         }
@@ -94,6 +136,7 @@ async fn run_connection(
     password: Zeroizing<String>,
     cancel: CancellationToken,
     events: broadcast::Sender<Event>,
+    options: EngineOptions,
 ) {
     // Publish `connecting` before validation/key derivation and any network
     // change so the UI never falls back to a stale idle state.
@@ -125,6 +168,7 @@ async fn run_connection(
         format!("tunnel lock acquired: {}", _lock.path().display()),
     );
     crate::netcfg::cleanup_stale_ipv6_blackhole().await;
+    crate::netcfg::cleanup_stale_firewall(&options.firewall_scope).await;
 
     // Argon2d is intentionally expensive.  Keep it off the async workers so
     // status/Disconnect requests stay responsive while a profile is opened.
@@ -153,7 +197,78 @@ async fn run_connection(
     };
 
     emit_log(&events, "info", format!("connecting to {}", spec.remote));
-    let tap = match Tap::open(&spec.iface, spec.mtu) {
+    if spec.keepalive > 0 && (spec.noise || spec.encless) {
+        emit_log(
+            &events,
+            "warn",
+            format!(
+                "keepalive={}s in {} mode is padded to the MTU per packet; \
+                 the v1 wire format cannot send a shorter keepalive",
+                spec.keepalive,
+                spec.mode_name()
+            ),
+        );
+    }
+
+    // v1 treats the numeric MTU as a two-sided wire contract.  Derive only
+    // the TAP interface IP MTU and MSS from it; never change `spec.mtu`.
+    let mode = validated.mode_enum();
+    let wire = match mtu::from_wire(mode, spec.mtu) {
+        Ok(value) => value,
+        Err(error) => {
+            emit_error(&events, &spec, format!("MTU: {error:#}"));
+            emit_log(&events, "error", format!("MTU: {error:#}"));
+            return;
+        }
+    };
+    emit_log(&events, "info", wire.log_line());
+    let daemon_mtu = spec.mtu;
+    let link_mtu = wire.inner_ip_mtu;
+    let (mss_v4, mss_v6) = if spec.mss_clamp {
+        (Some(wire.mss_v4), Some(wire.mss_v6))
+    } else {
+        (None, None)
+    };
+
+    // Encless is the only case where the outer path capacity still matters
+    // for a warning.  This never changes the configured wire MTU.
+    let mut endpoints: Option<Endpoints> = None;
+    if spec.encless {
+        match resolve_endpoints(&spec.remote, &spec.proxy).await {
+            Ok(resolved) => endpoints = Some(resolved),
+            Err(error) => emit_log(
+                &events,
+                "warn",
+                format!("cannot resolve outer endpoint for encless capacity check: {error:#}"),
+            ),
+        }
+        if let Some(addr) = endpoints.as_ref().and_then(Endpoints::outer) {
+            if let Ok(path) = mtu::detect_path_mtu(addr).await {
+                let needed = spec.mtu
+                    + rustvpn_proto::ENCLESS_ENLARGE_SIZE
+                    + OuterFamily::from_addr(&addr).header_len(validated.proto());
+                if path.underlay_mtu < needed {
+                    emit_log(
+                        &events,
+                        "warn",
+                        format!(
+                            "encless with mtu={} needs ~{} byte outer path but {} ({}) is {}; \
+                             expect fragmentation or large-packet loss",
+                            spec.mtu, needed, path.dev, path.source, path.underlay_mtu
+                        ),
+                    );
+                }
+            }
+        }
+    }
+    let resolved = MtuInfo {
+        daemon: daemon_mtu,
+        inner: link_mtu,
+        mss_v4,
+        mss_v6,
+    };
+
+    let tap = match Tap::open(&spec.iface, daemon_mtu) {
         Ok(tap) => Arc::new(tap),
         Err(error) => {
             emit_error(&events, &spec, format!("open TAP {}: {error}", spec.iface));
@@ -166,7 +281,7 @@ async fn run_connection(
         }
     };
     emit_log(&events, "info", format!("TAP {} opened", spec.iface));
-    if let Err(error) = crate::netcfg::bring_link_up(&spec.iface, spec.mtu).await {
+    if let Err(error) = crate::netcfg::bring_link_up(&spec.iface, link_mtu).await {
         emit_error(&events, &spec, format!("bring up TAP: {error:#}"));
         emit_log(&events, "error", format!("bring up TAP: {error:#}"));
         return;
@@ -178,10 +293,9 @@ async fn run_connection(
     // attempt cannot black-hole the host.  After the first success the address
     // is pinned for reconnects (the tunnel may own the default route at that
     // point, which would make a fresh DNS lookup unreliable).
-    let mut endpoints: Option<Endpoints> = None;
     let mut guard: Option<NetworkGuard> = None;
     let mut attempt: u32 = 0;
-    let mut last_status = base_status(&validated);
+    let mut last_status = base_status(&validated, resolved);
 
     loop {
         if cancel.is_cancelled() {
@@ -195,7 +309,7 @@ async fn run_connection(
                     attempt = attempt.saturating_add(1);
                     let message = format!("resolve {}: {error:#}", validated.outer_host());
                     emit_log(&events, "error", &message);
-                    let mut status = base_status(&validated);
+                    let mut status = base_status(&validated, resolved);
                     status.state = "reconnecting".into();
                     status.last_error = Some(message);
                     last_status = status.clone();
@@ -231,7 +345,7 @@ async fn run_connection(
             ),
         );
 
-        let cfg = validated.peer_config(signing_key.clone());
+        let cfg = validated.peer_config_with_mtu(signing_key.clone(), resolved.daemon);
         let started = start_session(
             cfg,
             signing_key.clone(),
@@ -246,16 +360,26 @@ async fn run_connection(
         )
         .await;
 
-        let mut connected_status = base_status(&validated);
+        let mut connected_status = base_status(&validated, resolved);
+        let mut planned_rekey = false;
         match started {
             Ok(mut session) => {
                 if guard.is_none() {
-                    let outer = endpoints
-                        .as_ref()
-                        .and_then(Endpoints::outer)
-                        .map(|addr| addr.ip());
-                    match NetworkGuard::install(&spec, outer).await {
+                    let outer = endpoints.as_ref().and_then(Endpoints::outer);
+                    let net_options = NetOptions {
+                        firewall: FirewallOptions {
+                            mss_v4: resolved.mss_v4,
+                            mss_v6: resolved.mss_v6,
+                            kill_switch: spec.kill_switch,
+                            scope: options.firewall_scope.clone(),
+                        },
+                        no_host_dns: options.no_host_dns,
+                    };
+                    match NetworkGuard::install(&spec, outer, resolved.inner, net_options).await {
                         Ok(installed) => {
+                            connected_status.mss_applied = Some(installed.mss_applied());
+                            connected_status.kill_switch_applied =
+                                Some(installed.kill_switch_applied());
                             guard = Some(installed);
                             emit_log(
                                 &events,
@@ -290,14 +414,28 @@ async fn run_connection(
                 if cancel.is_cancelled() {
                     break;
                 }
+                planned_rekey = matches!(end, SessionEnd::Rekey);
                 let reason = match end {
                     SessionEnd::Timeout => "timeout",
                     SessionEnd::Rehandshake => "rehandshake",
+                    SessionEnd::Rekey => "time-based rekey",
                     SessionEnd::TcpClosed => "connection closed",
                     SessionEnd::TapClosed => "TAP closed",
                     SessionEnd::Terminated => "terminated",
                 };
-                emit_log(&events, "warn", format!("session ended: {reason}"));
+                if planned_rekey {
+                    // The v1 protocol has no rekey message, so this is a
+                    // scheduled reconnect: new handshake immediately, with a
+                    // brief packet gap.  It is not zero-loss.
+                    emit_log(
+                        &events,
+                        "info",
+                        "planned rekey: reconnecting immediately (no session overlap; \
+                         short packet gap possible)",
+                    );
+                } else {
+                    emit_log(&events, "warn", format!("session ended: {reason}"));
+                }
                 connected_status.state = "reconnecting".into();
                 connected_status.since_unix = None;
                 connected_status.traffic = TrafficSample::default();
@@ -308,7 +446,7 @@ async fn run_connection(
                 attempt = attempt.saturating_add(1);
                 let message = format!("{error:#}");
                 emit_log(&events, "error", format!("session failed: {message}"));
-                let mut status = base_status(&validated);
+                let mut status = base_status(&validated, resolved);
                 status.state = "reconnecting".into();
                 status.last_error = Some(message);
                 last_status = status;
@@ -320,14 +458,20 @@ async fn run_connection(
             }
         }
 
-        let delay = backoff(attempt);
+        let delay = if planned_rekey {
+            Duration::ZERO
+        } else {
+            backoff(attempt)
+        };
         last_status.next_retry_in = Some(delay.as_secs());
         let _ = events.send(Event::State(last_status.clone()));
-        emit_log(
-            &events,
-            "info",
-            format!("reconnecting in {}s", delay.as_secs()),
-        );
+        if !(planned_rekey && delay.is_zero()) {
+            emit_log(
+                &events,
+                "info",
+                format!("reconnecting in {}s", delay.as_secs()),
+            );
+        }
         tokio::select! {
             _ = tokio::time::sleep(delay) => {}
             _ = cancel.cancelled() => break,
@@ -362,6 +506,7 @@ async fn session_loop(
                 return match ev {
                     Some(rustvpn_net::peer::PeerEvent::Timeout) => SessionEnd::Timeout,
                     Some(rustvpn_net::peer::PeerEvent::Rehandshake) => SessionEnd::Rehandshake,
+                    Some(rustvpn_net::peer::PeerEvent::Rekey) => SessionEnd::Rekey,
                     Some(rustvpn_net::peer::PeerEvent::TcpClosed) => SessionEnd::TcpClosed,
                     Some(rustvpn_net::peer::PeerEvent::TapClosed) => SessionEnd::TapClosed,
                     None => SessionEnd::TcpClosed,
@@ -385,6 +530,15 @@ async fn session_loop(
                 last_rx = rx;
                 last_tx = tx;
                 last_at = now;
+                status.endpoint = Some(snap.addr.clone());
+                status.last_handshake_unix = Some(snap.last_ping.timestamp());
+                status.heartbeat_sent = Some(snap.heartbeat_sent);
+                status.heartbeat_recv = Some(snap.heartbeat_recv);
+                status.frames_unauth = Some(snap.unauth);
+                status.frames_dup = Some(snap.dup);
+                status.rekey_in_sec = rekey_in_sec(rx, tx, traffic.rx_bps, traffic.tx_bps);
+                status.rates_available = true;
+                status.rate_window_sec = Some(1);
                 status.traffic = traffic.clone();
                 let _ = events.send(Event::Traffic(traffic));
             }
@@ -405,10 +559,27 @@ fn backoff(attempt: u32) -> Duration {
     Duration::from_secs(base) + Duration::from_millis(jitter_ms.min(999))
 }
 
-fn base_status(validated: &ValidatedProfile) -> EngineStatus {
+/// Remaining seconds before the 4 GiB per-key limit at the current wire rate.
+fn rekey_in_sec(rx: u64, tx: u64, rx_bps: u64, tx_bps: u64) -> Option<u64> {
+    let used = rx.saturating_add(tx);
+    let remaining = MAX_BYTES_PER_KEY.saturating_sub(used);
+    let rate = rx_bps.saturating_add(tx_bps);
+    remaining.checked_div(rate)
+}
+
+fn base_status(validated: &ValidatedProfile, mtu: MtuInfo) -> EngineStatus {
     let mut status = spec_status(validated.spec());
     status.proto = Some(validated.proto().to_string());
     status.mode = Some(validated.mode().to_string());
+    status.mtu = Some(mtu.daemon);
+    status.inner_mtu = Some(mtu.inner);
+    status.mss = mtu.mss_v4;
+    status.mss_v6 = mtu.mss_v6;
+    status.mtu_source = Some("configured".into());
+    status.kill_switch = Some(validated.spec().kill_switch);
+    status.keepalive_sec = (validated.spec().keepalive > 0).then_some(validated.spec().keepalive);
+    status.rekey_time_sec =
+        (validated.spec().rekey_time > 0).then_some(validated.spec().rekey_time);
     status
 }
 

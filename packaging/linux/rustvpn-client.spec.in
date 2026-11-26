@@ -19,6 +19,8 @@ Requires:       gtk3
 Requires:       libayatana-appindicator-gtk3
 Requires:       dbus-libs
 Requires:       openssl-libs
+# Optional: kill_switch/mss_clamp use the nft binary when configured.
+Recommends:     nftables
 
 # Not defined by a bare rpm installation; systemd-rpm-macros sets it on distros.
 %{!?_unitdir:%global _unitdir /usr/lib/systemd/system}

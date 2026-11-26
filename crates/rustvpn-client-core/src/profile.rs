@@ -9,8 +9,17 @@ use ed25519_dalek::SigningKey;
 use ipnet::IpNet;
 use rustvpn_client_ipc::ProfileSpec;
 use rustvpn_crypto::verifier::Verifier;
-use rustvpn_net::config::PeerConfig;
+use rustvpn_net::config::{is_default_route, PeerConfig};
 use rustvpn_proto::{MTU_MAX, MTU_MIN, MTU_MIN_NOISE};
+
+/// Keepalive lower bounds.  Noise/encless keepalives are padded to the MTU,
+/// so they get a stricter floor to avoid a silent bandwidth burn.
+const KEEPALIVE_MIN: u64 = 10;
+const KEEPALIVE_MIN_PADDED: u64 = 25;
+const KEEPALIVE_MAX: u64 = 3600;
+const REKEY_TIME_MIN: u64 = 60;
+const REKEY_TIME_MAX: u64 = 86_400;
+const REKEY_JITTER_MAX: u64 = 3600;
 
 pub struct ValidatedProfile {
     spec: ProfileSpec,
@@ -47,6 +56,15 @@ impl ValidatedProfile {
         if spec.encless && effective_proto != "tcp" {
             bail!("encless mode works only with TCP");
         }
+        if spec.mtu_is_auto() {
+            // `MTU_AUTO` is the legacy `0` sentinel, so this covers both
+            // `mtu: auto` and `mtu: 0`.
+            bail!(
+                "mtu: auto and mtu: 0 are not supported in v1; the wire MTU is a two-sided \
+                 contract. Configure the same numeric MTU as the server (for example 1515); \
+                 path-MTU negotiation is deferred to v2"
+            );
+        }
         if spec.mtu < MTU_MIN || spec.mtu > MTU_MAX {
             bail!("MTU must be between {MTU_MIN} and {MTU_MAX}");
         }
@@ -55,6 +73,41 @@ impl ValidatedProfile {
         }
         if spec.timeout == 0 {
             bail!("timeout must be positive");
+        }
+        if spec.keepalive > 0 {
+            let minimum = if spec.noise || spec.encless {
+                KEEPALIVE_MIN_PADDED
+            } else {
+                KEEPALIVE_MIN
+            };
+            if spec.keepalive < minimum {
+                bail!(
+                    "keepalive must be 0 (off) or at least {minimum}s for {} mode",
+                    spec.mode_name()
+                );
+            }
+            if spec.keepalive > KEEPALIVE_MAX {
+                bail!("keepalive must not exceed {KEEPALIVE_MAX}s");
+            }
+            if spec.keepalive >= spec.timeout {
+                bail!(
+                    "keepalive ({}s) must be shorter than timeout ({}s)",
+                    spec.keepalive,
+                    spec.timeout
+                );
+            }
+        }
+        if spec.rekey_time > 0 {
+            if !(REKEY_TIME_MIN..=REKEY_TIME_MAX).contains(&spec.rekey_time) {
+                bail!(
+                    "rekey_time must be 0 (off) or between {REKEY_TIME_MIN} and {REKEY_TIME_MAX}s"
+                );
+            }
+            if spec.rekey_jitter > REKEY_JITTER_MAX || spec.rekey_jitter > spec.rekey_time {
+                bail!("rekey_jitter must be 0..=min(rekey_time, {REKEY_JITTER_MAX})");
+            }
+        } else if spec.rekey_jitter > 0 {
+            bail!("rekey_jitter requires a non-zero rekey_time");
         }
         if spec.iface.is_empty() || spec.iface.len() > 15 {
             bail!("interface name must be 1..=15 characters");
@@ -102,7 +155,10 @@ impl ValidatedProfile {
             }
         }
         for route in &spec.routes {
-            if route == "default" || route.is_empty() {
+            // The keyword form has no address family; canonical and
+            // non-canonical IPv4 prefix-0 spellings parse below and are
+            // accepted as IPv4.  An IPv6 `::/0` must still be rejected.
+            if route.trim().is_empty() || route.trim().eq_ignore_ascii_case("default") {
                 continue;
             }
             let net: IpNet = route
@@ -114,6 +170,12 @@ impl ValidatedProfile {
         }
         if has_default_route(&spec.routes) && spec.dns.is_empty() {
             bail!("full-tunnel profile requires at least one DNS server");
+        }
+        if spec.kill_switch && !has_default_route(&spec.routes) {
+            bail!(
+                "kill_switch requires a full-tunnel profile (routes must contain default); \
+                 split-tunnel profiles cannot enable the kill switch"
+            );
         }
 
         Ok(Self {
@@ -136,13 +198,7 @@ impl ValidatedProfile {
     }
 
     pub fn mode(&self) -> &'static str {
-        if self.spec.encless {
-            "encless"
-        } else if self.spec.noise {
-            "noise"
-        } else {
-            "plain"
-        }
+        self.spec.mode_name()
     }
 
     pub fn derive_signing_key(&mut self, password: &str) -> Result<SigningKey> {
@@ -155,11 +211,19 @@ impl ValidatedProfile {
     }
 
     pub fn peer_config(&self, signing_key: SigningKey) -> Arc<PeerConfig> {
+        self.peer_config_with_mtu(signing_key, self.spec.mtu)
+    }
+
+    /// Build the runtime peer with an explicit wire MTU.
+    ///
+    /// This is always the numeric profile MTU; v1 never derives it from the
+    /// local path.  Only the TAP interface IP MTU and MSS are derived from it.
+    pub fn peer_config_with_mtu(&self, signing_key: SigningKey, mtu: usize) -> Arc<PeerConfig> {
         Arc::new(PeerConfig {
             id: self.verifier.id,
             name: self.spec.name.clone(),
             iface: self.spec.iface.clone(),
-            mtu: self.spec.mtu,
+            mtu,
             up: String::new(),
             down: String::new(),
             timeout: Duration::from_secs(self.spec.timeout.max(1)),
@@ -167,9 +231,23 @@ impl ValidatedProfile {
             cpr: self.spec.cpr,
             encless: self.spec.encless,
             time_sync: self.spec.timesync,
+            keepalive: Duration::from_secs(self.spec.keepalive),
+            rekey_time: Duration::from_secs(self.spec.rekey_time),
+            rekey_jitter: Duration::from_secs(self.spec.rekey_jitter),
+            network: None,
             verifier: self.verifier.clone(),
             signing_key: Some(signing_key),
         })
+    }
+
+    pub fn mode_enum(&self) -> rustvpn_proto::Mode {
+        if self.spec.encless {
+            rustvpn_proto::Mode::Encless
+        } else if self.spec.noise {
+            rustvpn_proto::Mode::Noise
+        } else {
+            rustvpn_proto::Mode::Plain
+        }
     }
 
     pub fn outer_host(&self) -> &str {
@@ -182,9 +260,9 @@ impl ValidatedProfile {
 }
 
 fn has_default_route(routes: &[String]) -> bool {
-    routes
-        .iter()
-        .any(|route| matches!(route.as_str(), "default" | "0.0.0.0/0"))
+    // Canonical check: also recognises non-canonical prefix-0 spellings such
+    // as `00.0.0.0/0`, so they still enable full-tunnel semantics.
+    routes.iter().any(|route| is_default_route(route))
 }
 
 #[cfg(test)]
@@ -262,6 +340,114 @@ mod tests {
     }
 
     #[test]
+    fn rejects_auto_and_zero_mtu() {
+        let mut spec = base();
+        spec.mtu = rustvpn_client_ipc::MTU_AUTO;
+        let error = ValidatedProfile::new(&spec).err().unwrap().to_string();
+        assert!(error.contains("auto"), "{error}");
+        assert!(error.contains("numeric"), "{error}");
+
+        let mut spec = base();
+        spec.mtu = 0;
+        let error = ValidatedProfile::new(&spec).err().unwrap().to_string();
+        assert!(error.contains("mtu: 0"), "{error}");
+    }
+
+    #[test]
+    fn noncanonical_default_routes_still_enable_full_tunnel_semantics() {
+        for route in [
+            "default",
+            "DEFAULT",
+            "0.0.0.0/0",
+            "00.0.0.0/0",
+            "0.0.0.00/0",
+            "0.0.0.0/00",
+        ] {
+            // A full-tunnel profile requires DNS ...
+            let mut spec = base();
+            spec.routes = vec![route.into()];
+            spec.dns.clear();
+            let error = ValidatedProfile::new(&spec).err().unwrap().to_string();
+            assert!(error.contains("DNS"), "route {route:?}: {error}");
+
+            // ... and permits the full-tunnel-only kill switch.
+            spec.dns = vec!["10.88.0.1".into()];
+            spec.kill_switch = true;
+            assert!(
+                ValidatedProfile::new(&spec).is_ok(),
+                "route {route:?} was not treated as a default route"
+            );
+        }
+
+        // A split-tunnel prefix is not a default route.
+        let mut spec = base();
+        spec.routes = vec!["0.0.0.0/1".into()];
+        spec.dns.clear();
+        spec.kill_switch = true;
+        assert!(ValidatedProfile::new(&spec).is_err());
+    }
+
+    #[test]
+    fn rejects_split_tunnel_kill_switch() {
+        let mut spec = base();
+        spec.kill_switch = true;
+        assert!(ValidatedProfile::new(&spec).is_ok());
+
+        let mut spec = base();
+        spec.routes = vec!["10.88.0.0/24".into()];
+        spec.dns.clear(); // split tunnel does not require DNS
+        spec.kill_switch = true;
+        let error = match ValidatedProfile::new(&spec) {
+            Ok(_) => panic!("split-tunnel kill switch must be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("kill_switch"), "{error}");
+    }
+
+    #[test]
+    fn validates_keepalive_and_rekey_bounds() {
+        let mut spec = base();
+        spec.keepalive = 25;
+        assert!(ValidatedProfile::new(&spec).is_ok());
+
+        let mut spec = base();
+        spec.keepalive = 9;
+        assert!(ValidatedProfile::new(&spec).is_err());
+        spec.keepalive = 10;
+        assert!(ValidatedProfile::new(&spec).is_ok());
+
+        // Noise keepalives are MTU-padded, so the floor is 25s.
+        let mut spec = base();
+        spec.noise = true;
+        spec.keepalive = 24;
+        assert!(ValidatedProfile::new(&spec).is_err());
+        spec.keepalive = 25;
+        assert!(ValidatedProfile::new(&spec).is_ok());
+
+        let mut spec = base();
+        spec.keepalive = spec.timeout;
+        assert!(ValidatedProfile::new(&spec).is_err());
+
+        let mut spec = base();
+        spec.rekey_time = 1800;
+        spec.rekey_jitter = 30;
+        assert!(ValidatedProfile::new(&spec).is_ok());
+
+        let mut spec = base();
+        spec.rekey_time = 10;
+        assert!(ValidatedProfile::new(&spec).is_err());
+
+        let mut spec = base();
+        spec.rekey_jitter = 30;
+        assert!(ValidatedProfile::new(&spec).is_err());
+
+        let mut spec = base();
+        spec.rekey_time = 1800;
+        spec.rekey_jitter = 1801;
+        assert!(ValidatedProfile::new(&spec).is_err());
+    }
+
+    #[test]
     fn rejects_ipv6_network_fields() {
         let mut spec = base();
         spec.address = "2001:db8::1/64".into();
@@ -273,6 +459,11 @@ mod tests {
 
         let mut spec = base();
         spec.routes = vec!["default".into(), "2001:db8::/32".into()];
+        assert!(ValidatedProfile::new(&spec).is_err());
+
+        // An IPv6 default route has prefix length 0 but is still IPv6.
+        let mut spec = base();
+        spec.routes = vec!["::/0".into()];
         assert!(ValidatedProfile::new(&spec).is_err());
 
         let mut spec = base();

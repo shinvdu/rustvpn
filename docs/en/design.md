@@ -282,7 +282,9 @@ byte equality. See [Performance](performance.md).
 - No thread-per-core `SO_REUSEPORT` sharding; one socket per protocol with
   a shared batcher. Simpler, and the measured wins came from batching and
   SIMD rather than sharding.
-- No automatic effective-MTU configuration.
+- No automatic path-MTU negotiation: v1 uses a two-sided numeric wire MTU;
+  the TAP interface IP MTU is derived locally from the mode, and `mtu: auto`
+  is deferred to v2.
 - FreeBSD/macOS builds are untested.
 - The encless path still allocates; a buffer-pooled AONT/CnW encoder is
   possible.

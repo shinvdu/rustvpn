@@ -58,7 +58,8 @@ alice:
 set -eu
 IFACE="${GOVPN_IFACE:-rsvpn0}"
 ip tuntap add dev "$IFACE" mode tap 2>/dev/null || true
-ip link set dev "$IFACE" mtu 1515 up
+# TAP 接口 IP MTU，不是线路 MTU（plain 线路 1515 -> 1500）。
+ip link set dev "$IFACE" mtu 1500 up
 ip addr replace 10.88.0.1/24 dev "$IFACE"
 ```
 
@@ -92,7 +93,8 @@ RUSTVPN_VERIFIER='$argon2d$m=4096,t=128,p=1$BASE64_ID'
 set -eu
 IFACE="${GOVPN_IFACE:-rsvpn0}"
 ip tuntap add dev "$IFACE" mode tap 2>/dev/null || true
-ip link set dev "$IFACE" mtu 1515 up
+# TAP 接口 IP MTU，不是线路 MTU（plain 线路 1515 -> 1500）。
+ip link set dev "$IFACE" mtu 1500 up
 ip addr replace 10.88.0.2/24 dev "$IFACE"
 ip route replace 10.88.0.0/24 dev "$IFACE"
 ```

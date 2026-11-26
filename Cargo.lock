@@ -3879,13 +3879,16 @@ version = "0.2.0-beta.1"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
+ "chrono",
  "ed25519-dalek",
  "rand_core",
  "rpassword",
  "rustvpn-client-core",
+ "rustvpn-client-ipc",
  "rustvpn-crypto",
  "rustvpn-net",
  "rustvpn-proto",
+ "serde_json",
  "tokio",
  "tokio-util",
 ]
@@ -3932,8 +3935,11 @@ dependencies = [
 name = "rustvpn-client-ipc"
 version = "0.2.0-beta.1"
 dependencies = [
+ "chrono",
+ "ipnet",
  "serde",
  "serde_json",
+ "serde_yaml_ng",
  "thiserror 2.0.21",
  "tokio",
 ]
@@ -3996,6 +4002,7 @@ dependencies = [
  "ed25519-dalek",
  "getrandom 0.2.17",
  "io-uring",
+ "ipnet",
  "libc",
  "rand_core",
  "rustvpn-crypto",
@@ -4004,6 +4011,7 @@ dependencies = [
  "serde_json",
  "serde_yaml_ng",
  "subtle",
+ "tempfile",
  "thiserror 2.0.21",
  "tokio",
  "tokio-util",
@@ -4041,6 +4049,7 @@ dependencies = [
  "rustvpn-crypto",
  "rustvpn-net",
  "rustvpn-proto",
+ "serde_json",
  "tempfile",
  "tokio",
  "tokio-util",
@@ -4054,6 +4063,7 @@ dependencies = [
  "rand_core",
  "rpassword",
  "rustvpn-crypto",
+ "tempfile",
 ]
 
 [[package]]

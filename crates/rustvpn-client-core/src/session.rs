@@ -27,6 +27,8 @@ use tokio_util::sync::CancellationToken;
 pub enum SessionEnd {
     Timeout,
     Rehandshake,
+    /// Time-driven rekey initiated by this client.
+    Rekey,
     TcpClosed,
     TapClosed,
     Terminated,
@@ -50,6 +52,7 @@ impl Session {
             ev = self.handle.events.recv() => match ev {
                 Some(PeerEvent::Timeout) => SessionEnd::Timeout,
                 Some(PeerEvent::Rehandshake) => SessionEnd::Rehandshake,
+                Some(PeerEvent::Rekey) => SessionEnd::Rekey,
                 Some(PeerEvent::TcpClosed) => SessionEnd::TcpClosed,
                 Some(PeerEvent::TapClosed) => SessionEnd::TapClosed,
                 None => SessionEnd::TcpClosed,

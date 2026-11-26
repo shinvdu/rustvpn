@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
-use rustvpn_client_core::{Command, Engine, ValidatedProfile};
+use rustvpn_client_core::{Command, Engine, EngineOptions, ValidatedProfile};
 use rustvpn_client_ipc::{
     read_frame, write_frame, EngineStatus, Event, LogLine, ProfileSpec, Request, Response,
     PROTOCOL_VERSION, SOCKET_ENV,
@@ -33,6 +33,7 @@ struct Args {
     socket_group: String,
     hello_timeout: Duration,
     idle_timeout: Duration,
+    no_host_dns: bool,
     help: bool,
     version: bool,
 }
@@ -44,6 +45,7 @@ fn usage() -> ! {
          \x20 -socket-group group (optional; socket becomes 0660)\n\
          \x20 -hello-timeout seconds (default {DEFAULT_HELLO_TIMEOUT_SECS}; 0 disables)\n\
          \x20 -idle-timeout seconds (default {DEFAULT_IDLE_TIMEOUT_SECS}; 0 disables)\n\
+         \x20 -no-host-dns (leave DNS to the caller; for netns/containers)\n\
          \x20 -version\n\
          \x20 -help\n\
          \n\
@@ -72,6 +74,7 @@ fn parse_args() -> Args {
         socket_group: String::new(),
         hello_timeout: Duration::from_secs(DEFAULT_HELLO_TIMEOUT_SECS),
         idle_timeout: Duration::from_secs(DEFAULT_IDLE_TIMEOUT_SECS),
+        no_host_dns: false,
         help: false,
         version: false,
     };
@@ -103,6 +106,7 @@ fn parse_args() -> Args {
                 let value = take("idle-timeout");
                 args.idle_timeout = Duration::from_secs(parse_secs(&value, "idle-timeout"));
             }
+            "no-host-dns" => args.no_host_dns = true,
             "version" => args.version = true,
             "h" | "help" => args.help = true,
             "" => usage(),
@@ -154,7 +158,15 @@ async fn main() {
         }
     };
 
-    if let Err(error) = run(args.socket, gid, args.hello_timeout, args.idle_timeout).await {
+    if let Err(error) = run(
+        args.socket,
+        gid,
+        args.hello_timeout,
+        args.idle_timeout,
+        args.no_host_dns,
+    )
+    .await
+    {
         eprintln!("{error:#}");
         process::exit(1);
     }
@@ -165,12 +177,19 @@ async fn run(
     gid: Option<u32>,
     hello_timeout: Duration,
     idle_timeout: Duration,
+    no_host_dns: bool,
 ) -> Result<()> {
     if socket_path.as_os_str().len() >= 100 {
         bail!("socket path is too long: {}", socket_path.display());
     }
     prepare_socket_parent(&socket_path)?;
     remove_stale_socket(&socket_path).await?;
+
+    // Backstop for this daemon instance after a crash while a kill switch/MSS
+    // table was installed.  Table names are scoped by the socket path, so
+    // another RustVPN daemon in the same netns is not touched.
+    let firewall_scope = rustvpn_client_core::firewall::instance_scope(&socket_path);
+    rustvpn_client_core::netcfg::cleanup_stale_firewall(&firewall_scope).await;
 
     let (commands_tx, commands_rx) = mpsc::channel(8);
     let (events_tx, _) = broadcast::channel(256);
@@ -188,7 +207,14 @@ async fn run(
         shutdown: shutdown.clone(),
     };
 
-    let engine = Engine::spawn(commands_rx, events_tx.clone());
+    let engine = Engine::spawn_with_options(
+        commands_rx,
+        events_tx.clone(),
+        EngineOptions {
+            no_host_dns,
+            firewall_scope,
+        },
+    );
     spawn_collector(events_tx.clone(), status.clone(), logs.clone());
 
     let listener = UnixListener::bind(&socket_path)

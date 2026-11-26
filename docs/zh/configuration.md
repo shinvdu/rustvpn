@@ -40,7 +40,7 @@ sudo rustvpn-server -proto all -bind 0.0.0.0:1194 \
 | `-stats ADDR` | JSON 统计 HTTP 端点。 | 禁用 |
 | `-proxy ADDR` | HTTP CONNECT 代理 `host:port`。 | 直连 |
 | `-proxy-auth USER:PASS` | 用于代理的 HTTP Basic 凭据。 | — |
-| `-mtu N` | 最大 TAP 帧大小。 | `1515` |
+| `-mtu N` | 与服务器一致的数值线路 MTU（双方契约；`auto`/`0` 无效）。 | `1515` |
 | `-timeout N` | peer 存活超时（秒）。 | `60` |
 | `-timesync N` | 握手时间戳窗口（秒，0 表示关闭）。 | `0` |
 | `-noise` | 将出站数据包填充至 MTU。 | 关闭 |
@@ -51,7 +51,7 @@ sudo rustvpn-server -proto all -bind 0.0.0.0:1194 \
 
 启动时执行的校验：
 
-- `mtu` 必须位于 `68..=9015` 区间；noise/encless 模式要求 `mtu >= 120`。
+- `mtu` 必须是正的数值，且位于 `68..=9015` 区间；`auto` 与 `0` 会被拒绝；noise/encless 模式要求 `mtu >= 120`。
 - `-encless` 要求 `-proto tcp`（或 `-proxy`，后者强制 TCP）。
 - 未知的 `-proto` 值会被拒绝。
 
@@ -60,7 +60,7 @@ sudo rustvpn-server -proto all -bind 0.0.0.0:1194 \
 Tauri 客户端不读取 CLI 参数，而是使用
 `~/.config/rustvpn/profiles/*.yaml`。与 CLI 的主要差异：
 
-- 必须有 IPv4 `address`；全隧道（`routes` 含 `default` 或 `0.0.0.0/0`）还必须提供 `gateway` 和至少一个 IPv4 `dns`。
+- 必须有 IPv4 `address`；全隧道（`routes` 含 `default`、`0.0.0.0/0` 或被规范化为前缀 0 的写法）还必须提供 `gateway` 和至少一个 IPv4 `dns`。
 - 默认 `iface` 为 `rsvpn-gui`，避免与本机 `rustvpn-client` 的 `tap0/rsvpn0` 冲突。
 - 不支持 `up`/`down` 脚本；地址、路由、DNS 和 IPv6 防护由 `rustvpn-clientd` 内置管理。
 - 界面/托盘语言与登录自启动是 GUI 设置，不写入 profile；语言保存在 WebView
@@ -89,7 +89,7 @@ Tauri 客户端不读取 CLI 参数，而是使用
 ```yaml
 alice:
   iface: tap0           # TAP device name; may be empty if up prints it
-  mtu: 1515             # max TAP frame size (default 1515, clamped 68..9015)
+  mtu: 1515             # 双方一致的数值线路 MTU（默认 1515，钳制 68..9015；0 无效）
   up: /etc/rustvpn/up.sh
   down: /etc/rustvpn/down.sh
   timeout: 60           # seconds; <= 0 means 60
@@ -98,15 +98,21 @@ alice:
   cpr: 0                # constant packet rate, KiB/s; 0 = off
   encless: false        # encryptionless mode (forces noise)
   verifier: $argon2d$m=4096,t=128,p=1$...$...   # LONG form required
+  # 可选：RustVPN 专属的声明式 TAP 配置（取代 up 脚本）：
+  # network:
+  #   address: 10.88.0.1/24
+  #   dns: [10.88.0.1]
+  #   routes: [10.88.0.0/24]      # 显式 CIDR；默认路由（含非规范前缀 0 写法）被拒绝
 ```
 
 加载文件时应用的规则：
 
 - `iface` 或 `up` 至少有一个可用。若 `iface` 为空，则使用 up 脚本 stdout 的第一行作为接口名。
 - `verifier` 必须能解码且包含公钥。短格式会被拒绝并报 `server verifier has no public key`。
-- `mtu: 0` 表示 1515。数值会被钳制到 `[68, 9015]`；noise/encless 条目会被提升到至少 120。
+- `mtu: 0` 无效并被拒绝；省略 `mtu` 才使用历史默认值 1515。数值会被钳制到 `[68, 9015]`；noise/encless 条目会被提升到至少 120。
 - `encless: true` 会强制 `noise: true`（填充是编码的一部分）。
 - `timeout <= 0` 表示 60 秒。
+- `network` 可选。若存在，需要 `iface`（或能打印接口名的 up 脚本）；IPv4 地址/网关/DNS/路由会被校验，默认路由（含 `00.0.0.0/0` 等非规范前缀 0 写法）会被拒绝。见下方“服务端声明式网络”。
 - 该文件每 **60 秒**重新读取一次。解析失败会保留上一份有效配置并打印错误。
 
 服务器上每个 peer 各自拥有一个 TAP 设备。若两个 peer 同时活跃，它们不得共享同一个 `iface`。
@@ -127,7 +133,8 @@ alice:
 set -eu
 IFACE="${GOVPN_IFACE:-tap0}"
 ip tuntap add dev "$IFACE" mode tap 2>/dev/null || true
-ip link set dev "$IFACE" mtu 1540 up
+# 这里设置的是 TAP 接口 IP MTU，不是线路 MTU（plain 线路 1515 -> 1500）。
+ip link set dev "$IFACE" mtu 1500 up
 ip addr replace 10.88.0.1/24 dev "$IFACE"
 ```
 
@@ -137,7 +144,8 @@ ip addr replace 10.88.0.1/24 dev "$IFACE"
 #!/bin/sh
 set -eu
 IFACE="${GOVPN_IFACE:-tap0}"
-ip link set dev "$IFACE" mtu 1540 up
+# 这里设置的是 TAP 接口 IP MTU，不是线路 MTU（plain 线路 1515 -> 1500）。
+ip link set dev "$IFACE" mtu 1500 up
 ip addr replace 10.88.0.2/24 dev "$IFACE"
 ip route replace 10.88.0.0/24 dev "$IFACE"
 ```
@@ -147,15 +155,39 @@ ip route replace 10.88.0.0/24 dev "$IFACE"
 <a id="mtu"></a>
 ## MTU
 
-`mtu` 是守护进程期望从 TAP 设备读取的最大帧大小。超过该模式有效载荷上限的帧会被拒绝并记录日志；它们绝不会被静默截断。
+在 v1 中，`mtu` 是**双方一致的数值线路契约**：客户端与服务器必须使用同一个数值。任何一侧根据本地路径推导都会改变握手/传输的线上长度，使对端以 `TooLarge` 拒绝数据包。因此：
 
-| 模式 | 有效载荷上限 |
-|---|---|
-| classic | `MTU - 1` |
-| noise | `MTU - 25`（16 字节 tag + 8 字节 nonce + 1 字节 pad） |
-| encless | `MTU - 9`（8 字节 nonce + 1 字节 pad） |
+- `mtu` 必须是正数；**`mtu: auto` 与 `mtu: 0` 会被拒绝**（省略服务端字段才使用默认 1515）。
+- 本地只推导 TAP **接口 IP MTU** 与 TCP MSS：
 
-在默认的 `mtu: 1515` 下，分别是 1514 / 1490 / 1506 字节。如果你需要通过 noise 或 encless 隧道承载完整的 1500 字节 IP 包（1514 字节以太网帧），请将配置的 MTU 至少提高到 1540（noise）或 1524（encless），并在 up 脚本中相应设置 TAP 接口 MTU。peer 的内部 MTU 不应超过有效载荷。
+```text
+inner_ip_mtu = Mode::max_payload(wire_mtu) - 14
+ipv4_mss     = inner_ip_mtu - 40
+ipv6_mss     = inner_ip_mtu - 60
+```
+
+| 模式 | 有效载荷上限 | 线路 1515 时的 TAP IP MTU | MSS v4 / v6 |
+|---|---|---:|---:|
+| plain | `MTU - 1` | 1500 | 1460 / 1440 |
+| noise | `MTU - 25`（16 tag + 8 nonce + 1 pad） | 1476 | 1436 / 1416 |
+| encless | `MTU - 9`（8 nonce + 1 pad） | 1492 | 1452 / 1432 |
+
+- 守护进程（`rustvpn-clientd`）与服务端声明式路径（`network:`）把 TAP 接口设置为 `inner_ip_mtu`，**绝不是帧预算本身**，并记录线路 MTU、模式、内部 MTU 与 MSS。
+- 走 Go 兼容的 CLI/up 脚本且自行配置接口时，必须写入同一个内部值：如 plain `-mtu 1515` → `ip link set ... mtu 1500`，noise → `1476`，encless → `1492`。若改用其它线路 MTU，请按上面的公式计算。
+- 超过模式有效载荷上限的帧会被拒绝并记录日志，绝不会被静默截断。
+- **自动路径 MTU 推导推迟到 v2 的 MTU 协商**。v1 不宣称路径 MTU 自适应；若路径更小，请在**两侧**同时降低数值线路 MTU。
+- encless 在普通 1500 字节外层路径上仍会记录容量告警：每个包增加 `4128` 字节。不要依赖 IP 分片；请使用 jumbo 帧或其它模式。
+
+## 服务端声明式网络（`network:`）
+
+当 `peers.yaml` 条目包含可选的 `network:` 时，`rustvpn-server` 无需 up 脚本即可管理该 peer 的 TAP：
+
+- 缺失时创建 TAP，按数值线路 MTU 推导并设置 **接口 IP MTU**（`inner_ip_mtu = max_payload - 14`；plain 1515 → 1500、noise 1515 → 1476、encless 1515 → 1492），然后添加地址/路由，并在配置了 `dns` 时调用 `resolvectl`。
+- **严格所有权**：新建 TAP 会写入 `ip link set dev <iface> alias rustvpn-managed`；已存在但未带该标记的 TAP 会被拒绝并保持原样，避免破坏管理员的地址/路由/DNS。带标记的 TAP 视为上次崩溃/重启遗留，接管并在退出时删除。
+- **非破坏式安装**：地址/路由使用 `ip addr add` / `ip route add`，**绝不使用 `replace`**。遇到 `EEXIST` 时，只有完全匹配的既有地址/路由才视为幂等（便于接管崩溃遗留）；其它冲突会中止并回滚。RustVPN 只记录并删除自己真正添加的项，既有路由（包括主机默认路由）绝不会被覆盖或删除。
+- `network.routes` 必须是显式 IPv4 CIDR；默认路由（包括非规范前缀 0 写法）会被拒绝，以免劫持服务器自身路由。设置 `gateway` 时它作为这些路由的下一跳。
+- 任一步失败都会回滚地址/路由/DNS/MTU 与 RustVPN 创建的 TAP；成功配置的状态在服务器退出时移除。运行中把某个 peer 从 `network:` 改回纯脚本路径不会自动迁移，需重启服务器（或手动清理）以移除声明式状态。
+- `network:` 是 RustVPN 扩展；不含该节的条目与 GoVPN 5.7 YAML 完全兼容，含该节的文件会被 Go 服务端拒绝。
 
 ## 超时与心跳
 

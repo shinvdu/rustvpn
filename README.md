@@ -58,8 +58,28 @@ ICMP through the tunnel):
 The wire format is covered by byte-exact handshake/transport vectors
 regardless.
 
+Client daemon profiles add optional nftables MSS clamping and a full-tunnel
+kill switch, an additive `rustvpn-client status --json` /
+`rustvpn-server status --json` document (`rustvpn.status.v1`), one-step
+profile/QR onboarding from `rustvpn-verifier`, opt-in NAT keepalive,
+time-driven rekey, and declarative server TAP setup (`network:` in
+`peers.yaml`).  Config reload is diff-based: only added/removed/changed peers
+are affected.  The wire protocol is unchanged.
+
+The numeric `mtu` is a two-sided wire contract in v1: both peers must use the
+same value, and only the TAP interface MTU/MSS are derived from it.  `mtu:
+auto` and `mtu: 0` are rejected; automatic path-MTU negotiation is deferred
+to a future protocol version.  Kill-switch protection covers host `output`
+traffic only (not forwarded/LAN/NAT), and is fail-closed when `nft` is
+unavailable.  New GUI/onboarding profiles default to `rekey_time: 1800`
+(the daemon default remains 0); time-driven rekey is a scheduled reconnect,
+so a short packet gap is possible.
+
 Not implemented yet: portability packaging for FreeBSD/macOS (only Linux
-has been exercised) and automatic effective-MTU handling for TAP interfaces.
+has been exercised), make-before-break rekey (v1 has no overlap message;
+time-driven rekey is a scheduled reconnect), `mtu: auto`, and an automatic
+`rustvpn://profile` importer (the onboarding URI is informational; use the
+YAML profile or QR image).
 
 ## Quick start
 
@@ -123,6 +143,7 @@ English pages:
 - [FAQ](docs/en/faq.md)
 - [Design](docs/en/design.md)
 - [Performance](docs/en/performance.md)
+- [Running the client daemon in a network namespace](docs/netns-client.md)
 - [Desktop client UI (Linux, deb/rpm, zh/en/ru; guide in Chinese)](docs/client-ui.md)
 
 ## Tests and benchmarks

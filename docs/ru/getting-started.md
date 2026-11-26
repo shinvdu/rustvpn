@@ -88,7 +88,8 @@ alice:
 set -eu
 IFACE="${GOVPN_IFACE:-tap0}"
 ip tuntap add dev "$IFACE" mode tap 2>/dev/null || true
-ip link set dev "$IFACE" mtu 1515 up
+# IP MTU интерфейса, а не MTU линии: plain линия 1515 -> 1500.
+ip link set dev "$IFACE" mtu 1500 up
 ip addr replace 10.88.0.1/24 dev "$IFACE"
 ```
 
@@ -124,7 +125,8 @@ sudo ./target/release/rustvpn-client \
 set -eu
 IFACE="${GOVPN_IFACE:-tap0}"
 ip tuntap add dev "$IFACE" mode tap 2>/dev/null || true
-ip link set dev "$IFACE" mtu 1515 up
+# IP MTU интерфейса, а не MTU линии: plain линия 1515 -> 1500.
+ip link set dev "$IFACE" mtu 1500 up
 ip addr replace 10.88.0.2/24 dev "$IFACE"
 ip route replace 10.88.0.0/24 dev "$IFACE"
 ```
@@ -141,7 +143,8 @@ ip route replace 10.88.0.0/24 dev "$IFACE"
 # TAP and addressing (also do this in up.sh for production)
 ip tuntap add dev tap10 mode tap
 ip addr replace 172.16.0.1/24 dev tap10
-ip link set dev tap10 mtu 1540 up   # 1515 + noise overhead if noise is on
+# IP MTU TAP-интерфейса, а не MTU линии. plain линия 1515 -> 1500.
+ip link set dev tap10 mtu 1500 up
 
 sudo rustvpn-server -bind 192.168.0.1:1194 -conf peers.yaml
 ```
@@ -151,7 +154,7 @@ sudo rustvpn-server -bind 192.168.0.1:1194 -conf peers.yaml
 ```bash
 ip tuntap add dev tap10 mode tap
 ip addr replace 172.16.0.2/24 dev tap10
-ip link set dev tap10 mtu 1540 up
+ip link set dev tap10 mtu 1500 up   # plain линия 1515 -> IP MTU TAP 1500
 ip route add 0/1 via 172.16.0.1
 ip route add 128/1 via 172.16.0.1
 
@@ -160,15 +163,21 @@ sudo rustvpn-client \
     -iface tap10 -remote 192.168.0.1:1194
 ```
 
-Два маршрута `/1` переопределяют маршрут по умолчанию, не удаляя его, поэтому туннель переносит весь трафик, а нижележащий канал по-прежнему передаёт шифрованные UDP-пакеты. Подбирайте MTU в зависимости от режима:
+Два маршрута `/1` переопределяют маршрут по умолчанию, не удаляя его, поэтому туннель переносит весь трафик, а нижележащий канал по-прежнему передаёт шифрованные UDP-пакеты.
 
-| Режим | Полезная нагрузка при `mtu: 1515` |
-|---|---|
-| classic | 1514 байт |
-| noise | 1490 байт |
-| encless | 1506 байт |
+Задавайте **IP MTU TAP-интерфейса** по числовому MTU линии и режиму; никогда не используйте сам бюджет линии/кадра:
 
-Либо увеличьте настроенный MTU/MTU интерфейса, либо уменьшите MTU внутренней сети. См. [Конфигурация → MTU](configuration.md#mtu).
+```text
+inner_ip_mtu = Mode::max_payload(wire_mtu) - 14
+```
+
+| Режим | IP MTU TAP-интерфейса при `mtu: 1515` |
+|---|---:|
+| plain | 1500 |
+| noise | 1476 |
+| encless | 1492 |
+
+Если используется другой числовой MTU линии, вычислите значение по формуле (или позвольте это демону/декларативному пути сервера). MTU линии — двусторонний контракт; `mtu: auto` и `mtu: 0` отклоняются. См. [Конфигурация → MTU](configuration.md#mtu).
 
 ## Опционально: настольный GUI
 
@@ -200,7 +209,7 @@ cargo run --release -p rustvpn-net    --example mmsg_bench
 |---|---|
 | `Cannot find device "tap0"` | Скрипт `up` на сервере не создал постоянное устройство TAP. Добавьте `ip tuntap add ... mode tap`. |
 | Рукопожатие проходит, трафика нет | У TAP нет IP-адреса, неверный MTU или отсутствует маршрут. Проверьте `ip addr` / `ip route`. |
-| Крупные пакеты пропадают при noise/encless | Полезная нагрузка превышает `MTU-25` / `MTU-9`. Увеличьте MTU или уменьшите MTU внутренней сети. |
+| Крупные пакеты пропадают при noise/encless | Полезная нагрузка превышает `MTU-25` / `MTU-9`. Увеличьте числовой MTU линии на обеих сторонах (затем пересчитайте IP MTU TAP) или уменьшите MTU внутренней сети. |
 | `Currently encryptionless mode works only with TCP` | Используйте `-proto tcp` (также подразумевается при `-proxy`) для encless на клиенте. |
 | `server verifier has no public key` | В `peers.yaml` указана короткая форма; используйте длинную форму, созданную в том же запуске. |
 | `random number mismatch` во время рукопожатия | Обычно это две перекрывающиеся сессии после одновременного перезапуска; помогает чистый перезапуск или автопереподключение клиента. |

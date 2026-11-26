@@ -3,14 +3,13 @@
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
 
 use anyhow::Result;
 use rustvpn_proto::{Decoder, Encoder, Ordering as PktOrdering, TransportError, MAX_BYTES_PER_KEY};
 use tokio::io::AsyncReadExt;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
-use tokio::time::{Duration, MissedTickBehavior};
+use tokio::time::{Duration, Instant, MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
 use zeroize::Zeroizing;
 
@@ -29,7 +28,10 @@ pub enum Outbound {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PeerEvent {
     Timeout,
+    /// Transport reached the 4 GiB per-key limit.
     Rehandshake,
+    /// Time-driven rekey; only emitted by the original initiator (client).
+    Rekey,
     TcpClosed,
     /// The TAP backend failed fatally (io_uring/ring death, ENODEV, ...).
     TapClosed,
@@ -154,12 +156,11 @@ async fn sender_task(
     let mut wire: Vec<u8> = Vec::new();
     let mut scratch: Vec<u8> = Vec::new();
     let mut last_sent = Instant::now();
-    let tick = if cfg.cpr > 0 {
-        cfg.cpr_cycle()
-    } else {
-        cfg.heartbeat_interval()
-    };
-    let mut ticker = tokio::time::interval(tick.max(Duration::from_millis(1)));
+    // `send_interval` is timeout/4 when keepalive is disabled (historical
+    // heartbeat), the configured keepalive otherwise, and the CPR cycle when
+    // constant-rate mode is active.
+    let send_interval = cfg.send_interval();
+    let mut ticker = tokio::time::interval(send_interval.max(Duration::from_millis(1)));
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
     loop {
         tokio::select! {
@@ -167,7 +168,10 @@ async fn sender_task(
             _ = ticker.tick() => {
                 let payload = if cfg.cpr > 0 {
                     queue.pop_front().unwrap_or_default()
-                } else if last_sent.elapsed() >= cfg.peer_timeout() {
+                } else if last_sent.elapsed() >= send_interval {
+                    // Empty payload.  In noise/encless mode the transport
+                    // codec pads this to the MTU; the wire format cannot
+                    // carry a shorter packet, so keepalive cost is documented.
                     Vec::new()
                 } else {
                     continue;
@@ -296,7 +300,7 @@ async fn udp_receiver_task(
                                 eprintln!("TAP write failed: {e}");
                             }
                         }
-                        if client && wire_total(&stats) > MAX_BYTES_PER_KEY {
+                        if client && bytes_rekey_due(&stats) {
                             rekey = true;
                         }
                     }
@@ -362,7 +366,7 @@ async fn tcp_receiver_task(
                                     eprintln!("TAP write failed: {e}");
                                 }
                             }
-                            if client && wire_total(&stats) > MAX_BYTES_PER_KEY {
+                            if client && bytes_rekey_due(&stats) {
                                 event(&events, PeerEvent::Rehandshake);
                                 return;
                             }
@@ -384,6 +388,11 @@ fn wire_total(stats: &LiveStats) -> u64 {
     stats.bytes_in_total() + stats.bytes_out_total()
 }
 
+/// 4 GiB per-key threshold, evaluated only on the client (initiator).
+fn bytes_rekey_due(stats: &LiveStats) -> bool {
+    wire_total(stats) > MAX_BYTES_PER_KEY
+}
+
 async fn monitor_task(
     stats: Arc<LiveStats>,
     cfg: Arc<PeerConfig>,
@@ -402,6 +411,35 @@ async fn monitor_task(
                 }
             }
         }
+    }
+}
+
+/// Randomized time-driven rekey delay.  Returns `None` for servers (only the
+/// original initiator may rekey) and when `rekey_time` is disabled.
+fn rekey_delay(cfg: &PeerConfig, is_client: bool) -> Option<Duration> {
+    if !is_client || cfg.rekey_time.is_zero() {
+        return None;
+    }
+    let jitter_secs = cfg.rekey_jitter.as_secs();
+    let jitter = if jitter_secs == 0 {
+        0
+    } else {
+        let mut bytes = [0u8; 8];
+        if getrandom::getrandom(&mut bytes).is_ok() {
+            u64::from_le_bytes(bytes) % jitter_secs.saturating_add(1)
+        } else {
+            0
+        }
+    };
+    cfg.rekey_time
+        .checked_add(Duration::from_secs(jitter))
+        .or(Some(Duration::MAX))
+}
+
+async fn rekey_task(delay: Duration, cancel: CancellationToken, events: mpsc::Sender<PeerEvent>) {
+    tokio::select! {
+        _ = cancel.cancelled() => {}
+        _ = tokio::time::sleep(delay) => event(&events, PeerEvent::Rekey),
     }
 }
 
@@ -430,6 +468,9 @@ pub fn spawn_udp_peer(
     let (outbound_tx, outbound_rx) = mpsc::channel(OUTBOUND_QUEUE);
     let (inbound_tx, inbound_rx) = mpsc::channel(INBOUND_QUEUE);
     let (events_tx, events_rx) = mpsc::channel(4);
+    if let Some(delay) = rekey_delay(&cfg, is_client) {
+        tokio::spawn(rekey_task(delay, cancel.clone(), events_tx.clone()));
+    }
     tokio::spawn(sender_task(
         writer,
         Encoder::new(key, is_client),
@@ -479,6 +520,9 @@ pub fn spawn_tcp(
     let cancel = CancellationToken::new();
     let (outbound_tx, outbound_rx) = mpsc::channel(OUTBOUND_QUEUE);
     let (events_tx, events_rx) = mpsc::channel(4);
+    if let Some(delay) = rekey_delay(&cfg, is_client) {
+        tokio::spawn(rekey_task(delay, cancel.clone(), events_tx.clone()));
+    }
     tokio::spawn(sender_task(
         WireWriter::Tcp(write),
         Encoder::new(key, is_client),
@@ -561,4 +605,137 @@ pub fn spawn_udp_dispatch(
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rustvpn_crypto::verifier::Verifier;
+
+    fn cfg(rekey_time: u64, rekey_jitter: u64) -> PeerConfig {
+        PeerConfig {
+            id: [1u8; 16],
+            name: "test".into(),
+            iface: "tap0".into(),
+            mtu: 1515,
+            up: String::new(),
+            down: String::new(),
+            timeout: Duration::from_secs(60),
+            noise: false,
+            cpr: 0,
+            encless: false,
+            time_sync: 0,
+            keepalive: Duration::ZERO,
+            rekey_time: Duration::from_secs(rekey_time),
+            rekey_jitter: Duration::from_secs(rekey_jitter),
+            network: None,
+            verifier: Verifier::new(1, 1, 1, [1u8; 16]),
+            signing_key: None,
+        }
+    }
+
+    #[test]
+    fn rekey_is_client_only_and_off_by_default() {
+        assert!(rekey_delay(&cfg(0, 0), true).is_none());
+        assert!(rekey_delay(&cfg(1800, 30), false).is_none());
+    }
+
+    #[test]
+    fn rekey_delay_respects_interval_and_jitter() {
+        let base = Duration::from_secs(1800);
+        let max = Duration::from_secs(1830);
+        for _ in 0..64 {
+            let delay = rekey_delay(&cfg(1800, 30), true).unwrap();
+            assert!(delay >= base && delay <= max, "{delay:?}");
+        }
+        assert_eq!(
+            rekey_delay(&cfg(1800, 0), true).unwrap(),
+            Duration::from_secs(1800)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn rekey_task_fires_once_and_honours_cancel() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let cancel = CancellationToken::new();
+        tokio::spawn(rekey_task(Duration::from_secs(30), cancel.clone(), tx));
+        tokio::time::advance(Duration::from_secs(29)).await;
+        assert!(rx.try_recv().is_err());
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert_eq!(rx.recv().await, Some(PeerEvent::Rekey));
+
+        let (tx, mut rx) = mpsc::channel(4);
+        let cancel = CancellationToken::new();
+        tokio::spawn(rekey_task(Duration::from_secs(30), cancel.clone(), tx));
+        cancel.cancel();
+        tokio::time::advance(Duration::from_secs(31)).await;
+        assert!(rx.try_recv().is_err());
+    }
+
+    async fn spawn_sender_for_test(
+        cfg: PeerConfig,
+    ) -> (
+        Arc<LiveStats>,
+        mpsc::Sender<Outbound>,
+        tokio::net::UdpSocket,
+    ) {
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let remote = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let stats = LiveStats::new("test".into(), cfg.id, false, 0, false, cfg.mtu);
+        let (outbound_tx, outbound_rx) = mpsc::channel(4);
+        let (events_tx, _events_rx) = mpsc::channel(4);
+        tokio::spawn(sender_task(
+            WireWriter::Udp {
+                socket,
+                remote: remote.local_addr().unwrap(),
+            },
+            Encoder::new([9u8; 32], true),
+            Arc::new(cfg),
+            stats.clone(),
+            outbound_rx,
+            CancellationToken::new(),
+            events_tx,
+        ));
+        // Let the sender create its interval timer before the test advances
+        // the paused clock.
+        tokio::task::yield_now().await;
+        (stats, outbound_tx, remote)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn keepalive_disabled_keeps_legacy_timeout_quarter() {
+        let mut cfg = cfg(0, 0);
+        cfg.timeout = Duration::from_secs(60);
+        let (stats, _outbound, _remote) = spawn_sender_for_test(cfg).await;
+        tokio::time::advance(Duration::from_secs(5)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(stats.snapshot().heartbeat_sent, 0);
+        tokio::time::advance(Duration::from_secs(10)).await;
+        tokio::task::yield_now().await;
+        assert!(stats.snapshot().heartbeat_sent >= 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn keepalive_uses_configured_interval() {
+        let mut cfg = cfg(0, 0);
+        cfg.timeout = Duration::from_secs(60);
+        cfg.keepalive = Duration::from_secs(25);
+        let (stats, _outbound, _remote) = spawn_sender_for_test(cfg).await;
+        tokio::time::advance(Duration::from_secs(24)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(stats.snapshot().heartbeat_sent, 0);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        assert!(stats.snapshot().heartbeat_sent >= 1);
+    }
+
+    #[test]
+    fn bytes_rekey_threshold_is_client_side_budget() {
+        let stats = LiveStats::new("1.2.3.4:5".into(), [1u8; 16], false, 0, false, 1515);
+        assert!(!bytes_rekey_due(&stats));
+        stats.add_wire_out(MAX_BYTES_PER_KEY as usize);
+        assert!(!bytes_rekey_due(&stats));
+        stats.add_wire_out(1);
+        assert!(bytes_rekey_due(&stats));
+    }
 }

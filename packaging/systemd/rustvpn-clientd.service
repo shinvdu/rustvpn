@@ -14,6 +14,13 @@ ExecStart=/usr/local/bin/rustvpn-clientd -socket /run/rustvpn-client/client.sock
 # Backstop for a crash: the route is marked with proto 66 so it cannot be
 # confused with an administrator's own blackhole route.
 ExecStopPost=-/usr/sbin/ip -6 route del blackhole default proto 66 metric 50
+# nftables tables are named rustvpn_{mss,killswitch}_<hash-of-socket-path>.
+# The daemon removes them on shutdown and on the next start of the same
+# instance, so no unit-level `nft delete` is used (it would race with other
+# RustVPN daemons in the same netns and requires nft on the host PATH).
+# If the daemon is killed uncleanly, an active kill switch stays installed
+# (fail-closed) until that instance starts again; install the `nftables`
+# package on hosts that use kill_switch/mss_clamp.
 AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW
 NoNewPrivileges=yes

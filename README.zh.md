@@ -39,7 +39,7 @@ RustVPN 是从零开始用 Rust 实现的 GoVPN 5.7 协议。它不是一套新�
 
 \* 在此环境中，Go 的 water TAP 读取器会间歇性报告 `not pollable`；当 TAP 预先创建时，同一个 Go 服务器工作正常。无论如何，线格式均由字节精确的握手/传输向量覆盖。
 
-尚未实现：面向 FreeBSD/macOS 的移植打包（目前仅在 Linux 上验证），以及 TAP 接口的有效 MTU（effective-MTU）自动处理。
+尚未实现：面向 FreeBSD/macOS 的移植打包（目前仅在 Linux 上验证），以及自动路径 MTU 协商（v1 使用双方一致的数值线路 MTU；TAP 接口 IP MTU 由模式推导，`auto`/`0` 被拒绝，推迟到 v2）。
 
 ## 快速开始
 

@@ -6,13 +6,61 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
+use ipnet::IpNet;
 use rustvpn_crypto::verifier::Verifier;
 use rustvpn_crypto::xtea::Xtea;
 use rustvpn_proto::{Mode, MTU_DEFAULT, MTU_MAX, MTU_MIN, MTU_MIN_NOISE};
+use serde::de::{self, Deserializer};
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
 
 use crate::DEFAULT_TIMEOUT;
+
+/// True when `route` denotes the default route.
+///
+/// `ipnet` accepts non-canonical spellings such as `00.0.0.0/0`,
+/// `0.0.0.00/0` and `0.0.0.0/00` and normalises them to prefix length zero.
+/// Comparing raw strings (`"default"` / `"0.0.0.0/0"`) therefore misses those
+/// forms and lets a declarative server route silently hijack the host default
+/// route.  This canonical check is shared by the server config validator and
+/// the declarative TAP installer.
+pub fn is_default_route(route: &str) -> bool {
+    let route = route.trim();
+    if route.eq_ignore_ascii_case("default") {
+        return true;
+    }
+    route
+        .parse::<IpNet>()
+        .map(|net| net.prefix_len() == 0)
+        .unwrap_or(false)
+}
+
+/// Declarative network setup for a server peer TAP.
+///
+/// This is a RustVPN extension.  When present, `rustvpn-server` can create
+/// and configure the TAP without an `up` script.  `peers.yaml` files without
+/// this section remain byte-for-byte GoVPN-compatible; see the migration note
+/// in `docs/en/configuration.md`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PeerNetwork {
+    pub address: String,
+    pub gateway: String,
+    pub dns: Vec<String>,
+    pub routes: Vec<String>,
+}
+
+impl PeerNetwork {
+    /// Stable representation used by reload diffing.
+    pub fn fingerprint(&self) -> String {
+        format!(
+            "{}|{}|{}|{}",
+            self.address,
+            self.gateway,
+            self.dns.join(","),
+            self.routes.join(",")
+        )
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct PeerConfig {
@@ -27,6 +75,14 @@ pub struct PeerConfig {
     pub cpr: u32,
     pub encless: bool,
     pub time_sync: i64,
+    /// Idle keepalive interval; zero preserves the timeout/4 heartbeat.
+    pub keepalive: Duration,
+    /// Time-driven rekey interval for client sessions; zero disables it.
+    pub rekey_time: Duration,
+    /// Random jitter added to `rekey_time`; zero means no jitter.
+    pub rekey_jitter: Duration,
+    /// Optional declarative TAP configuration (server-side extension).
+    pub network: Option<PeerNetwork>,
     pub verifier: Verifier,
     pub signing_key: Option<ed25519_dalek::SigningKey>,
 }
@@ -44,6 +100,33 @@ impl PeerConfig {
 
     pub fn max_payload(&self) -> usize {
         self.mode().max_payload(self.mtu)
+    }
+
+    pub fn mode_label(&self) -> &'static str {
+        match self.mode() {
+            Mode::Plain => "plain",
+            Mode::Noise => "noise",
+            Mode::Encless => "encless",
+        }
+    }
+
+    /// IP MTU for the TAP interface derived from the numeric wire MTU.
+    ///
+    /// This must never be the wire/frame budget itself: the kernel would then
+    /// be able to emit frames larger than the mode payload budget and the
+    /// reader would drop them.
+    pub fn inner_ip_mtu(&self) -> usize {
+        self.max_payload().saturating_sub(14)
+    }
+
+    /// IPv4 TCP MSS clamp value derived from the TAP IP MTU.
+    pub fn mss_v4(&self) -> usize {
+        self.inner_ip_mtu().saturating_sub(40)
+    }
+
+    /// IPv6 TCP MSS clamp value derived from the TAP IP MTU.
+    pub fn mss_v6(&self) -> usize {
+        self.inner_ip_mtu().saturating_sub(60)
     }
 
     /// Interval used for heartbeat/ticker scheduling (Go's `Peer.Timeout`).
@@ -79,6 +162,27 @@ impl PeerConfig {
         }
     }
 
+    /// Idle interval used by the sender task.
+    ///
+    /// With `keepalive: 0` this is exactly the historical `timeout / 4`
+    /// heartbeat.  A configured keepalive overrides that interval while
+    /// remaining below `timeout`, so it cannot mask peer death.
+    pub fn send_interval(&self) -> Duration {
+        if self.cpr > 0 {
+            self.cpr_cycle()
+        } else if !self.keepalive.is_zero() {
+            self.keepalive
+        } else {
+            self.heartbeat_interval()
+        }
+    }
+
+    /// True when the keepalive (rather than the legacy heartbeat) controls
+    /// idle empty-packet timing.
+    pub fn keepalive_enabled(&self) -> bool {
+        self.cpr == 0 && !self.keepalive.is_zero()
+    }
+
     /// Render this runtime peer back into the GoVPN 5.7 YAML schema.
     ///
     /// The long-form verifier is required: a server configuration without the
@@ -94,6 +198,12 @@ impl PeerConfig {
             cpr: self.cpr,
             encless: self.encless,
             timesync: self.time_sync,
+            network: self.network.as_ref().map(|network| PeerNetworkYaml {
+                address: network.address.clone(),
+                gateway: network.gateway.clone(),
+                dns: network.dns.clone(),
+                routes: network.routes.clone(),
+            }),
             verifier: self.verifier.long_form()?,
         })
     }
@@ -109,7 +219,13 @@ impl PeerConfig {
 pub struct PeerYaml {
     #[serde(default)]
     pub iface: String,
-    #[serde(default)]
+    /// Numeric wire MTU; an explicit `0` is rejected.  Omitted values keep the
+    /// historical GoVPN default (1515).
+    #[serde(
+        default,
+        skip_serializing_if = "is_zero",
+        deserialize_with = "de_explicit_mtu"
+    )]
     pub mtu: usize,
     #[serde(default)]
     pub up: String,
@@ -125,7 +241,43 @@ pub struct PeerYaml {
     pub encless: bool,
     #[serde(default)]
     pub timesync: i64,
+    /// Optional RustVPN-only declarative TAP setup.  Omitted for
+    /// GoVPN-compatible configurations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network: Option<PeerNetworkYaml>,
     pub verifier: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PeerNetworkYaml {
+    #[serde(default)]
+    pub address: String,
+    #[serde(default)]
+    pub gateway: String,
+    #[serde(default)]
+    pub dns: Vec<String>,
+    #[serde(default)]
+    pub routes: Vec<String>,
+}
+
+/// Reject an explicit `mtu: 0` while still allowing the field to be omitted
+/// (the `default` attribute handles the omitted case).
+fn de_explicit_mtu<'de, D>(deserializer: D) -> Result<usize, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = usize::deserialize(deserializer)?;
+    if value == 0 {
+        return Err(de::Error::custom(
+            "mtu must be a positive numeric value; 0 is invalid",
+        ));
+    }
+    Ok(value)
+}
+
+fn is_zero(value: &usize) -> bool {
+    *value == 0
 }
 
 #[derive(Clone, Debug, Default)]
@@ -202,6 +354,7 @@ impl ConfigSet {
             } else {
                 y.timeout
             };
+            let network = parse_peer_network(&name, y.network.as_ref())?;
             peers.push(PeerConfig {
                 id: verifier.id,
                 name,
@@ -214,6 +367,10 @@ impl ConfigSet {
                 cpr: y.cpr,
                 encless,
                 time_sync: y.timesync,
+                keepalive: Duration::ZERO,
+                rekey_time: Duration::ZERO,
+                rekey_jitter: Duration::ZERO,
+                network,
                 verifier,
                 signing_key: None,
             });
@@ -255,6 +412,61 @@ impl ConfigSet {
     }
 }
 
+fn parse_peer_network(
+    name: &str,
+    network: Option<&PeerNetworkYaml>,
+) -> Result<Option<PeerNetwork>> {
+    let Some(network) = network else {
+        return Ok(None);
+    };
+    if !network.address.trim().is_empty() {
+        let address: IpNet = network
+            .address
+            .parse()
+            .with_context(|| format!("{name}: invalid network.address {:?}", network.address))?;
+        if !matches!(address, IpNet::V4(_)) {
+            return Err(anyhow!("{name}: network.address must be IPv4"));
+        }
+    }
+    if !network.gateway.trim().is_empty() {
+        let gateway: std::net::IpAddr = network
+            .gateway
+            .parse()
+            .with_context(|| format!("{name}: invalid network.gateway {:?}", network.gateway))?;
+        if !matches!(gateway, std::net::IpAddr::V4(_)) {
+            return Err(anyhow!("{name}: network.gateway must be IPv4"));
+        }
+    }
+    for dns in &network.dns {
+        let server: std::net::IpAddr = dns
+            .parse()
+            .with_context(|| format!("{name}: invalid network.dns {dns:?}"))?;
+        if !matches!(server, std::net::IpAddr::V4(_)) {
+            return Err(anyhow!("{name}: network.dns must be IPv4"));
+        }
+    }
+    for route in &network.routes {
+        if is_default_route(route) {
+            return Err(anyhow!(
+                "{name}: network.routes must not contain a default route on the server \
+                 (including non-canonical prefix-0 forms)"
+            ));
+        }
+        let net: IpNet = route
+            .parse()
+            .with_context(|| format!("{name}: invalid network.route {route:?}"))?;
+        if !matches!(net, IpNet::V4(_)) {
+            return Err(anyhow!("{name}: network.routes must be IPv4"));
+        }
+    }
+    Ok(Some(PeerNetwork {
+        address: network.address.clone(),
+        gateway: network.gateway.clone(),
+        dns: network.dns.clone(),
+        routes: network.routes.clone(),
+    }))
+}
+
 pub fn add_time_sync(time_sync: i64, data: &mut [u8]) {
     if time_sync <= 0 {
         return;
@@ -289,8 +501,112 @@ mod tests {
             cpr: 0,
             encless: false,
             time_sync: 0,
+            keepalive: Duration::ZERO,
+            rekey_time: Duration::ZERO,
+            rekey_jitter: Duration::ZERO,
+            network: None,
             verifier: Verifier::new(1, 1, 1, id),
             signing_key: None,
+        }
+    }
+
+    #[test]
+    fn keepalive_interval_selection_preserves_default_heartbeat() {
+        let mut p = peer([5u8; 16]);
+        p.timeout = Duration::from_secs(60);
+        assert_eq!(p.send_interval(), Duration::from_secs(15));
+        assert!(!p.keepalive_enabled());
+
+        p.keepalive = Duration::from_secs(25);
+        assert_eq!(p.send_interval(), Duration::from_secs(25));
+        assert!(p.keepalive_enabled());
+
+        // CPR owns the clock even if a keepalive was configured.
+        p.cpr = 10;
+        assert_eq!(p.send_interval(), p.cpr_cycle());
+        assert!(!p.keepalive_enabled());
+    }
+
+    #[test]
+    fn peer_yaml_network_is_optional_and_go_compatible() {
+        let id = [2u8; 16];
+        let mut verifier = Verifier::new(1, 1, 1, id);
+        verifier.public = Some([0x44u8; 32]);
+        let long = verifier.long_form().unwrap();
+        // Without `network`, rendering must not invent a RustVPN-only key.
+        let yaml = format!("peer:\n  iface: tap9\n  verifier: {long}\n");
+        let set = ConfigSet::from_str(&yaml).unwrap();
+        let rendered = set.render_yaml().unwrap();
+        assert!(!rendered.contains("network:"), "{rendered}");
+
+        let with_network = format!(
+            "peer:\n  iface: tap9\n  network:\n    address: 10.88.0.1/24\n    routes: [10.88.0.0/24]\n  verifier: {long}\n"
+        );
+        let set = ConfigSet::from_str(&with_network).unwrap();
+        let network = set.peers[0].network.as_ref().unwrap();
+        assert_eq!(network.address, "10.88.0.1/24");
+        assert_eq!(network.routes, vec!["10.88.0.0/24"]);
+        let rendered = set.render_yaml().unwrap();
+        assert!(rendered.contains("network:"));
+    }
+
+    #[test]
+    fn peer_yaml_rejects_unsafe_network_values() {
+        let id = [3u8; 16];
+        let mut verifier = Verifier::new(1, 1, 1, id);
+        verifier.public = Some([0x55u8; 32]);
+        let long = verifier.long_form().unwrap();
+        for network in [
+            "    address: 2001:db8::1/64\n",
+            "    address: 10.88.0.1/24\n    routes: [default]\n",
+            "    address: 10.88.0.1/24\n    dns: [2001:db8::53]\n",
+        ] {
+            let yaml = format!("peer:\n  iface: tap9\n  network:\n{network}  verifier: {long}\n");
+            assert!(ConfigSet::from_str(&yaml).is_err(), "{network}");
+        }
+    }
+
+    #[test]
+    fn default_route_detection_covers_canonical_and_noncanonical_forms() {
+        for route in [
+            "default",
+            "DEFAULT",
+            " default ",
+            "0.0.0.0/0",
+            "00.0.0.0/0",
+            "0.0.0.00/0",
+            "0.0.0.0/00",
+        ] {
+            assert!(
+                is_default_route(route),
+                "{route:?} should be a default route"
+            );
+        }
+        for route in ["10.0.0.0/8", "0.0.0.0/1", "::/1", "not-a-route", ""] {
+            assert!(!is_default_route(route), "{route:?} is not a default route");
+        }
+    }
+
+    #[test]
+    fn server_network_rejects_noncanonical_default_routes() {
+        let mut verifier = Verifier::new(1, 1, 1, [0x31; 16]);
+        verifier.public = Some([0x31; 32]);
+        let long = verifier.long_form().unwrap();
+        for route in [
+            "00.0.0.0/0",
+            "0.0.0.00/0",
+            "0.0.0.0/00",
+            "DEFAULT",
+            " ::/0 ",
+        ] {
+            let yaml = format!(
+                "peer:\n  iface: tap9\n  network:\n    address: 10.88.0.1/24\n    routes: [\"{route}\"]\n  verifier: {long}\n"
+            );
+            let error = format!("{:#}", ConfigSet::from_str(&yaml).unwrap_err());
+            assert!(
+                error.contains("default route"),
+                "route {route:?} was not rejected as a default route: {error}"
+            );
         }
     }
 
@@ -374,6 +690,40 @@ mod tests {
         assert_eq!(parsed.peers[0].iface, "tap3");
         assert_eq!(parsed.peers[0].mtu, 1540);
         assert!(parsed.peers[0].noise);
+    }
+
+    #[test]
+    fn inner_ip_mtu_derives_from_the_numeric_wire_mtu() {
+        let mut plain = peer([0x11; 16]);
+        plain.mtu = 1515;
+        plain.noise = false;
+        assert_eq!(plain.inner_ip_mtu(), 1500);
+        assert_eq!(plain.mss_v4(), 1460);
+        assert_eq!(plain.mss_v6(), 1440);
+
+        let mut noise = peer([0x12; 16]);
+        noise.mtu = 1515;
+        noise.noise = true;
+        assert_eq!(noise.inner_ip_mtu(), 1476);
+        assert_eq!(noise.mss_v4(), 1436);
+        assert_eq!(noise.mss_v6(), 1416);
+    }
+
+    fn parse_peer_mtu(mtu_line: &str) -> Result<ConfigSet> {
+        let mut verifier = Verifier::new(1, 1, 1, [0x21; 16]);
+        verifier.public = Some([0x21; 32]);
+        let long = verifier.long_form().unwrap();
+        ConfigSet::from_str(&format!(
+            "peer:\n  iface: tap9\n{mtu_line}  verifier: {long}\n"
+        ))
+    }
+
+    #[test]
+    fn rejects_explicit_zero_mtu_but_defaults_when_omitted() {
+        let error = format!("{:#}", parse_peer_mtu("  mtu: 0\n").unwrap_err());
+        assert!(error.contains("0 is invalid"), "{error}");
+        let set = parse_peer_mtu("").unwrap();
+        assert_eq!(set.peers[0].mtu, MTU_DEFAULT);
     }
 
     #[test]

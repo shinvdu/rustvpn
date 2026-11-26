@@ -5,13 +5,16 @@
 //! GUI talks to `rustvpn-clientd`, which also links this crate.
 
 pub mod engine;
+pub mod firewall;
 pub mod lock;
+pub mod mtu;
 pub mod netcfg;
 pub mod profile;
 pub mod session;
 
-pub use engine::{Command, Engine};
+pub use engine::{Command, Engine, EngineOptions};
 pub use lock::TunnelLock;
+pub use mtu::WireMtu;
 pub use netcfg::NetworkGuard;
 pub use profile::ValidatedProfile;
 pub use session::{resolve_endpoints, start_session, Endpoints, Session, SessionEnd};

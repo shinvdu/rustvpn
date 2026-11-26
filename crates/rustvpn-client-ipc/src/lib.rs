@@ -15,7 +15,12 @@ pub use frame::{read_frame, write_frame, FrameError, MAX_FRAME_LEN};
 pub use proto::*;
 
 /// Protocol version negotiated by `Hello`.
-pub const PROTOCOL_VERSION: u32 = 1;
+///
+/// v2 adds the `ProfileSpec` tuning fields (`keepalive`/`rekey_*`), the
+/// opt-in `kill_switch`/`mss_clamp` flags and the extended status document.
+/// Older daemons used `deny_unknown_fields`, so a v2 GUI would otherwise get
+/// an opaque deserialisation error rather than a clear version mismatch.
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// Environment override honoured by both the daemon and its clients.
 pub const SOCKET_ENV: &str = "RUSTVPN_CLIENTD_SOCKET";

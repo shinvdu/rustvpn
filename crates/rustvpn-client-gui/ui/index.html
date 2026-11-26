@@ -64,6 +64,8 @@
             <div><span>服务器</span><strong id="meta-remote">—</strong></div>
             <div><span>协议 / 模式</span><strong id="meta-proto">—</strong></div>
             <div><span>接口</span><strong id="meta-iface">—</strong></div>
+            <div><span>MTU</span><strong id="meta-mtu">—</strong></div>
+            <div><span>安全</span><strong id="meta-security">—</strong></div>
             <div><span>连接时长</span><strong id="meta-uptime">—</strong></div>
           </div>
         </div>
@@ -208,7 +210,7 @@
               <option value="tcp">TCP</option>
             </select>
           </label>
-          <label>MTU <input id="f-mtu" type="number" min="68" max="9015" value="1515"></label>
+          <label>MTU <input id="f-mtu" type="text" placeholder="numeric wire MTU (e.g. 1515)" value="1515"></label>
           <label>超时（秒） <input id="f-timeout" type="number" min="1" value="60"></label>
           <label>Timesync <input id="f-timesync" type="number" value="0"></label>
           <label class="wide-field">Verifier（短格式） <textarea id="f-verifier" required rows="2" placeholder="$argon2d$m=...$..."></textarea></label>

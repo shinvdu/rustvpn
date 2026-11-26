@@ -36,7 +36,20 @@ Design goals, inherited from GoVPN:
 - Noise padding and optional constant packet rate (CPR).
 - Optional timestamp windows for handshake replay resistance.
 - Built-in rehandshake, heartbeat, timeout and JSON statistics.
+- Versioned `rustvpn.status.v1` output (`status --json`) for the client daemon
+  and server control socket.
 - Built-in handshake rate limiting (5/s per source, 200/s global).
+- Client profiles use a numeric two-sided wire MTU with optional nftables
+  MSS clamping (separate IPv4/IPv6 values) and an opt-in full-tunnel kill
+  switch (host output scope; fail-closed without `nft`).
+- One-step profile/QR onboarding from `rustvpn-verifier` without writing the
+  passphrase to disk (the URI is informational; there is no automatic
+  importer yet).
+- Opt-in NAT keepalive (`keepalive`) and time-driven rekey
+  (`rekey_time`/`rekey_jitter`); the 4 GiB threshold still applies.  New
+  onboarding/GUI profiles default to 1800 s; the daemon default is 0 (off).
+- Declarative server TAP setup (`network:` in `peers.yaml`) and diff-based
+  reload that preserves unchanged peer sessions.
 - UDP and TCP transports, plus HTTP CONNECT proxy on both sides.
 - IPv4 and IPv6.
 - EGD entropy-daemon support for systems with weak `/dev/urandom`.
@@ -54,7 +67,7 @@ Design goals, inherited from GoVPN:
 | **Noise** | Padding every outgoing packet to the configured MTU. |
 | **Encless** | Encryptionless mode: AONT + Chaffing-and-Winnowing instead of stream encryption. |
 | **CPR** | Constant packet rate: emit filler traffic at a configured KiB/s. |
-| **MTU** | The configured maximum TAP frame size. The usable payload is smaller in noise/encless modes. |
+| **MTU** | A numeric two-sided wire MTU. Only the TAP interface IP MTU and MSS are derived from it; usable payload is smaller in noise/encless modes. |
 
 ## Documentation map
 
@@ -68,6 +81,7 @@ Design goals, inherited from GoVPN:
 | [FAQ](faq.md) | Design questions and "when should I use X" answers. |
 | [Design](design.md) | Architecture, data path, compatibility invariants, tests. |
 | [Performance](performance.md) | Go-side optimizations and same-machine Rust-vs-Go results. |
+| [Client in a network namespace](../netns-client.md) | Netns/container recipe, `-no-host-dns`, `-socket`, kill-switch isolation and the reusable smoke script. |
 | [Desktop client UI (Linux, optional)](../client-ui.md) | Tauri GUI + clientd: deb/rpm packages, zh/en/ru UI and tray, opt-in signed updates, profiles, route/DNS/IPv6 protection and troubleshooting; currently documented in Chinese. |
 
 ## Status and limitations
@@ -83,8 +97,16 @@ Known limitations:
 - Only Linux has been exercised. FreeBSD and macOS may work through the
   `tun` crate but are untested; set `GOVPN_IO_URING=0` to force the epoll
   TAP backend.
-- Effective MTU is not adjusted automatically. In noise/encless modes the
-  up script should raise the interface MTU (or accept a smaller payload).
+- The Go-compatible CLI, `peers.yaml` and client profiles all use the same
+  manual numeric MTU.  It is a two-sided wire contract (both peers must use
+  the same value); `mtu: auto`/`mtu: 0` are rejected and automatic path-MTU
+  negotiation is deferred to v2.  With `network:`, the server derives the
+  TAP IP MTU (`max_payload - 14`) instead of applying the frame budget.
 - The client only supports encryptionless mode over TCP, matching Go.
+- Time-driven rekey is a scheduled reconnect, not make-before-break: v1 has
+  no in-band rekey/session-overlap message, so a short packet gap is possible.
+- Keepalives in noise/encless mode are padded to the MTU by the v1 wire
+  format; the minimum interval is 25 s (10 s in plain mode) and the cost is
+  documented.
 
 Next: [Getting started](getting-started.md).

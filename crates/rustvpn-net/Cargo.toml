@@ -24,6 +24,11 @@ getrandom = { workspace = true }
 ed25519-dalek = { workspace = true }
 subtle = { workspace = true }
 zeroize = { workspace = true }
+ipnet = "2"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+tempfile = "3"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = "0.7"

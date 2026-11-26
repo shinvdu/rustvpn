@@ -6,15 +6,39 @@
 //! restore the original state.  The anti-loop host route for the outer
 //! (server or proxy) address is installed before the tunnel's default route.
 
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 
 use anyhow::{anyhow, bail, Context, Result};
 use ipnet::IpNet;
 use rustvpn_client_ipc::ProfileSpec;
+use rustvpn_net::config::is_default_route;
 use tokio::process::Command;
 
+use crate::firewall;
+
 const ROUTE_METRIC: u32 = 50;
+
+/// Optional nftables features applied together with the address/route setup.
+#[derive(Clone, Debug, Default)]
+pub struct FirewallOptions {
+    /// Clamp IPv4 TCP MSS to this value on the tunnel interface.
+    pub mss_v4: Option<usize>,
+    /// Clamp IPv6 TCP MSS to this value on the tunnel interface.
+    pub mss_v6: Option<usize>,
+    /// Install the full-tunnel kill switch (requires `outer`).
+    pub kill_switch: bool,
+    /// Per-daemon table-name scope (see [`firewall::instance_scope`]).
+    pub scope: String,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct NetOptions {
+    pub firewall: FirewallOptions,
+    /// Skip `resolvectl`; useful inside a network namespace or container
+    /// where DNS is managed by the caller.
+    pub no_host_dns: bool,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DefaultRouteLite {
@@ -110,6 +134,15 @@ pub async fn cleanup_stale_ipv6_blackhole() {
     let _ = run_command(&ip, &args).await;
 }
 
+/// Remove tables left behind by a crashed client daemon with the same
+/// instance scope.
+///
+/// Only this scope's RustVPN-owned tables are deleted; host NAT/filter rules
+/// and other RustVPN daemons in the same netns are not touched.
+pub async fn cleanup_stale_firewall(scope: &str) {
+    firewall::cleanup_stale(scope).await;
+}
+
 pub struct NetworkGuard {
     ip: PathBuf,
     enabled: bool,
@@ -119,15 +152,25 @@ pub struct NetworkGuard {
     host_route: Option<Vec<String>>,
     dns: bool,
     ipv6_blackhole: bool,
+    mss: bool,
+    kill_switch: bool,
+    scope: String,
 }
 
 impl NetworkGuard {
-    /// Apply the profile's address, routes and DNS.
+    /// Apply the profile's address, routes, DNS and optional firewall rules.
     ///
     /// `outer` is the resolved server or proxy address; it is pinned to the
     /// original default route so tunnel traffic does not recursively enter
-    /// the tunnel.
-    pub async fn install(spec: &ProfileSpec, outer: Option<IpAddr>) -> Result<Self> {
+    /// the tunnel. `inner_mtu` is the derived IP MTU for the TAP interface
+    /// from the numeric wire MTU (never the wire/frame budget itself).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn install(
+        spec: &ProfileSpec,
+        outer: Option<SocketAddr>,
+        inner_mtu: usize,
+        options: NetOptions,
+    ) -> Result<Self> {
         if spec.address.trim().is_empty() && !spec.routes.is_empty() {
             bail!("profile has routes but no address");
         }
@@ -136,6 +179,9 @@ impl NetworkGuard {
         }
         if has_default_route(&spec.routes) && outer.is_none() {
             bail!("cannot install a default route without resolving the outer endpoint");
+        }
+        if options.firewall.kill_switch && !has_default_route(&spec.routes) {
+            bail!("kill_switch is only supported for full-tunnel profiles");
         }
 
         let ip = ip_bin();
@@ -148,23 +194,34 @@ impl NetworkGuard {
             host_route: None,
             dns: false,
             ipv6_blackhole: false,
+            mss: false,
+            kill_switch: false,
+            scope: options.firewall.scope.clone(),
         };
 
-        if let Err(error) = guard.apply(spec, outer).await {
+        if let Err(error) = guard.apply(spec, outer, inner_mtu, options).await {
             guard.remove().await;
             return Err(error);
         }
         Ok(guard)
     }
 
-    async fn apply(&mut self, spec: &ProfileSpec, outer: Option<IpAddr>) -> Result<()> {
+    async fn apply(
+        &mut self,
+        spec: &ProfileSpec,
+        outer: Option<SocketAddr>,
+        inner_mtu: usize,
+        options: NetOptions,
+    ) -> Result<()> {
         let has_default = has_default_route(&spec.routes);
+        let mut underlay: Option<String> = None;
         if has_default {
             if let Some(outer) = outer {
                 let family = if outer.is_ipv6() { "-6" } else { "-4" };
                 let route = read_default_route(&self.ip, family).await?;
                 if let Some(route) = route {
-                    let dest = match outer {
+                    underlay = Some(route.dev.clone());
+                    let dest = match outer.ip() {
                         IpAddr::V4(addr) => format!("{addr}/32"),
                         IpAddr::V6(addr) => format!("{addr}/128"),
                     };
@@ -190,7 +247,7 @@ impl NetworkGuard {
             }
         }
 
-        let mtu = spec.mtu.to_string();
+        let mtu = inner_mtu.to_string();
         let link = self
             .run(&[
                 "-4".into(),
@@ -241,7 +298,7 @@ impl NetworkGuard {
             if output.status.success() {
                 self.routes.push(plan);
             } else if stderr_is_exists(&output.stderr) {
-                if route == "default" || route == "0.0.0.0/0" {
+                if is_default_route(route) {
                     bail!(
                         "default route metric 50 already exists; refusing to pretend the tunnel owns it"
                     );
@@ -258,7 +315,14 @@ impl NetworkGuard {
             self.block_ipv6().await?;
         }
 
-        if !spec.dns.is_empty() {
+        if options.no_host_dns {
+            if !spec.dns.is_empty() {
+                eprintln!(
+                    "--no-host-dns is set; leaving resolver configuration to the caller \
+                     (profile DNS values are not applied)"
+                );
+            }
+        } else if !spec.dns.is_empty() {
             let resolvectl = which("resolvectl").ok_or_else(|| {
                 anyhow!("resolvectl not found; refusing to connect with an unmanaged DNS leak")
             })?;
@@ -291,6 +355,42 @@ impl NetworkGuard {
         } else if has_default {
             bail!("full-tunnel profile requires at least one DNS server");
         }
+
+        let mss_v4 = options.firewall.mss_v4;
+        let mss_v6 = options.firewall.mss_v6;
+        if mss_v4.is_some() || mss_v6.is_some() {
+            match firewall::apply_mss(&self.scope, &self.iface, mss_v4, mss_v6).await {
+                Ok(()) => {
+                    self.mss = true;
+                    eprintln!(
+                        "nft: MSS clamped on {} (v4={:?}, v6={:?})",
+                        self.iface, mss_v4, mss_v6
+                    );
+                }
+                Err(error) => {
+                    // MSS clamping is a best-effort optimisation; a missing
+                    // nft binary must not turn a working tunnel into a
+                    // failed connection.  Keep the failure visible.
+                    eprintln!("warning: MSS clamp not applied: {error:#}");
+                }
+            }
+        }
+
+        if options.firewall.kill_switch {
+            let outer = outer.ok_or_else(|| {
+                anyhow!("cannot install kill switch without a resolved outer endpoint")
+            })?;
+            firewall::apply_kill_switch(&self.scope, &self.iface, outer, underlay.as_deref())
+                .await?;
+            self.kill_switch = true;
+            eprintln!(
+                "nft: kill switch active (loopback, {}, outer {}, underlay {})",
+                self.iface,
+                outer,
+                underlay.as_deref().unwrap_or("-")
+            );
+        }
+
         Ok(())
     }
 
@@ -364,6 +464,27 @@ impl NetworkGuard {
                 let _ = run_command(&resolvectl, &["revert".into(), self.iface.clone()]).await;
             }
         }
+        // Remove firewall state last so the tunnel stays leak-free until the
+        // routes are gone.  Both helpers are idempotent and ignore a missing
+        // nft binary.
+        if self.kill_switch {
+            firewall::remove_kill_switch(&self.scope).await;
+            self.kill_switch = false;
+        }
+        if self.mss {
+            firewall::remove_mss(&self.scope).await;
+            self.mss = false;
+        }
+    }
+
+    /// Whether the MSS clamp table was applied successfully.
+    pub fn mss_applied(&self) -> bool {
+        self.mss
+    }
+
+    /// Whether the kill switch table was applied successfully.
+    pub fn kill_switch_applied(&self) -> bool {
+        self.kill_switch
     }
 
     async fn run(&self, args: &[String]) -> Result<std::process::Output> {
@@ -372,9 +493,9 @@ impl NetworkGuard {
 }
 
 fn has_default_route(routes: &[String]) -> bool {
-    routes
-        .iter()
-        .any(|route| matches!(route.as_str(), "default" | "0.0.0.0/0"))
+    // Canonical check: recognises `default`, `0.0.0.0/0` and non-canonical
+    // prefix-0 spellings that `ipnet` normalises.
+    routes.iter().any(|route| is_default_route(route))
 }
 
 fn ipv6_blackhole_args(add: bool) -> Vec<String> {
@@ -406,7 +527,7 @@ fn route_plan(route: &str, gateway: &str) -> Result<RoutePlan> {
     } else {
         Some(gateway.to_string())
     };
-    let (family, dest) = if route == "default" {
+    let (family, dest) = if route.trim().eq_ignore_ascii_case("default") {
         ("-4", "default".to_string())
     } else {
         let net: IpNet = route
@@ -417,7 +538,13 @@ fn route_plan(route: &str, gateway: &str) -> Result<RoutePlan> {
         } else {
             "-6"
         };
-        (family, route.to_string())
+        if is_default_route(route) {
+            // Normalise every IPv4 prefix-0 spelling to the keyword form;
+            // `ip route add 00.0.0.0/0` is not portable across iproute2.
+            (family, "default".to_string())
+        } else {
+            (family, route.to_string())
+        }
     };
     Ok(RoutePlan {
         family,
@@ -575,8 +702,35 @@ mod tests {
     fn recognises_default_route_spellings() {
         assert!(has_default_route(&["default".into()]));
         assert!(has_default_route(&["0.0.0.0/0".into()]));
-        assert!(!has_default_route(&["10.0.0.0/8".into(), "::/0".into()]));
+        for route in ["DEFAULT", "00.0.0.0/0", "0.0.0.00/0", "0.0.0.0/00"] {
+            assert!(
+                has_default_route(&[route.into()]),
+                "{route:?} must enable full-tunnel semantics"
+            );
+        }
+        assert!(!has_default_route(&["0.0.0.0/1".into()]));
         assert!(!has_default_route(&["10.0.0.0/8".into()]));
+    }
+
+    #[test]
+    fn route_plan_normalises_noncanonical_default_routes() {
+        for route in [
+            "default",
+            "DEFAULT",
+            "0.0.0.0/0",
+            "00.0.0.0/0",
+            "0.0.0.0/00",
+        ] {
+            let plan = route_plan(route, "10.88.0.1").unwrap();
+            assert_eq!(plan.family, "-4", "{route:?}");
+            assert_eq!(plan.dest, "default", "{route:?}");
+        }
+        let plan = route_plan("10.88.1.0/24", "").unwrap();
+        assert_eq!(plan.dest, "10.88.1.0/24");
+        // An IPv6 default is never rewritten as IPv4.
+        let plan = route_plan("::/0", "").unwrap();
+        assert_eq!(plan.family, "-6");
+        assert_eq!(plan.dest, "default");
     }
 
     #[test]

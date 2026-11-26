@@ -88,7 +88,8 @@ alice:
 set -eu
 IFACE="${GOVPN_IFACE:-tap0}"
 ip tuntap add dev "$IFACE" mode tap 2>/dev/null || true
-ip link set dev "$IFACE" mtu 1515 up
+# 接口 IP MTU，不是线路 MTU：plain 线路 1515 -> 1500。
+ip link set dev "$IFACE" mtu 1500 up
 ip addr replace 10.88.0.1/24 dev "$IFACE"
 ```
 
@@ -124,7 +125,8 @@ sudo ./target/release/rustvpn-client \
 set -eu
 IFACE="${GOVPN_IFACE:-tap0}"
 ip tuntap add dev "$IFACE" mode tap 2>/dev/null || true
-ip link set dev "$IFACE" mtu 1515 up
+# 接口 IP MTU，不是线路 MTU：plain 线路 1515 -> 1500。
+ip link set dev "$IFACE" mtu 1500 up
 ip addr replace 10.88.0.2/24 dev "$IFACE"
 ip route replace 10.88.0.0/24 dev "$IFACE"
 ```
@@ -141,7 +143,8 @@ ip route replace 10.88.0.0/24 dev "$IFACE"
 # TAP and addressing (also do this in up.sh for production)
 ip tuntap add dev tap10 mode tap
 ip addr replace 172.16.0.1/24 dev tap10
-ip link set dev tap10 mtu 1540 up   # 1515 + noise overhead if noise is on
+# TAP 接口 IP MTU，不是线路 MTU。plain 线路 1515 -> 1500。
+ip link set dev tap10 mtu 1500 up
 
 sudo rustvpn-server -bind 192.168.0.1:1194 -conf peers.yaml
 ```
@@ -151,7 +154,7 @@ sudo rustvpn-server -bind 192.168.0.1:1194 -conf peers.yaml
 ```bash
 ip tuntap add dev tap10 mode tap
 ip addr replace 172.16.0.2/24 dev tap10
-ip link set dev tap10 mtu 1540 up
+ip link set dev tap10 mtu 1500 up   # plain 线路 1515 -> TAP IP MTU 1500
 ip route add 0/1 via 172.16.0.1
 ip route add 128/1 via 172.16.0.1
 
@@ -160,15 +163,21 @@ sudo rustvpn-client \
     -iface tap10 -remote 192.168.0.1:1194
 ```
 
-两条 `/1` 路由会在不删除默认路由的前提下覆盖它，因此隧道承载全部流量，而底层链路仍承载加密的 UDP 数据包。按模式调整 MTU：
+两条 `/1` 路由会在不删除默认路由的前提下覆盖它，因此隧道承载全部流量，而底层链路仍承载加密的 UDP 数据包。
 
-| 模式 | `mtu: 1515` 时的可用载荷 |
-|---|---|
-| classic | 1514 字节 |
-| noise | 1490 字节 |
-| encless | 1506 字节 |
+请按数值线路 MTU 与模式设置 TAP **接口 IP MTU**，绝不要直接使用线路/帧预算：
 
-要么提高配置/接口 MTU，要么降低内部网络的 MTU。参见[配置 → MTU](configuration.md#mtu)。
+```text
+inner_ip_mtu = Mode::max_payload(wire_mtu) - 14
+```
+
+| 模式 | `mtu: 1515` 时的 TAP 接口 IP MTU |
+|---|---:|
+| plain | 1500 |
+| noise | 1476 |
+| encless | 1492 |
+
+若使用其它数值线路 MTU，请按公式计算（或交给守护进程/声明式服务端路径）。线路 MTU 是双方契约；`mtu: auto` 与 `mtu: 0` 会被拒绝。参见[配置 → MTU](configuration.md#mtu)。
 
 ## 可选：桌面图形界面
 
@@ -197,7 +206,7 @@ Go 源码及其附带的向量生成器；本仓库不包含 Go 代码树。
 |---|---|
 | `Cannot find device "tap0"` | 服务器的 `up` 脚本未创建持久化 TAP。添加 `ip tuntap add ... mode tap`。 |
 | 握手成功但无流量 | TAP 没有 IP、MTU 错误或缺少路由。检查 `ip addr` / `ip route`。 |
-| 开启 noise/encless 后大包丢失 | 载荷超过 `MTU-25` / `MTU-9`。提高 MTU 或降低内部 MTU。 |
+| 开启 noise/encless 后大包丢失 | 载荷超过 `MTU-25` / `MTU-9`。在两侧同时提高数值线路 MTU（并重新计算 TAP 接口 IP MTU），或降低内部网络的 MTU。 |
 | `Currently encryptionless mode works only with TCP` | 对客户端的 encless 使用 `-proto tcp`（`-proxy` 也会隐含此设置）。 |
 | `server verifier has no public key` | `peers.yaml` 中包含的是短格式；请使用同一次运行生成的长格式。 |
 | 握手时出现 `random number mismatch` | 通常是同时重启导致两个会话重叠；干净重启或客户端自动重连即可解决。 |

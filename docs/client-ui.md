@@ -12,7 +12,7 @@ GUI 不持有特权，也不链接隧道/密码学代码。隧道由独立的 `r
 ```text
 rustvpn-client-ui（Tauri 2 + 静态 HTML/JS）
         │  /run/rustvpn-client/client.sock
-        │  4B BE 长度 + JSON，协议 v1，SO_PEERCRED
+        │  4B BE 长度 + JSON，协议 v2，SO_PEERCRED
 rustvpn-clientd（TAP、路由、DNS、重连）
         │
 rustvpn-client-core（Profile、Engine、会话、Linux 网络配置）
@@ -98,7 +98,12 @@ name: office
 remote: vpn.example.com:1194
 proto: udp                 # udp | tcp；设置 proxy 时强制 tcp
 verifier: $argon2d$m=4096,t=128,p=1$<id>
-mtu: 1515
+mtu: 1515                  # 必填数值=双方一致的线路 MTU；auto/0 在 v1 拒绝
+mss_clamp: auto            # 可选：nftables TCP MSS clamp（断开时清理）
+kill_switch: false         # 可选：全隧道 nftables kill switch（默认关闭）
+keepalive: 25              # 可选：空闲保活秒数（0 关闭；plain 最小 10，noise 最小 25）
+rekey_time: 1800           # 可选：时间驱动重协商秒数（0 关闭；新 profile 默认 1800）
+rekey_jitter: 30           # 可选：重协商随机抖动秒数
 timeout: 60
 timesync: 0
 noise: false
@@ -113,6 +118,21 @@ dns: [10.88.0.1]
 routes: [default]          # default 或 CIDR
 ipv6: false                # 暂不支持
 ```
+
+- `mtu` 是**双方一致的线路 MTU**（v1 的 two-sided wire contract）：daemon 绝不根据
+  本地路径改写它；`auto`/`0` 会被明确拒绝，路径 MTU 协商推迟到 v2。只从数值推导
+  TAP 接口 IP MTU 与 MSS：`inner = Mode::max_payload(wire) - 14`，IPv4 MSS =
+  `inner - 40`，IPv6 MSS = `inner - 60`（plain 1515 → inner 1500；noise 1515 →
+  inner 1476），并写入日志。encless 需要外层能承载 ~4128 B 的每包膨胀，容量不足时
+  只告警。
+- `kill_switch: true` 仅允许全隧道（routes 含 default），使用按 daemon 实例命名的
+  `inet rustvpn_killswitch_<hash>` 表；仅过滤主机 `output`（不覆盖 forward/LAN/NAT），
+  无 `nft` 时 fail-closed 拒绝连接；断开时及同实例下次启动时清理。IPv6 外层端点会
+  在物理接口上放行 ND/MLD/DHCPv6（UDP 546/547），避免邻居缓存过期后断链。
+- `rustvpn-client status --json` 输出稳定的 `rustvpn.status.v1` 文档（不含口令/密钥），
+  新增 `mss_applied`、`kill_switch`/`kill_switch_applied`、`mtu_source`、
+  `rates_available`/`rate_window_sec`；GUI 首页显示 MTU（线路/接口）与
+  kill-switch/MSS/rekey 状态。
 
 - 口令**不写入 YAML**；每次连接由 GUI 在内存中传给守护进程，派生密钥后即释放。
 - profile 目录为 `0700`、文件为 `0600`；`proxy_auth` 属于凭据，不要共享这些文件。
@@ -150,6 +170,9 @@ sudo systemctl enable --now rustvpn-clientd
 ```
 
 - 守护进程以 `rustvpn` 用户运行，仅保留 `CAP_NET_ADMIN`/`CAP_NET_RAW`。
+- 使用 kill-switch/MSS clamp 的主机需安装 `nftables` 包；unit 不再在 `ExecStopPost`
+  里全局 `nft delete`（会与同 netns 的其他 RustVPN 实例冲突，且依赖固定路径）。
+  daemon 崩溃时规则保留（fail-closed），同实例下次启动会清理自己命名空间的表。
 - socket 为 `rustvpn:rustvpn 0660`；`SO_PEERCRED` 校验 uid，主/补充组包含
   `rustvpn` 的用户可连接。
 - GUI 的托盘/自启动/钥匙串都在用户桌面会话内；托盘不可用时关闭窗口会正常退出。
@@ -234,6 +257,13 @@ updater 面向 AppImage 自更新；通过本仓库 deb/rpm 安装的副本应�
 ## 已知限制
 
 - 仅 Linux；Windows/macOS 需要 L3 适配器 + 以太网垫片，尚未实现。
+- `mtu: auto`/路径 MTU 自适应当前**未实现**（推迟到 v2 的 MTU 协商）；v1 必须使用
+  双方一致的数值 MTU。升级旧 profile 时把 `mtu: auto`/`0` 改成 `1515`（或服务端
+  实际值）。
+- `rustvpn-verifier` 生成的 `rustvpn://profile` URI 仅作参考，**没有自动导入器**；
+  文档不再宣称“扫码即连”。请用生成的 YAML profile 或 QR 图片手动导入。
+- kill-switch 只保护主机自身 `output` 流量；不保护 forward/容器/ICS/LAN 转发，
+  不能当网关级防泄漏使用。无 `nft` 时连接被拒绝（fail-closed）。
 - IPv6 暂不支持；profile 中 `ipv6: true` 会被拒绝。全隧道会阻断 IPv6 默认
   路由；更具体的 IPv6 链路路由仍可能存在。分流（无 `default` 路由）不会阻断
   IPv6 或系统 DNS，使用前应确认不会泄漏。
@@ -305,6 +335,9 @@ Rust 测试覆盖语言标签解析、托盘文案、IPC Hello/空闲超时。de
   给它补上 `RuntimeDirectory=rustvpn-client` 和
   `RuntimeDirectoryMode=0750`，否则锁目录可能由 daemon 之外的对象创建。
 - socket 与锁默认位于 `/run/rustvpn-client/`，不再使用 `/run/rustvpn`。
+- IPC 协议提升到 **v2**（新增 keepalive/rekey/kill-switch/MSS 与状态字段）。旧 GUI
+  连接新 daemon 或反之会收到明确的版本不匹配错误，而不是模糊的反序列化失败；
+  GUI 与 daemon 需一起升级。
 
 ## 故障排查
 

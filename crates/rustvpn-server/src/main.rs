@@ -1,6 +1,6 @@
 //! GoVPN 5.7-compatible Rust server.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::net::{IpAddr, SocketAddr};
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -11,14 +11,15 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context, Result};
 use rand_core::{OsRng, RngCore};
+use rustvpn_control::client::ControlClient;
 use rustvpn_control::{
     id_hex, mode_name, now_unix, read_frame, rfc3339, write_frame, ConfigReloaded, Counters, Event,
-    KickReport, ReloadReport, Request, Response, ServerCounters, ServerStatus, SessionEnded,
-    SessionInfo, SessionStarted, PROTOCOL_VERSION,
+    KickReport, ReloadReport, Request, Response, ServerCounters, ServerStatus, ServerStatusV1,
+    SessionEnded, SessionInfo, SessionStarted, PROTOCOL_VERSION,
 };
 use rustvpn_crypto::egd::EgDRng;
 use rustvpn_crypto::xtea::Xtea;
-use rustvpn_net::config::{add_time_sync, ConfigSet, PeerConfig};
+use rustvpn_net::config::{add_time_sync, ConfigSet, PeerConfig, PeerNetwork};
 use rustvpn_net::peer::{spawn_tcp, spawn_udp_peer, PeerEvent, WireWriter};
 use rustvpn_net::scripts::{call_down, run_script};
 use rustvpn_net::stats::{stats_listener, LiveStats, PeerStats, StatsState};
@@ -71,7 +72,11 @@ fn usage() -> ! {
          \x20 -control string (optional local admin control socket)\n\
          \x20 -control-group string (socket group; default owner-only)\n\
          \x20 -script-dir string (repeatable; restrict up/down paths)\n\
-         \x20 -warranty"
+         \x20 -warranty\n\
+         \n\
+         Subcommand:\n\
+         \x20 status [--json] -control PATH\n\
+         \x20   Query a running server over its control socket."
     );
     process::exit(2);
 }
@@ -284,6 +289,173 @@ impl RateLimiter {
 
 type ConfigStore = Arc<RwLock<ConfigSet>>;
 
+/// Normalised difference between two parsed `peers.yaml` configurations.
+///
+/// Only fingerprints of semantically relevant settings participate, so
+/// comments, field order and whitespace never revoke sessions.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct ReloadPlan {
+    added: Vec<([u8; 16], String)>,
+    removed: Vec<([u8; 16], String)>,
+    /// `(id, name, comma-separated changed fields)`.
+    changed: Vec<([u8; 16], String, String)>,
+    unchanged: Vec<([u8; 16], String)>,
+}
+
+impl ReloadPlan {
+    fn is_noop(&self) -> bool {
+        self.added.is_empty() && self.removed.is_empty() && self.changed.is_empty()
+    }
+
+    fn revoked_ids(&self) -> HashSet<[u8; 16]> {
+        self.removed
+            .iter()
+            .map(|(id, _)| *id)
+            .chain(self.changed.iter().map(|(id, _, _)| *id))
+            .collect()
+    }
+
+    fn summary(&self) -> String {
+        fn names(entries: &[([u8; 16], String)]) -> String {
+            if entries.is_empty() {
+                return "-".into();
+            }
+            let mut names: Vec<&str> = entries.iter().map(|(_, name)| name.as_str()).collect();
+            names.sort_unstable();
+            names.join(",")
+        }
+        let mut changed: Vec<String> = self
+            .changed
+            .iter()
+            .map(|(_, name, fields)| format!("{name}{{{fields}}}"))
+            .collect();
+        changed.sort_unstable();
+        format!(
+            "added={} [{}] removed={} [{}] changed={} [{}] unchanged={} [{}]",
+            self.added.len(),
+            names(&self.added),
+            self.removed.len(),
+            names(&self.removed),
+            self.changed.len(),
+            if changed.is_empty() {
+                "-".into()
+            } else {
+                changed.join(",")
+            },
+            self.unchanged.len(),
+            names(&self.unchanged)
+        )
+    }
+}
+
+fn config_map(set: &ConfigSet) -> BTreeMap<[u8; 16], (String, String)> {
+    set.peers
+        .iter()
+        .map(|peer| {
+            (
+                peer.id,
+                (peer.name.clone(), config_fingerprint(peer.as_ref())),
+            )
+        })
+        .collect()
+}
+
+fn plan_reload(previous: &ConfigSet, next: &ConfigSet) -> ReloadPlan {
+    let before = config_map(previous);
+    let after = config_map(next);
+    let before_cfg: HashMap<[u8; 16], &PeerConfig> = previous
+        .peers
+        .iter()
+        .map(|peer| (peer.id, peer.as_ref()))
+        .collect();
+    let after_cfg: HashMap<[u8; 16], &PeerConfig> = next
+        .peers
+        .iter()
+        .map(|peer| (peer.id, peer.as_ref()))
+        .collect();
+    let mut plan = ReloadPlan::default();
+    for (id, (name, fingerprint)) in &after {
+        match before.get(id) {
+            None => plan.added.push((*id, name.clone())),
+            Some((_, old)) if old != fingerprint => {
+                let fields = match (before_cfg.get(id), after_cfg.get(id)) {
+                    (Some(old), Some(new)) => config_changed_fields(old, new).join(","),
+                    _ => "unknown".into(),
+                };
+                plan.changed.push((*id, name.clone(), fields));
+            }
+            Some(_) => plan.unchanged.push((*id, name.clone())),
+        }
+    }
+    for (id, (name, _)) in &before {
+        if !after.contains_key(id) {
+            plan.removed.push((*id, name.clone()));
+        }
+    }
+    plan
+}
+
+/// Field-level explanation for a revoked peer, used in reload logs.
+fn config_changed_fields(old: &PeerConfig, new: &PeerConfig) -> Vec<&'static str> {
+    let mut fields = Vec::new();
+    if old.verifier.long_form().ok() != new.verifier.long_form().ok() {
+        fields.push("verifier");
+    }
+    if old.name != new.name {
+        fields.push("name");
+    }
+    if old.iface != new.iface {
+        fields.push("iface");
+    }
+    if old.mtu != new.mtu {
+        fields.push("mtu");
+    }
+    if old.noise != new.noise {
+        fields.push("noise");
+    }
+    if old.encless != new.encless {
+        fields.push("encless");
+    }
+    if old.cpr != new.cpr {
+        fields.push("cpr");
+    }
+    if old.time_sync != new.time_sync {
+        fields.push("timesync");
+    }
+    if old.timeout != new.timeout {
+        fields.push("timeout");
+    }
+    if old.up != new.up {
+        fields.push("up");
+    }
+    if old.down != new.down {
+        fields.push("down");
+    }
+    if old.keepalive != new.keepalive {
+        fields.push("keepalive");
+    }
+    if old.rekey_time != new.rekey_time {
+        fields.push("rekey_time");
+    }
+    if old.rekey_jitter != new.rekey_jitter {
+        fields.push("rekey_jitter");
+    }
+    if old.network != new.network {
+        fields.push("network");
+    }
+    fields
+}
+
+/// Is this snapshot still the live configuration for the same peer id?
+///
+/// Used before creating/inserting a peer so a snapshot taken during the
+/// handshake cannot resurrect a peer after the reload revocation pass.
+fn config_is_current(set: &ConfigSet, cfg: &PeerConfig) -> bool {
+    set.by_id
+        .get(&cfg.id)
+        .is_some_and(|current| config_fingerprint(current) == config_fingerprint(cfg))
+}
+
 /// Serialises disk reloads from the 60-second poller and the admin service.
 struct Reloader {
     path: PathBuf,
@@ -359,11 +531,21 @@ impl Reloader {
             self.emit_reload(Some(message));
             return Err(error);
         }
-        let fingerprints = set
-            .peers
-            .iter()
-            .map(|peer| (peer.id, config_fingerprint(peer)))
-            .collect();
+        let previous = self.store.read().await.clone();
+        let plan = plan_reload(&previous, &set);
+        if plan.is_noop() {
+            // Comments, key order or whitespace changed, but the parsed
+            // configuration is semantically identical.  Keep the existing
+            // store/generation and preserve every session.
+            *self.last_bytes.lock().unwrap() = Some(bytes);
+            *self.last_loaded.lock().unwrap() = Some(SystemTime::now());
+            *self.last_error.lock().unwrap() = None;
+            eprintln!(
+                "reload: semantic no-op ({} peer(s) unchanged)",
+                plan.unchanged.len()
+            );
+            return Ok(false);
+        }
         *self.store.write().await = set;
         *self.last_bytes.lock().unwrap() = Some(bytes);
         self.generation.fetch_add(1, AtomicOrdering::Relaxed);
@@ -372,7 +554,7 @@ impl Reloader {
         self.emit_reload(None);
         let _ = self
             .requests
-            .send(MainRequest::ConfigReloaded { fingerprints })
+            .send(MainRequest::ConfigReloaded { plan })
             .await;
         Ok(true)
     }
@@ -595,9 +777,15 @@ fn validate_script_path(
     Ok(())
 }
 
+struct AppliedNetwork {
+    fingerprint: String,
+    guard: rustvpn_net::network::TapGuard,
+}
+
 #[derive(Clone)]
 struct ServerContext {
     registry: Arc<Registry>,
+    network_guards: Arc<tokio::sync::Mutex<HashMap<String, AppliedNetwork>>>,
     configs: ConfigStore,
     stats: Arc<StatsState>,
     events: mpsc::Sender<(SocketAddr, [u8; 16], u64, PeerEvent)>,
@@ -628,7 +816,7 @@ enum MainRequest {
         tap: Arc<Tap>,
     },
     ConfigReloaded {
-        fingerprints: Vec<([u8; 16], String)>,
+        plan: ReloadPlan,
     },
     Kick {
         id: [u8; 16],
@@ -641,6 +829,7 @@ enum MainRequest {
 enum EndReason {
     Timeout,
     Rehandshake,
+    Rekey,
     TcpClosed,
     TapClosed,
     Replaced,
@@ -654,6 +843,7 @@ impl EndReason {
         match self {
             EndReason::Timeout => "timeout",
             EndReason::Rehandshake => "rehandshake",
+            EndReason::Rekey => "rekey",
             EndReason::TcpClosed => "tcp_closed",
             EndReason::TapClosed => "tap_closed",
             EndReason::Replaced => "replaced",
@@ -668,6 +858,7 @@ fn end_reason_from_event(event: PeerEvent) -> EndReason {
     match event {
         PeerEvent::Timeout => EndReason::Timeout,
         PeerEvent::Rehandshake => EndReason::Rehandshake,
+        PeerEvent::Rekey => EndReason::Rekey,
         PeerEvent::TcpClosed => EndReason::TcpClosed,
         PeerEvent::TapClosed => EndReason::TapClosed,
     }
@@ -803,7 +994,103 @@ async fn open_tap(
     if iface.is_empty() {
         return Err(anyhow!("empty interface name"));
     }
-    Ok((Arc::new(Tap::open(&iface, cfg.mtu)?), iface))
+
+    let Some(network) = &cfg.network else {
+        // GoVPN-compatible path: up script (if any) owns TAP/routing.
+        return Ok((Arc::new(Tap::open(&iface, cfg.mtu)?), iface));
+    };
+
+    // Declarative path: create/configure the TAP without a script.  A guard
+    // is shared per interface so repeated handshakes with the same config are
+    // no-ops and a config change tears down only the old declarative state.
+    let fingerprint = declarative_network_fingerprint(cfg, network);
+    let mut guards = ctx.network_guards.lock().await;
+    let needs_apply = declarative_reapply_needed(
+        guards
+            .get(&iface)
+            .map(|applied| applied.fingerprint.as_str()),
+        &fingerprint,
+    );
+    if needs_apply {
+        if let Some(old) = guards.remove(&iface) {
+            old.guard.remove().await;
+        }
+        let inner_ip_mtu = cfg.inner_ip_mtu();
+        eprintln!(
+            "declarative network: wire_mtu={} mode={} -> inner_ip_mtu={} mss_v4={} mss_v6={} on {iface}",
+            cfg.mtu,
+            cfg.mode_label(),
+            inner_ip_mtu,
+            cfg.mss_v4(),
+            cfg.mss_v6()
+        );
+        let guard = rustvpn_net::network::configure_tap(&iface, inner_ip_mtu, network).await?;
+        let tap = match Tap::open(&iface, cfg.mtu) {
+            Ok(tap) => Arc::new(tap),
+            Err(error) => {
+                guard.remove().await;
+                return Err(error.into());
+            }
+        };
+        guards.insert(iface.clone(), AppliedNetwork { fingerprint, guard });
+        eprintln!("declarative network configured on {iface}");
+        Ok((tap, iface))
+    } else {
+        Ok((Arc::new(Tap::open(&iface, cfg.mtu)?), iface))
+    }
+}
+
+/// Fingerprint of all declarative TAP state that must be reapplied.
+///
+/// The wire MTU alone is not enough: the TAP IP MTU is derived from the
+/// *mode* (`Mode::max_payload(wire_mtu) - 14`), so a plain→noise reload with
+/// the same wire MTU must still reconfigure the TAP (1500 → 1476).
+fn declarative_network_fingerprint(cfg: &PeerConfig, network: &PeerNetwork) -> String {
+    format!(
+        "wire_mtu={}|mode={}|inner_ip_mtu={}|{}",
+        cfg.mtu,
+        cfg.mode_label(),
+        cfg.inner_ip_mtu(),
+        network.fingerprint()
+    )
+}
+
+/// True when the applied fingerprint differs from the current one.
+fn declarative_reapply_needed(applied: Option<&str>, current: &str) -> bool {
+    applied != Some(current)
+}
+
+/// Whether the applied declarative guard no longer matches `cfg`.
+async fn declarative_needs_reapply(ctx: &ServerContext, cfg: &PeerConfig, iface: &str) -> bool {
+    let Some(network) = &cfg.network else {
+        return false;
+    };
+    let fingerprint = declarative_network_fingerprint(cfg, network);
+    let guards = ctx.network_guards.lock().await;
+    declarative_reapply_needed(
+        guards
+            .get(iface)
+            .map(|applied| applied.fingerprint.as_str()),
+        &fingerprint,
+    )
+}
+
+/// Acquire the TAP for a peer, reusing an existing one only when its
+/// declarative state (including the mode-derived MTU) still matches.
+async fn peer_tap(ctx: &ServerContext, cfg: &PeerConfig, remote: &str) -> Result<Arc<Tap>> {
+    match take_old_peer(ctx, cfg.id).await {
+        Some(tap) => {
+            if declarative_needs_reapply(ctx, cfg, tap.name()).await {
+                // The old TAP would keep a stale IP MTU; rebuild it before the
+                // new session starts.
+                drop(tap);
+                open_tap(ctx, cfg, remote).await.map(|(tap, _)| tap)
+            } else {
+                Ok(tap)
+            }
+        }
+        None => open_tap(ctx, cfg, remote).await.map(|(tap, _)| tap),
+    }
 }
 
 fn watch_peer(
@@ -828,10 +1115,12 @@ async fn create_udp_peer(
     cfg: Arc<PeerConfig>,
     key: [u8; 32],
 ) -> Result<()> {
-    let tap = match take_old_peer(ctx, cfg.id).await {
-        Some(t) => t,
-        None => open_tap(ctx, &cfg, &addr.to_string()).await?.0,
-    };
+    // Close the reload race: the handshake may have started before a config
+    // change revoked this peer.
+    if !config_is_current(&*ctx.configs.read().await, &cfg) {
+        bail!("configuration changed during handshake; refusing to create peer");
+    }
+    let tap = peer_tap(ctx, &cfg, &addr.to_string()).await?;
     let stats = LiveStats::new(
         addr.to_string(),
         cfg.id,
@@ -849,6 +1138,10 @@ async fn create_udp_peer(
         },
     };
     let handle = spawn_udp_peer(cfg.clone(), tap.clone(), key, false, stats.clone(), writer);
+    // This runs in a spawned task, so unlike the TCP path it is NOT
+    // serialised with the main task's reload revocation pass.  Publish the
+    // entry and then re-validate it; a reload that lands between the check
+    // above and the insert would otherwise miss (and leak) this stale peer.
     let token = NEXT_PEER_TOKEN.fetch_add(1, AtomicOrdering::Relaxed);
     watch_peer(handle.events, addr, cfg.id, token, ctx.events.clone());
     let entry = Arc::new(PeerEntry {
@@ -862,13 +1155,73 @@ async fn create_udp_peer(
         inbound: handle.inbound,
         proto: "udp",
     });
+    publish_peer_checked(ctx, entry).await
+}
+
+/// Publish a peer and then verify it against the live configuration.
+///
+/// If a reload revoked/changed the snapshot while this task was setting up,
+/// remove the just-published session, tear down declarative state created for
+/// that stale config, and fail so the caller does not send a success reply.
+async fn publish_peer_checked(ctx: &ServerContext, entry: Arc<PeerEntry>) -> Result<()> {
     // Publish the start event before the registry entry becomes visible:
     // any subsequent end (kick/timeout/reload) can only happen after the
     // insert, so subscribers observe start before end.
     notify_session_started(ctx, &entry);
     ctx.registry.insert(entry.clone());
-    eprintln!("peer created: {addr}");
-    Ok(())
+    if config_is_current(&*ctx.configs.read().await, &entry.cfg) {
+        return Ok(());
+    }
+    // A reload raced the insert.  The main task's revocation pass may already
+    // have removed the entry; `end_session` only acts on a still-present
+    // registry entry, so this is idempotent in that case.
+    eprintln!(
+        "reload: peer {} published after a config change; revoking ({})",
+        entry.cfg.name, entry.addr
+    );
+    end_session(ctx, entry.clone(), EndReason::ConfigRevoke).await;
+    cleanup_stale_declarative_guard(ctx, &entry).await;
+    bail!("configuration changed while publishing the peer; session revoked");
+}
+
+/// Remove the declarative guard for this session's TAP only when it still
+/// matches this (stale) config.  A newer valid session may already own a
+/// different guard on the same interface; it must not be disturbed.
+async fn cleanup_stale_declarative_guard(ctx: &ServerContext, entry: &PeerEntry) {
+    let Some(network) = &entry.cfg.network else {
+        return;
+    };
+    let fingerprint = declarative_network_fingerprint(&entry.cfg, network);
+    let guard = {
+        let mut guards = ctx.network_guards.lock().await;
+        take_matching_guard(&mut guards, entry.tap.name(), &fingerprint)
+    };
+    if let Some(guard) = guard {
+        guard.remove().await;
+    }
+}
+
+/// Take an applied guard only if its fingerprint matches exactly.
+fn take_matching_guard(
+    guards: &mut HashMap<String, AppliedNetwork>,
+    iface: &str,
+    fingerprint: &str,
+) -> Option<rustvpn_net::network::TapGuard> {
+    let matches = guard_fingerprint_matches(
+        guards
+            .get(iface)
+            .map(|applied| applied.fingerprint.as_str()),
+        fingerprint,
+    );
+    if matches {
+        guards.remove(iface).map(|applied| applied.guard)
+    } else {
+        None
+    }
+}
+
+fn guard_fingerprint_matches(applied: Option<&str>, expected: &str) -> bool {
+    applied == Some(expected)
 }
 
 fn msg1_len(cfg: &PeerConfig) -> usize {
@@ -888,14 +1241,27 @@ fn msg1_len(cfg: &PeerConfig) -> usize {
 /// session when they change on config reload.
 fn config_fingerprint(cfg: &PeerConfig) -> String {
     format!(
-        "{}|{}|{}|{}|{}|{}|{}",
+        "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
         cfg.verifier.long_form().unwrap_or_default(),
+        cfg.name,
         cfg.iface,
         cfg.mtu,
         cfg.noise,
         cfg.encless,
         cfg.cpr,
-        cfg.time_sync
+        cfg.time_sync,
+        cfg.timeout.as_secs(),
+        cfg.up,
+        cfg.down,
+        cfg.keepalive.as_secs(),
+        cfg.rekey_time.as_secs(),
+        cfg.rekey_jitter.as_secs()
+    ) + &format!(
+        "|network={}",
+        cfg.network
+            .as_ref()
+            .map(|network| network.fingerprint())
+            .unwrap_or_else(|| "-".into())
     )
 }
 
@@ -1210,13 +1576,15 @@ async fn handle_tcp_conn(mut stream: TcpStream, ctx: ServerContext) -> Result<()
         ServerOutput::Complete { reply, session_key } => (reply, session_key),
         _ => return Err(anyhow!("handshake did not complete")),
     };
+    if !config_is_current(&*ctx.configs.read().await, &cfg) {
+        return Err(anyhow!(
+            "configuration changed during handshake; refusing to create peer"
+        ));
+    }
     // Prepare the TAP before telling the client the handshake succeeded:
     // otherwise it would run its up script and black-hole traffic if TAP
     // creation or the up script fails.
-    let tap = match take_old_peer(&ctx, cfg.id).await {
-        Some(t) => t,
-        None => open_tap(&ctx, &cfg, &addr.to_string()).await?.0,
-    };
+    let tap = peer_tap(&ctx, &cfg, &addr.to_string()).await?;
     stream.write_all(&msg4).await?;
     let (read, write) = stream.into_split();
     ctx.requests
@@ -1242,6 +1610,9 @@ async fn create_tcp_peer(
     write: OwnedWriteHalf,
     tap: Arc<Tap>,
 ) -> Result<()> {
+    if !config_is_current(&*ctx.configs.read().await, &cfg) {
+        bail!("configuration changed during handshake; refusing to create peer");
+    }
     let stats = LiveStats::new(
         addr.to_string(),
         cfg.id,
@@ -1357,7 +1728,144 @@ async fn proxy_listener_loop(listener: TcpListener, ctx: ServerContext) {
     }
 }
 
+struct StatusArgs {
+    json: bool,
+    control: Option<PathBuf>,
+}
+
+fn status_usage() -> ! {
+    eprintln!(
+        "Usage of rustvpn-server status:\n\
+         \x20 -control PATH     Server control socket (or RUSTVPN_CONTROL_SOCKET)\n\
+         \x20 --json            Print the stable rustvpn.status.v1 document\n\
+         \x20 --help            Show this help"
+    );
+    process::exit(2);
+}
+
+fn parse_status_args() -> StatusArgs {
+    let mut args = StatusArgs {
+        json: false,
+        control: std::env::var_os("RUSTVPN_CONTROL_SOCKET").map(PathBuf::from),
+    };
+    let mut it = std::env::args().skip(2);
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "--json" | "-json" | "-j" => args.json = true,
+            "--control" | "-control" => {
+                let Some(path) = it.next() else {
+                    eprintln!("-control needs an argument");
+                    status_usage();
+                };
+                args.control = Some(PathBuf::from(path));
+            }
+            "--help" | "-h" | "-help" => status_usage(),
+            other => {
+                eprintln!("unexpected status argument: {other}");
+                status_usage();
+            }
+        }
+    }
+    args
+}
+
+fn print_server_status_json(document: &ServerStatusV1) {
+    match serde_json::to_string_pretty(document) {
+        Ok(text) => println!("{text}"),
+        Err(error) => eprintln!("serialize status: {error}"),
+    }
+}
+
+fn server_status_command() -> ! {
+    let args = parse_status_args();
+    let Some(control) = args.control else {
+        eprintln!("-control PATH is required for `rustvpn-server status`");
+        process::exit(2);
+    };
+    let rt = match tokio::runtime::Runtime::new() {
+        Ok(rt) => rt,
+        Err(error) => {
+            eprintln!("runtime: {error}");
+            process::exit(1);
+        }
+    };
+    let exit = rt.block_on(async {
+        match tokio::time::timeout(Duration::from_secs(3), ControlClient::connect(&control)).await {
+            Ok(Ok(mut client)) => {
+                let status = match client.status().await {
+                    Ok(status) => status,
+                    Err(error) => {
+                        eprintln!("status request failed: {error}");
+                        return 1;
+                    }
+                };
+                let sessions = match client.sessions().await {
+                    Ok(sessions) => sessions,
+                    Err(error) => {
+                        eprintln!("sessions request failed: {error}");
+                        Vec::new()
+                    }
+                };
+                let document = ServerStatusV1::from_parts(&status, &sessions);
+                if args.json {
+                    match serde_json::to_string_pretty(&document) {
+                        Ok(text) => println!("{text}"),
+                        Err(error) => {
+                            eprintln!("serialize status: {error}");
+                            return 1;
+                        }
+                    }
+                } else {
+                    println!("state:      running");
+                    println!("version:    {}", status.server_version);
+                    println!("bind:       {} ({})", status.bind, status.proto);
+                    println!("uptime:     {}s", status.uptime_seconds);
+                    println!(
+                        "sessions:   {} active / {} configured",
+                        status.active_sessions, status.configured_peers
+                    );
+                    println!(
+                        "traffic:    tx={} rx={}",
+                        document.tx_bytes, document.rx_bytes
+                    );
+                    println!(
+                        "heartbeat:  sent={} recv={}",
+                        document.heartbeat_sent, document.heartbeat_recv
+                    );
+                    println!(
+                        "frames:     unauth={} dup={}",
+                        document.frames_unauth, document.frames_dup
+                    );
+                }
+                0
+            }
+            Ok(Err(error)) => {
+                if args.json {
+                    let document = ServerStatusV1::unavailable("", error.to_string());
+                    print_server_status_json(&document);
+                } else {
+                    eprintln!("connect control socket {}: {error}", control.display());
+                }
+                1
+            }
+            Err(_) => {
+                if args.json {
+                    let document = ServerStatusV1::unavailable("", "control socket timed out");
+                    print_server_status_json(&document);
+                } else {
+                    eprintln!("connect control socket {}: timed out", control.display());
+                }
+                1
+            }
+        }
+    });
+    process::exit(exit);
+}
+
 fn main() {
+    if std::env::args().nth(1).as_deref() == Some("status") {
+        server_status_command();
+    }
     let args = parse_args();
     if args.warranty {
         println!("{WARRANTY}");
@@ -1430,6 +1938,7 @@ async fn run(args: Args) -> Result<()> {
 
     let ctx = ServerContext {
         registry: registry.clone(),
+        network_guards: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         configs: configs.clone(),
         stats: stats.clone(),
         events: events_tx,
@@ -1521,18 +2030,36 @@ async fn run(args: Args) -> Result<()> {
                             eprintln!("peer setup failed: {e:#}");
                         }
                     }
-                    Some(MainRequest::ConfigReloaded { fingerprints }) => {
-                        let keep: HashMap<[u8; 16], String> = fingerprints.into_iter().collect();
+                    Some(MainRequest::ConfigReloaded { plan }) => {
+                        let revoked = plan.revoked_ids();
+                        let summary = plan.summary();
+                        let changed_fields: HashMap<[u8; 16], String> = plan
+                            .changed
+                            .iter()
+                            .map(|(id, _, fields)| (*id, fields.clone()))
+                            .collect();
+                        let removed: HashSet<[u8; 16]> =
+                            plan.removed.iter().map(|(id, _)| *id).collect();
+                        let mut revoked_count = 0usize;
                         for entry in registry.snapshot() {
-                            let stale = keep
-                                .get(&entry.id)
-                                .is_none_or(|fp| *fp != config_fingerprint(&entry.cfg));
-                            if stale {
+                            if revoked.contains(&entry.id) {
                                 let addr = entry.addr;
+                                let name = entry.cfg.name.clone();
+                                let reason = if let Some(fields) = changed_fields.get(&entry.id) {
+                                    format!("changed fields: {fields}")
+                                } else if removed.contains(&entry.id) {
+                                    "removed from peers.yaml".to_string()
+                                } else {
+                                    "changed/removed".to_string()
+                                };
                                 end_session(&ctx, entry, EndReason::ConfigRevoke).await;
-                                eprintln!("peer revoked by config reload: {addr}");
+                                revoked_count += 1;
+                                eprintln!(
+                                    "reload: peer {name} {reason}, session revoked ({addr})"
+                                );
                             }
                         }
+                        eprintln!("reload: {summary}; revoked {revoked_count} active session(s)");
                     }
                     Some(MainRequest::Kick { id, reason, reply }) => {
                         let result = match registry.addr_by_id(&id) {
@@ -1561,6 +2088,18 @@ async fn run(args: Args) -> Result<()> {
 
     for entry in registry.snapshot() {
         end_session(&ctx, entry, EndReason::Shutdown).await;
+    }
+    // Let cancelled peer tasks drop their TAP handles before deleting a
+    // declarative device.
+    tokio::time::sleep(Duration::from_millis(25)).await;
+    // Undo only the declarative network state created above; script-managed
+    // TAPs are intentionally left to their down scripts.
+    let guards: Vec<rustvpn_net::network::TapGuard> = {
+        let mut applied = ctx.network_guards.lock().await;
+        applied.drain().map(|(_, entry)| entry.guard).collect()
+    };
+    for guard in guards {
+        guard.remove().await;
     }
     if let Some(control) = &ctx.control {
         control.shutdown();
@@ -2043,5 +2582,243 @@ mod tests {
             assert!(value > 0);
             assert!(value < (1u64 << 52));
         }
+    }
+
+    fn test_peer(name: &str, id: [u8; 16], mtu: usize) -> PeerConfig {
+        let mut verifier = rustvpn_crypto::verifier::Verifier::new(1024, 2, 1, id);
+        verifier.public = Some([id[0]; 32]);
+        PeerConfig {
+            id,
+            name: name.into(),
+            iface: format!("tap-{name}"),
+            mtu,
+            up: String::new(),
+            down: String::new(),
+            timeout: Duration::from_secs(60),
+            noise: false,
+            cpr: 0,
+            encless: false,
+            time_sync: 0,
+            keepalive: Duration::ZERO,
+            rekey_time: Duration::ZERO,
+            rekey_jitter: Duration::ZERO,
+            network: None,
+            verifier,
+            signing_key: None,
+        }
+    }
+
+    fn config_set(peers: Vec<PeerConfig>) -> ConfigSet {
+        ConfigSet::from_peers(peers).unwrap()
+    }
+
+    #[test]
+    fn reload_plan_changes_only_the_modified_peer() {
+        let alice = test_peer("alice", [1u8; 16], 1515);
+        let bob = test_peer("bob", [2u8; 16], 1515);
+        let carol = test_peer("carol", [3u8; 16], 1515);
+        let old = config_set(vec![alice.clone(), bob.clone(), carol.clone()]);
+        let mut changed = carol;
+        changed.mtu = 1540;
+        let new = config_set(vec![alice, bob, changed]);
+
+        let plan = plan_reload(&old, &new);
+        assert_eq!(plan.changed.len(), 1, "{plan:?}");
+        assert_eq!(plan.changed[0].1, "carol");
+        assert_eq!(plan.unchanged.len(), 2, "{plan:?}");
+        let unchanged: Vec<&str> = plan
+            .unchanged
+            .iter()
+            .map(|(_, name)| name.as_str())
+            .collect();
+        assert!(unchanged.contains(&"alice") && unchanged.contains(&"bob"));
+        assert_eq!(plan.revoked_ids().len(), 1);
+        assert!(plan.revoked_ids().contains(&[3u8; 16]));
+    }
+
+    #[test]
+    fn reload_plan_detects_added_and_removed_peers() {
+        let alice = test_peer("alice", [1u8; 16], 1515);
+        let bob = test_peer("bob", [2u8; 16], 1515);
+        let old = config_set(vec![alice.clone(), bob.clone()]);
+        let added = test_peer("dave", [4u8; 16], 1515);
+        let new = config_set(vec![alice, added]);
+        let plan = plan_reload(&old, &new);
+        assert_eq!(plan.added[0].1, "dave");
+        assert_eq!(plan.removed[0].1, "bob");
+        assert_eq!(plan.unchanged[0].1, "alice");
+        assert!(plan.revoked_ids().contains(&[2u8; 16]));
+        assert!(!plan.revoked_ids().contains(&[4u8; 16]));
+    }
+
+    #[test]
+    fn semantic_yaml_differences_do_not_trigger_reload() {
+        let long = {
+            let mut verifier = rustvpn_crypto::verifier::Verifier::new(1024, 2, 1, [9u8; 16]);
+            verifier.password_apply("test").unwrap();
+            verifier.long_form().unwrap()
+        };
+        // Same peers, different key order/comments/whitespace/quoting.
+        let one = format!("alice:\n  iface: tap0\n  verifier: '{long}'\n");
+        let two = format!(
+            "# comment\n\n\nalice:\n    verifier: \"{long}\"\n    iface: tap0\n    # trailing\n"
+        );
+        let a = ConfigSet::from_str(&one).unwrap();
+        let b = ConfigSet::from_str(&two).unwrap();
+        let plan = plan_reload(&a, &b);
+        assert!(plan.is_noop(), "{plan:?}");
+        assert!(plan.revoked_ids().is_empty());
+    }
+
+    #[tokio::test]
+    async fn reloader_semantic_noop_does_not_bump_generation() {
+        let long = {
+            let mut verifier = rustvpn_crypto::verifier::Verifier::new(1024, 2, 1, [6u8; 16]);
+            verifier.password_apply("test").unwrap();
+            verifier.long_form().unwrap()
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("peers.yaml");
+        let one = format!("alice:\n  iface: tap0\n  verifier: '{long}'\n");
+        std::fs::write(&path, &one).unwrap();
+        let set = ConfigSet::from_str(&one).unwrap();
+        let store = Arc::new(RwLock::new(set));
+        let (requests, mut requests_rx) = mpsc::channel(4);
+        let reloader = Reloader::new(
+            path.clone(),
+            store,
+            requests,
+            Some(one.as_bytes().to_vec()),
+            1,
+            Arc::new(Vec::new()),
+            None,
+        );
+
+        let two = format!("# comment\nalice:\n  verifier: \"{long}\"\n  iface: tap0\n");
+        std::fs::write(&path, &two).unwrap();
+        assert!(!reloader.reload_from_disk().await.unwrap());
+        assert_eq!(reloader.generation(), 1);
+        assert!(requests_rx.try_recv().is_err());
+
+        let changed = format!("alice:\n  iface: tap0\n  mtu: 1540\n  verifier: '{long}'\n");
+        std::fs::write(&path, &changed).unwrap();
+        assert!(reloader.reload_from_disk().await.unwrap());
+        assert_eq!(reloader.generation(), 2);
+        let request = requests_rx.try_recv().expect("reload request");
+        match request {
+            MainRequest::ConfigReloaded { plan } => {
+                assert_eq!(plan.changed.len(), 1);
+                assert_eq!(plan.changed[0].1, "alice");
+            }
+            _ => panic!("unexpected request"),
+        }
+    }
+
+    #[test]
+    fn reload_plan_reports_changed_fields() {
+        let alice = test_peer("alice", [1u8; 16], 1515);
+        let old = config_set(vec![alice.clone()]);
+        let mut changed = alice;
+        changed.mtu = 1540;
+        changed.keepalive = Duration::from_secs(25);
+        let new = config_set(vec![changed]);
+        let plan = plan_reload(&old, &new);
+        let fields = &plan.changed[0].2;
+        assert!(fields.contains("mtu"), "{fields}");
+        assert!(fields.contains("keepalive"), "{fields}");
+        assert!(!fields.contains("iface"), "{fields}");
+        assert!(plan.summary().contains("alice{"), "{}", plan.summary());
+    }
+
+    #[test]
+    fn config_is_current_rejects_revoked_or_changed_snapshots() {
+        let alice = test_peer("alice", [1u8; 16], 1515);
+        let set = config_set(vec![alice.clone()]);
+        assert!(config_is_current(&set, &alice));
+
+        let mut changed = alice.clone();
+        changed.mtu = 1540;
+        assert!(!config_is_current(&set, &changed));
+
+        let empty = config_set(Vec::new());
+        assert!(!config_is_current(&empty, &alice));
+    }
+
+    #[test]
+    fn network_changes_are_part_of_the_fingerprint() {
+        let alice = test_peer("alice", [1u8; 16], 1515);
+        let old = config_set(vec![alice.clone()]);
+        let mut changed = alice;
+        changed.network = Some(rustvpn_net::config::PeerNetwork {
+            address: "10.88.0.1/24".into(),
+            gateway: String::new(),
+            dns: Vec::new(),
+            routes: vec!["10.88.0.0/24".into()],
+        });
+        let new = config_set(vec![changed]);
+        let plan = plan_reload(&old, &new);
+        assert_eq!(plan.changed.len(), 1);
+    }
+
+    fn declarative_network() -> PeerNetwork {
+        PeerNetwork {
+            address: "10.88.0.1/24".into(),
+            gateway: String::new(),
+            dns: Vec::new(),
+            routes: vec!["10.88.0.0/24".into()],
+        }
+    }
+
+    #[test]
+    fn mode_only_change_reapplies_declarative_tap_mtu() {
+        let network = declarative_network();
+        let mut plain = test_peer("alice", [1u8; 16], 1515);
+        plain.noise = false;
+        plain.network = Some(network.clone());
+        let plain_fp = declarative_network_fingerprint(&plain, &network);
+        assert_eq!(plain.inner_ip_mtu(), 1500);
+
+        // Same wire MTU, only the mode changes: the applied fingerprint must
+        // differ so `open_tap` reconfigures the TAP IP MTU before the session.
+        let mut noise = plain.clone();
+        noise.noise = true;
+        let noise_fp = declarative_network_fingerprint(&noise, &network);
+        assert_eq!(noise.inner_ip_mtu(), 1476);
+        assert!(declarative_reapply_needed(Some(&plain_fp), &noise_fp));
+
+        let mut encless = plain.clone();
+        encless.noise = true;
+        encless.encless = true;
+        let encless_fp = declarative_network_fingerprint(&encless, &network);
+        assert_eq!(encless.inner_ip_mtu(), 1492);
+        assert!(declarative_reapply_needed(Some(&noise_fp), &encless_fp));
+
+        // noise → plain is also detected.
+        assert!(declarative_reapply_needed(Some(&noise_fp), &plain_fp));
+        // Unchanged mode/MTU/network is still a no-op.
+        assert!(!declarative_reapply_needed(Some(&plain_fp), &plain_fp));
+    }
+
+    #[test]
+    fn publish_after_reload_detects_stale_snapshot_and_matching_guard() {
+        let alice = test_peer("alice", [1u8; 16], 1515);
+        let old = config_set(vec![alice.clone()]);
+        assert!(config_is_current(&old, &alice));
+
+        // A spawned UDP task can hold the old snapshot while the main task
+        // installs a changed config before `registry.insert`.  The post-insert
+        // re-check must see the stale snapshot.
+        let mut changed = alice.clone();
+        changed.noise = true;
+        let reloaded = config_set(vec![changed]);
+        assert!(
+            !config_is_current(&reloaded, &alice),
+            "post-publish recheck must revoke a snapshot the reload already replaced"
+        );
+
+        // Cleanup must only take the guard that belongs to the stale config.
+        assert!(guard_fingerprint_matches(Some("stale"), "stale"));
+        assert!(!guard_fingerprint_matches(Some("new"), "stale"));
+        assert!(!guard_fingerprint_matches(None, "stale"));
     }
 }

@@ -102,7 +102,8 @@ attaches to it. A minimal up script:
 set -eu
 IFACE="${GOVPN_IFACE:-tap0}"
 ip tuntap add dev "$IFACE" mode tap 2>/dev/null || true
-ip link set dev "$IFACE" mtu 1515 up
+# Interface IP MTU, not the wire MTU: plain wire 1515 -> 1500.
+ip link set dev "$IFACE" mtu 1500 up
 ip addr replace 10.88.0.1/24 dev "$IFACE"
 ```
 
@@ -144,7 +145,8 @@ Client up script (runs after the tunnel is established):
 set -eu
 IFACE="${GOVPN_IFACE:-tap0}"
 ip tuntap add dev "$IFACE" mode tap 2>/dev/null || true
-ip link set dev "$IFACE" mtu 1515 up
+# Interface IP MTU, not the wire MTU: plain wire 1515 -> 1500.
+ip link set dev "$IFACE" mtu 1500 up
 ip addr replace 10.88.0.2/24 dev "$IFACE"
 ip route replace 10.88.0.0/24 dev "$IFACE"
 ```
@@ -164,7 +166,8 @@ On the server:
 # TAP and addressing (also do this in up.sh for production)
 ip tuntap add dev tap10 mode tap
 ip addr replace 172.16.0.1/24 dev tap10
-ip link set dev tap10 mtu 1540 up   # 1515 + noise overhead if noise is on
+# TAP IP MTU, not the wire MTU. Plain wire 1515 -> 1500.
+ip link set dev tap10 mtu 1500 up
 
 sudo rustvpn-server -bind 192.168.0.1:1194 -conf peers.yaml
 ```
@@ -174,7 +177,7 @@ On the client:
 ```bash
 ip tuntap add dev tap10 mode tap
 ip addr replace 172.16.0.2/24 dev tap10
-ip link set dev tap10 mtu 1540 up
+ip link set dev tap10 mtu 1500 up   # plain wire 1515 -> TAP IP MTU 1500
 ip route add 0/1 via 172.16.0.1
 ip route add 128/1 via 172.16.0.1
 
@@ -185,16 +188,25 @@ sudo rustvpn-client \
 
 The two `/1` routes override the default route without deleting it, so
 the tunnel carries all traffic while the underlying link still carries the
-encrypted UDP packets. Adjust MTU according to the mode:
+encrypted UDP packets.
 
-| Mode | Usable payload with `mtu: 1515` |
-|---|---|
-| classic | 1514 bytes |
-| noise | 1490 bytes |
-| encless | 1506 bytes |
+Set the TAP **interface IP MTU**, never the wire/frame budget, from the
+numeric wire MTU and mode:
 
-Either raise the configured/interface MTU or lower the interior network's
-MTU. See [Configuration → MTU](configuration.md#mtu).
+```text
+inner_ip_mtu = Mode::max_payload(wire_mtu) - 14
+```
+
+| Mode | TAP interface IP MTU for `mtu: 1515` |
+|---|---:|
+| plain | 1500 |
+| noise | 1476 |
+| encless | 1492 |
+
+If you use a different numeric wire MTU, compute the value with the formula
+(or let the daemon/declarative server path do it). The wire MTU is a
+two-sided contract; `mtu: auto` and `mtu: 0` are rejected. See
+[Configuration → MTU](configuration.md#mtu).
 
 ## Optional: desktop GUI
 
@@ -226,7 +238,7 @@ shipped with it; the Go tree is not part of this repository.
 |---|---|
 | `Cannot find device "tap0"` | The server's `up` script did not create the persistent TAP. Add `ip tuntap add ... mode tap`. |
 | Handshake succeeds, no traffic | TAP has no IP, wrong MTU, or the route is missing. Check `ip addr` / `ip route`. |
-| Large packets disappear with noise/encless | Payload exceeds `MTU-25` / `MTU-9`. Raise MTU or lower the interior MTU. |
+| Large packets disappear with noise/encless | Payload exceeds `MTU-25` / `MTU-9`. Raise the numeric wire MTU on both sides (then recompute the TAP IP MTU) or lower the interior network's MTU. |
 | `Currently encryptionless mode works only with TCP` | Use `-proto tcp` (also implied by `-proxy`) for encless on the client. |
 | `server verifier has no public key` | `peers.yaml` contains the short form; use the long form generated in the same run. |
 | `random number mismatch` during handshake | Usually two overlapping sessions from a simultaneous restart; a clean restart or client auto-reconnect resolves it. |

@@ -292,4 +292,19 @@ mod tests {
         }
         assert_eq!(obj["BytesIn"], 100);
     }
+
+    #[test]
+    fn empty_heartbeat_counters_are_observable() {
+        let stats = LiveStats::new("1.2.3.4:5".into(), [8u8; 16], false, 0, false, 1515);
+        for _ in 0..3 {
+            stats.add_wire_out(1);
+            stats.add_heartbeat_sent();
+        }
+        stats.add_wire_in(1);
+        stats.add_heartbeat_recv();
+        let snap = stats.snapshot();
+        assert_eq!(snap.heartbeat_sent, 3);
+        assert_eq!(snap.heartbeat_recv, 1);
+        assert_eq!(snap.frames_out, 3);
+    }
 }
