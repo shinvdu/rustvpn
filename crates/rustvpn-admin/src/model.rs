@@ -288,6 +288,10 @@ pub struct SystemStatus {
     pub disabled_peers: usize,
     pub config: ConfigStatus,
     pub counters: ServerCounters,
+    /// False when the control socket is unreachable; the UI is then showing
+    /// the last known sessions and local configuration only.
+    pub server_online: bool,
+    pub server_instance: Option<u64>,
 }
 
 #[derive(Clone, Debug, Serialize)]

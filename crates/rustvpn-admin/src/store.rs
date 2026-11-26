@@ -104,9 +104,9 @@ impl Store {
             conn: Mutex::new(conn),
         };
         store.migrate()?;
-        store
-            .close_orphan_sessions()
-            .map_err(|e| format!("close orphan sessions: {e}"))?;
+        // Open sessions are reconciled against the server's control plane by
+        // the admin daemon; closing them here would wrongly end live sessions
+        // when only the admin process restarts.
         Ok(store)
     }
 
@@ -445,6 +445,37 @@ impl Store {
             )
             .map_err(|e| e.to_string())?;
         }
+        Ok(())
+    }
+
+    pub fn open_session_ids(&self) -> Result<Vec<u64>, String> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare("SELECT session_id FROM session WHERE ended_at IS NULL")
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, i64>(0))
+            .map_err(|e| e.to_string())?;
+        let mut ids = Vec::new();
+        for row in rows {
+            ids.push(row.map_err(|e| e.to_string())? as u64);
+        }
+        Ok(ids)
+    }
+
+    pub fn close_session(
+        &self,
+        session_id: u64,
+        reason: &str,
+        ended_at: i64,
+    ) -> Result<(), String> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE session SET ended_at = ?2, end_reason = ?3
+             WHERE session_id = ?1 AND ended_at IS NULL",
+            params![session_id as i64, ended_at, reason],
+        )
+        .map_err(|e| e.to_string())?;
         Ok(())
     }
 

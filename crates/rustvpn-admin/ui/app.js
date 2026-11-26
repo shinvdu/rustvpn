@@ -259,6 +259,7 @@ async function renderDashboard() {
       <td class="small muted">${esc(event.detail || '')}</td>
     </tr>`).join('');
   const configOk = !status.config.last_error;
+  const serverOnline = status.server_online !== false;
   app.innerHTML = shell('dash', '总览', `
     <div class="cards">
       <div class="card"><div class="label">在线 / 配置</div>
@@ -271,8 +272,8 @@ async function renderDashboard() {
         <div class="value">${fmtBytes(list.summary.today_payload_in + list.summary.today_payload_out)}</div>
         <div class="sub">入 ${fmtBytes(list.summary.today_payload_in)} · 出 ${fmtBytes(list.summary.today_payload_out)}</div></div>
       <div class="card"><div class="label">服务状态</div>
-        <div class="value" style="color:${configOk ? 'var(--ok)' : 'var(--danger)'}">${configOk ? '正常' : '配置错误'}</div>
-        <div class="sub">运行 ${fmtDuration(status.uptime_seconds)} · ${esc(status.bind)}</div></div>
+        <div class="value" style="color:${serverOnline && configOk ? 'var(--ok)' : 'var(--danger)'}">${!serverOnline ? '服务端离线' : configOk ? '正常' : '配置错误'}</div>
+        <div class="sub">${!serverOnline ? '控制 socket 不可达' : `运行 ${fmtDuration(status.uptime_seconds)} · ${esc(status.bind)}`}</div></div>
     </div>
     <div class="panel">
       <h3>Top 客户端</h3>

@@ -1133,6 +1133,7 @@ dependencies = [
  "rpassword",
  "rusqlite",
  "rust-embed",
+ "rustvpn-control",
  "rustvpn-crypto",
  "rustvpn-net",
  "rustvpn-proto",
@@ -1161,6 +1162,18 @@ dependencies = [
  "rustvpn-proto",
  "tokio",
  "tokio-util",
+]
+
+[[package]]
+name = "rustvpn-control"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "hex",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
 ]
 
 [[package]]
@@ -1234,12 +1247,13 @@ name = "rustvpn-server"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "async-trait",
+ "hex",
  "rand_core",
- "rustvpn-admin",
+ "rustvpn-control",
  "rustvpn-crypto",
  "rustvpn-net",
  "rustvpn-proto",
+ "tempfile",
  "tokio",
  "tokio-util",
 ]

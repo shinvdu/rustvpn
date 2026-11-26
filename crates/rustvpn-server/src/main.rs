@@ -1,23 +1,27 @@
 //! GoVPN 5.7-compatible Rust server.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, SocketAddr};
-use std::path::PathBuf;
+use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use rand_core::{OsRng, RngCore};
+use rustvpn_control::{
+    id_hex, mode_name, now_unix, read_frame, rfc3339, write_frame, ConfigReloaded, Counters, Event,
+    KickReport, ReloadReport, Request, Response, ServerCounters, ServerStatus, SessionEnded,
+    SessionInfo, SessionStarted, PROTOCOL_VERSION,
+};
 use rustvpn_crypto::egd::EgDRng;
 use rustvpn_crypto::xtea::Xtea;
 use rustvpn_net::config::{add_time_sync, ConfigSet, PeerConfig};
 use rustvpn_net::peer::{spawn_tcp, spawn_udp_peer, PeerEvent, WireWriter};
 use rustvpn_net::scripts::{call_down, run_script};
-#[cfg(feature = "admin")]
-use rustvpn_net::stats::PeerStats;
-use rustvpn_net::stats::{stats_listener, LiveStats, StatsState};
+use rustvpn_net::stats::{stats_listener, LiveStats, PeerStats, StatsState};
 use rustvpn_net::tap::Tap;
 use rustvpn_proto::{
     HandshakeConfig, ServerHandshake, ServerOutput, ENCLESS_ENLARGE_SIZE, MTU_MAX,
@@ -25,27 +29,9 @@ use rustvpn_proto::{
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::OwnedReadHalf;
 use tokio::net::tcp::OwnedWriteHalf;
-use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use tokio::sync::{mpsc, RwLock, Semaphore};
+use tokio::net::{TcpListener, TcpStream, UdpSocket, UnixListener, UnixStream};
+use tokio::sync::{broadcast, mpsc, RwLock, Semaphore};
 use tokio_util::sync::CancellationToken;
-
-#[cfg(feature = "admin")]
-use async_trait::async_trait;
-#[cfg(feature = "admin")]
-use rustvpn_admin::config_edit::{self, ConfigPaths};
-#[cfg(feature = "admin")]
-use rustvpn_admin::history::History;
-#[cfg(feature = "admin")]
-use rustvpn_admin::model::{
-    id_hex, mode_name, now_unix, rfc3339, AdminBackend, ApplyReport, ApplyRequest, BackupInfo,
-    ConfigError, ConfigSnapshot, ConfigStatus, Counters, EventLog, EventView, KickReport,
-    PreviewReport, ServerCounters, SessionEnd, SessionInfo, SessionObserver, SessionStart,
-    SystemStatus,
-};
-#[cfg(feature = "admin")]
-use rustvpn_admin::store::Store;
-#[cfg(feature = "admin")]
-use rustvpn_admin::{AdminOptions, AdminState};
 
 const WARRANTY: &str = "This program is free software: you can redistribute it and/or modify
 it under the terms of the GNU General Public License as published by
@@ -67,11 +53,9 @@ struct Args {
     stats: String,
     proxy: String,
     egd: String,
-    admin: String,
-    admin_db: String,
-    admin_disabled_conf: String,
-    admin_cookie_secure: bool,
-    admin_script_dir: Vec<String>,
+    control: String,
+    control_group: String,
+    script_dir: Vec<String>,
     warranty: bool,
 }
 
@@ -84,11 +68,9 @@ fn usage() -> ! {
          \x20 -proto string (default \"udp\")\n\
          \x20 -proxy string\n\
          \x20 -stats string\n\
-         \x20 -admin string (optional, build with --features admin)\n\
-         \x20 -admin-db string (default \"/var/lib/rustvpn/admin.db\")\n\
-         \x20 -admin-disabled-conf string (default \"peers.disabled.yaml\") \n\
-         \x20 -admin-cookie-secure (set Secure/__Host- cookies; behind TLS)\n\
-         \x20 -admin-script-dir string (repeatable; restrict up/down paths)\n\
+         \x20 -control string (optional local admin control socket)\n\
+         \x20 -control-group string (socket group; default owner-only)\n\
+         \x20 -script-dir string (repeatable; restrict up/down paths)\n\
          \x20 -warranty"
     );
     process::exit(2);
@@ -102,11 +84,9 @@ fn parse_args() -> Args {
         stats: String::new(),
         proxy: String::new(),
         egd: String::new(),
-        admin: String::new(),
-        admin_db: "/var/lib/rustvpn/admin.db".into(),
-        admin_disabled_conf: String::new(),
-        admin_cookie_secure: false,
-        admin_script_dir: Vec::new(),
+        control: String::new(),
+        control_group: String::new(),
+        script_dir: Vec::new(),
         warranty: false,
     };
     let mut it = std::env::args().skip(1);
@@ -130,11 +110,9 @@ fn parse_args() -> Args {
             "stats" => a.stats = take("stats"),
             "proxy" => a.proxy = take("proxy"),
             "egd" => a.egd = take("egd"),
-            "admin" => a.admin = take("admin"),
-            "admin-db" => a.admin_db = take("admin-db"),
-            "admin-disabled-conf" => a.admin_disabled_conf = take("admin-disabled-conf"),
-            "admin-cookie-secure" => a.admin_cookie_secure = true,
-            "admin-script-dir" => a.admin_script_dir.push(take("admin-script-dir")),
+            "control" => a.control = take("control"),
+            "control-group" => a.control_group = take("control-group"),
+            "script-dir" => a.script_dir.push(take("script-dir")),
             "warranty" => a.warranty = true,
             "h" | "help" => usage(),
             "" => usage(),
@@ -200,7 +178,6 @@ struct PeerEntry {
     stats: Arc<LiveStats>,
     cancel: CancellationToken,
     inbound: Option<mpsc::Sender<Vec<u8>>>,
-    #[cfg_attr(not(feature = "admin"), allow(dead_code))]
     proto: &'static str,
 }
 
@@ -312,6 +289,8 @@ struct Reloader {
     path: PathBuf,
     store: ConfigStore,
     requests: mpsc::Sender<MainRequest>,
+    script_dirs: Vec<PathBuf>,
+    events: Mutex<Option<broadcast::Sender<Event>>>,
     guard: tokio::sync::Mutex<()>,
     last_bytes: Mutex<Option<Vec<u8>>>,
     generation: AtomicU64,
@@ -326,16 +305,30 @@ impl Reloader {
         requests: mpsc::Sender<MainRequest>,
         initial_bytes: Option<Vec<u8>>,
         generation: u64,
+        script_dirs: Vec<PathBuf>,
+        events: Option<broadcast::Sender<Event>>,
     ) -> Self {
         Self {
             path,
             store,
             requests,
+            script_dirs,
+            events: Mutex::new(events),
             guard: tokio::sync::Mutex::new(()),
             last_bytes: Mutex::new(initial_bytes),
             generation: AtomicU64::new(generation),
             last_loaded: Mutex::new(Some(SystemTime::now())),
             last_error: Mutex::new(None),
+        }
+    }
+
+    fn emit_reload(&self, last_error: Option<String>) {
+        let generation = self.generation();
+        if let Some(tx) = self.events.lock().unwrap().as_ref() {
+            let _ = tx.send(Event::ConfigReloaded(ConfigReloaded {
+                generation,
+                last_error,
+            }));
         }
     }
 
@@ -354,10 +347,18 @@ impl Reloader {
         let set = match ConfigSet::from_str(text) {
             Ok(set) => set,
             Err(error) => {
-                *self.last_error.lock().unwrap() = Some(format!("{error:#}"));
+                let message = format!("{error:#}");
+                *self.last_error.lock().unwrap() = Some(message.clone());
+                self.emit_reload(Some(message));
                 return Err(error);
             }
         };
+        if let Err(error) = validate_script_paths(&set, &self.script_dirs) {
+            let message = format!("{error:#}");
+            *self.last_error.lock().unwrap() = Some(message.clone());
+            self.emit_reload(Some(message));
+            return Err(error);
+        }
         let fingerprints = set
             .peers
             .iter()
@@ -368,6 +369,7 @@ impl Reloader {
         self.generation.fetch_add(1, AtomicOrdering::Relaxed);
         *self.last_loaded.lock().unwrap() = Some(SystemTime::now());
         *self.last_error.lock().unwrap() = None;
+        self.emit_reload(None);
         let _ = self
             .requests
             .send(MainRequest::ConfigReloaded { fingerprints })
@@ -375,35 +377,31 @@ impl Reloader {
         Ok(true)
     }
 
-    #[cfg(feature = "admin")]
     fn generation(&self) -> u64 {
         self.generation.load(AtomicOrdering::Relaxed)
     }
 
-    #[cfg(feature = "admin")]
     fn last_loaded(&self) -> Option<SystemTime> {
         *self.last_loaded.lock().unwrap()
     }
 
-    #[cfg(feature = "admin")]
     fn last_error(&self) -> Option<String> {
         self.last_error.lock().unwrap().clone()
     }
 }
 
-#[cfg(feature = "admin")]
 #[derive(Default)]
-struct AdminMetrics {
+struct ServerMetrics {
     handshake_requests: AtomicU64,
     handshake_rate_limited: AtomicU64,
     handshake_errors: AtomicU64,
     tcp_connections_rejected: AtomicU64,
     sessions_started: AtomicU64,
     sessions_finished: AtomicU64,
+    events_dropped: AtomicU64,
 }
 
-#[cfg(feature = "admin")]
-impl AdminMetrics {
+impl ServerMetrics {
     fn snapshot(&self) -> ServerCounters {
         ServerCounters {
             handshake_requests: self.handshake_requests.load(AtomicOrdering::Relaxed),
@@ -412,219 +410,135 @@ impl AdminMetrics {
             tcp_connections_rejected: self.tcp_connections_rejected.load(AtomicOrdering::Relaxed),
             sessions_started: self.sessions_started.load(AtomicOrdering::Relaxed),
             sessions_finished: self.sessions_finished.load(AtomicOrdering::Relaxed),
-            admin_hook_dropped: 0,
+            events_dropped: self.events_dropped.load(AtomicOrdering::Relaxed),
         }
     }
 }
 
-#[cfg(feature = "admin")]
-struct AdminRuntime {
-    history: Arc<History>,
-    events: Arc<EventLog>,
-    metrics: Arc<AdminMetrics>,
+const RECENT_SESSIONS_CAPACITY: usize = 1024;
+
+/// In-process event hub for the optional control socket.  It keeps a bounded
+/// ring of recent session ends so an admin daemon that reconnects can
+/// reconcile sessions it missed while it was down.
+struct ControlRuntime {
+    events: broadcast::Sender<Event>,
+    recent: Mutex<VecDeque<SessionEnded>>,
 }
 
-#[cfg(feature = "admin")]
-struct ServerBackend {
-    registry: Arc<Registry>,
-    configs: ConfigStore,
-    requests: mpsc::Sender<MainRequest>,
-    reloader: Arc<Reloader>,
-    paths: ConfigPaths,
-    events: Arc<EventLog>,
-    metrics: Arc<AdminMetrics>,
-    config_write: tokio::sync::Mutex<()>,
-    bind: String,
-    proto: String,
-    admin_addr: String,
-    started_at: SystemTime,
+impl ControlRuntime {
+    fn new() -> Arc<Self> {
+        let (events, _) = broadcast::channel(256);
+        Arc::new(Self {
+            events,
+            recent: Mutex::new(VecDeque::with_capacity(RECENT_SESSIONS_CAPACITY)),
+        })
+    }
+
+    fn sender(&self) -> broadcast::Sender<Event> {
+        self.events.clone()
+    }
+
+    fn session_started(&self, started: SessionStarted) {
+        let _ = self.events.send(Event::SessionStarted(started));
+    }
+
+    fn session_ended(&self, ended: SessionEnded) {
+        {
+            let mut recent = self.recent.lock().unwrap();
+            if recent.len() >= RECENT_SESSIONS_CAPACITY {
+                recent.pop_front();
+            }
+            recent.push_back(ended.clone());
+        }
+        let _ = self.events.send(Event::SessionEnded(ended));
+    }
+
+    fn recent(&self, limit: usize) -> Vec<SessionEnded> {
+        let recent = self.recent.lock().unwrap();
+        let skip = recent.len().saturating_sub(limit);
+        recent.iter().skip(skip).cloned().collect()
+    }
+
+    fn shutdown(&self) {
+        let _ = self.events.send(Event::ServerShutdown);
+    }
 }
 
-#[cfg(feature = "admin")]
-#[async_trait]
-impl AdminBackend for ServerBackend {
-    async fn system_status(&self) -> SystemStatus {
-        let configured_peers = self.configs.read().await.peers.len();
-        let paths = self.paths.clone();
-        let loaded = tokio::task::spawn_blocking(move || config_edit::load(&paths))
-            .await
-            .ok()
-            .and_then(|result| result.ok());
-        let (disabled_peers, etag, load_error) = match loaded {
-            Some(loaded) => (loaded.files.disabled.len(), loaded.etag(), None),
-            None => (
-                0,
-                String::new(),
-                Some("unable to read peers.yaml".to_string()),
-            ),
-        };
-        let last_loaded_at = self.reloader.last_loaded().and_then(|time| {
-            time.duration_since(SystemTime::UNIX_EPOCH)
-                .ok()
-                .map(|d| rfc3339(d.as_secs() as i64))
-        });
-        SystemStatus {
-            uptime_seconds: SystemTime::now()
-                .duration_since(self.started_at)
-                .map(|d| d.as_secs())
-                .unwrap_or(0),
-            bind: self.bind.clone(),
-            proto: self.proto.clone(),
-            admin_addr: self.admin_addr.clone(),
-            active_sessions: self.registry.snapshot().len(),
-            configured_peers,
-            disabled_peers,
-            config: ConfigStatus {
-                path: self.paths.enabled.display().to_string(),
-                disabled_path: self.paths.disabled.display().to_string(),
-                generation: self.reloader.generation(),
-                last_loaded_at,
-                last_error: self.reloader.last_error().or(load_error),
-                etag,
-            },
-            counters: self.metrics.snapshot(),
+/// When `script_dirs` is non-empty, every configured `up`/`down` path must:
+/// - resolve under one of those directories,
+/// - be a regular file,
+/// - not be writable by group or others,
+/// - be owned by root or by the server's own effective uid.
+///
+/// This closes the escalation path where a non-privileged admin process can
+/// write `peers.yaml` and point it at a script it controls.
+fn validate_script_paths(set: &ConfigSet, script_dirs: &[PathBuf]) -> Result<()> {
+    if script_dirs.is_empty() {
+        return Ok(());
+    }
+    let allowed: Vec<PathBuf> = script_dirs
+        .iter()
+        .map(|dir| {
+            dir.canonicalize()
+                .with_context(|| format!("resolve script dir {}", dir.display()))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let server_uid = server_euid();
+    for peer in &set.peers {
+        for (label, script) in [("up", &peer.up), ("down", &peer.down)] {
+            if script.is_empty() {
+                continue;
+            }
+            validate_script_path(label, Path::new(script), &allowed, server_uid)?;
         }
     }
+    Ok(())
+}
 
-    async fn config_snapshot(&self) -> Result<ConfigSnapshot, ConfigError> {
-        let paths = self.paths.clone();
-        tokio::task::spawn_blocking(move || config_edit::load(&paths))
-            .await
-            .map_err(|e| ConfigError::Io(e.to_string()))?
-            .map(|loaded| loaded.snapshot())
-    }
+/// Effective uid of the server process.  Reading `/proc/self/status` avoids
+/// an unsafe libc call in the main (non-FFI) module.
+fn server_euid() -> Option<u32> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    let line = status.lines().find(|line| line.starts_with("Uid:"))?;
+    let mut fields = line.split_whitespace();
+    fields.next()?; // "Uid:"
+    fields.next()?; // real uid
+    fields.next()?.parse().ok() // effective uid
+}
 
-    async fn preview_config(
-        &self,
-        enabled_yaml: &str,
-        disabled_yaml: &str,
-    ) -> Result<PreviewReport, ConfigError> {
-        let paths = self.paths.clone();
-        let enabled = enabled_yaml.to_string();
-        let disabled = disabled_yaml.to_string();
-        tokio::task::spawn_blocking(move || {
-            let current = config_edit::load(&paths)?;
-            config_edit::preview(&current, &enabled, &disabled)
-        })
-        .await
-        .map_err(|e| ConfigError::Io(e.to_string()))?
+fn validate_script_path(
+    label: &str,
+    path: &Path,
+    allowed: &[PathBuf],
+    server_uid: Option<u32>,
+) -> Result<()> {
+    let canonical = path
+        .canonicalize()
+        .with_context(|| format!("resolve {label} script {}", path.display()))?;
+    if !allowed.iter().any(|dir| canonical.starts_with(dir)) {
+        bail!(
+            "{label} script {} is outside the allowed -script-dir list",
+            path.display()
+        );
     }
-
-    async fn apply_config(&self, request: ApplyRequest) -> Result<ApplyReport, ConfigError> {
-        let _guard = self.config_write.lock().await;
-        let paths = self.paths.clone();
-        let current = tokio::task::spawn_blocking(move || config_edit::load(&paths))
-            .await
-            .map_err(|e| ConfigError::Io(e.to_string()))??;
-        if current.etag() != request.expected_etag {
-            return Err(ConfigError::Conflict {
-                current_etag: current.etag(),
-            });
-        }
-        let files = config_edit::parse_files(&request.enabled_yaml, &request.disabled_yaml)?;
-        let (_, _, _, revoked) = config_edit::diff(&current.files, &files);
-        let paths = self.paths.clone();
-        let report = tokio::task::spawn_blocking(move || config_edit::commit(&paths, &files))
-            .await
-            .map_err(|e| ConfigError::Io(e.to_string()))??;
-        let applied = self
-            .reloader
-            .reload_from_disk()
-            .await
-            .map_err(|e| ConfigError::Io(format!("{e:#}")))?;
-        Ok(ApplyReport {
-            applied,
-            generation: self.reloader.generation(),
-            etag: report.etag,
-            backups: report.backups,
-            revoked,
-            warnings: report.warnings,
-        })
+    let metadata = std::fs::metadata(&canonical)
+        .with_context(|| format!("stat {label} script {}", path.display()))?;
+    if !metadata.is_file() {
+        bail!("{label} script {} is not a regular file", path.display());
     }
-
-    async fn active_sessions(&self) -> Vec<SessionInfo> {
-        self.registry
-            .snapshot()
-            .into_iter()
-            .map(|entry| {
-                let stats = entry.stats.snapshot();
-                SessionInfo {
-                    session_id: entry.token,
-                    peer_id: id_hex(&entry.id),
-                    name: entry.cfg.name.clone(),
-                    addr: entry.addr.to_string(),
-                    proto: entry.proto.to_string(),
-                    mode: mode_name(entry.cfg.noise, entry.cfg.encless).to_string(),
-                    mtu: entry.cfg.mtu,
-                    established: rfc3339(stats.established.timestamp()),
-                    started_at_unix: stats.established.timestamp(),
-                    last_ping: rfc3339(stats.last_ping.timestamp()),
-                    last_sent: rfc3339(stats.last_sent.timestamp()),
-                    counters: counters_from(&stats),
-                    rate_in_bps: 0,
-                    rate_out_bps: 0,
-                }
-            })
-            .collect()
+    if metadata.mode() & 0o022 != 0 {
+        bail!(
+            "{label} script {} is writable by group or others",
+            path.display()
+        );
     }
-
-    async fn kick(&self, id: [u8; 16], reason: String) -> Result<KickReport, String> {
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        self.requests
-            .send(MainRequest::Kick {
-                id,
-                reason,
-                reply: tx,
-            })
-            .await
-            .map_err(|_| "server is shutting down".to_string())?;
-        match tokio::time::timeout(Duration::from_secs(5), rx).await {
-            Ok(Ok(result)) => result,
-            Ok(Err(_)) => Err("kick request was cancelled".into()),
-            Err(_) => Err("kick request timed out".into()),
-        }
+    if metadata.uid() != 0 && Some(metadata.uid()) != server_uid {
+        bail!(
+            "{label} script {} is not owned by root or the server user",
+            path.display()
+        );
     }
-
-    async fn list_backups(&self) -> Result<Vec<BackupInfo>, ConfigError> {
-        let paths = self.paths.clone();
-        tokio::task::spawn_blocking(move || config_edit::list_backups(&paths))
-            .await
-            .map_err(|e| ConfigError::Io(e.to_string()))?
-    }
-
-    async fn restore_backup(
-        &self,
-        name: &str,
-        _comment: String,
-    ) -> Result<ApplyReport, ConfigError> {
-        let _guard = self.config_write.lock().await;
-        let paths = self.paths.clone();
-        let name = name.to_string();
-        tokio::task::spawn_blocking(move || config_edit::restore(&paths, &name))
-            .await
-            .map_err(|e| ConfigError::Io(e.to_string()))??;
-        let applied = self
-            .reloader
-            .reload_from_disk()
-            .await
-            .map_err(|e| ConfigError::Io(format!("{e:#}")))?;
-        let paths = self.paths.clone();
-        let current = tokio::task::spawn_blocking(move || config_edit::load(&paths))
-            .await
-            .map_err(|e| ConfigError::Io(e.to_string()))??;
-        Ok(ApplyReport {
-            applied,
-            generation: self.reloader.generation(),
-            etag: current.etag(),
-            backups: Vec::new(),
-            revoked: Vec::new(),
-            warnings: Vec::new(),
-        })
-    }
-
-    fn events(&self) -> Vec<EventView> {
-        self.events.snapshot()
-    }
+    Ok(())
 }
 
 #[derive(Clone)]
@@ -639,8 +553,13 @@ struct ServerContext {
     hs_global: Arc<Mutex<RateLimiter>>,
     tcp_limit: Arc<Semaphore>,
     egd: Arc<String>,
-    #[cfg(feature = "admin")]
-    admin: Option<Arc<AdminRuntime>>,
+    reloader: Arc<Reloader>,
+    metrics: Arc<ServerMetrics>,
+    control: Option<Arc<ControlRuntime>>,
+    instance: u64,
+    bind: String,
+    proto: String,
+    started_at: Instant,
 }
 
 enum MainRequest {
@@ -655,7 +574,6 @@ enum MainRequest {
     ConfigReloaded {
         fingerprints: Vec<([u8; 16], String)>,
     },
-    #[cfg(feature = "admin")]
     Kick {
         id: [u8; 16],
         reason: String,
@@ -672,12 +590,10 @@ enum EndReason {
     Replaced,
     ConfigRevoke,
     Shutdown,
-    #[cfg(feature = "admin")]
     AdminKick,
 }
 
 impl EndReason {
-    #[cfg(feature = "admin")]
     fn as_str(self) -> &'static str {
         match self {
             EndReason::Timeout => "timeout",
@@ -707,64 +623,47 @@ async fn end_session(ctx: &ServerContext, entry: Arc<PeerEntry>, reason: EndReas
         return;
     }
     entry.cancel.cancel();
-    #[cfg(feature = "admin")]
     let snapshot = entry.stats.snapshot();
     ctx.stats.remove(&entry.stats.addr);
-    #[cfg(feature = "admin")]
-    if let Some(admin) = &ctx.admin {
-        admin.history.session_ended(SessionEnd {
+    ctx.metrics
+        .sessions_finished
+        .fetch_add(1, AtomicOrdering::Relaxed);
+    if let Some(control) = &ctx.control {
+        control.session_ended(SessionEnded {
             session_id: entry.token,
-            peer_id: entry.id,
+            peer_id: id_hex(&entry.id),
+            name: entry.cfg.name.clone(),
+            addr: entry.addr.to_string(),
             ended_at: now_unix(),
             reason: reason.as_str().to_string(),
             counters: counters_from(&snapshot),
         });
-        admin.events.push(EventView {
-            ts: now_unix(),
-            kind: "peer_removed".into(),
-            peer: Some(entry.cfg.name.clone()),
-            addr: Some(entry.addr.to_string()),
-            detail: Some(reason.as_str().into()),
-        });
-        admin
-            .metrics
-            .sessions_finished
-            .fetch_add(1, AtomicOrdering::Relaxed);
     }
     if !matches!(reason, EndReason::Replaced) {
         call_down(&entry.cfg.down, entry.tap.name(), &entry.addr.to_string()).await;
     }
 }
 
-#[cfg(feature = "admin")]
 fn notify_session_started(ctx: &ServerContext, entry: &PeerEntry) {
-    if let Some(admin) = &ctx.admin {
-        let stats = entry.stats.snapshot();
-        admin.history.session_started(SessionStart {
+    let stats = entry.stats.snapshot();
+    ctx.metrics
+        .sessions_started
+        .fetch_add(1, AtomicOrdering::Relaxed);
+    if let Some(control) = &ctx.control {
+        control.session_started(SessionStarted {
             session_id: entry.token,
-            peer_id: entry.id,
+            peer_id: id_hex(&entry.id),
             name: entry.cfg.name.clone(),
             addr: entry.addr.to_string(),
             proto: entry.proto.to_string(),
             mode: mode_name(entry.cfg.noise, entry.cfg.encless).to_string(),
+            mtu: entry.cfg.mtu,
             started_at: stats.established.timestamp(),
             counters: counters_from(&stats),
         });
-        admin.events.push(EventView {
-            ts: now_unix(),
-            kind: "peer_created".into(),
-            peer: Some(entry.cfg.name.clone()),
-            addr: Some(entry.addr.to_string()),
-            detail: Some(entry.proto.to_string()),
-        });
-        admin
-            .metrics
-            .sessions_started
-            .fetch_add(1, AtomicOrdering::Relaxed);
     }
 }
 
-#[cfg(feature = "admin")]
 fn counters_from(stats: &PeerStats) -> Counters {
     Counters {
         bytes_in: stats.bytes_in,
@@ -876,7 +775,6 @@ async fn create_udp_peer(
         proto: "udp",
     });
     ctx.registry.insert(entry.clone());
-    #[cfg(feature = "admin")]
     notify_session_started(ctx, &entry);
     eprintln!("peer created: {addr}");
     Ok(())
@@ -1031,13 +929,9 @@ async fn handle_udp_packet(
             // is parsed as msg3 and fails.  Replay the cached server flight
             // so the handshake can resume without a full restart.
             Err(e) => {
-                #[cfg(feature = "admin")]
-                if let Some(admin) = &ctx.admin {
-                    admin
-                        .metrics
-                        .handshake_errors
-                        .fetch_add(1, AtomicOrdering::Relaxed);
-                }
+                ctx.metrics
+                    .handshake_errors
+                    .fetch_add(1, AtomicOrdering::Relaxed);
                 eprintln!("handshake error from {addr}: {e}");
                 if !ph.last_reply.is_empty() {
                     let reply = ph.last_reply.clone();
@@ -1057,13 +951,9 @@ async fn handle_udp_packet(
     let Some(cfg) = cfg else {
         return;
     };
-    #[cfg(feature = "admin")]
-    if let Some(admin) = &ctx.admin {
-        admin
-            .metrics
-            .handshake_requests
-            .fetch_add(1, AtomicOrdering::Relaxed);
-    }
+    ctx.metrics
+        .handshake_requests
+        .fetch_add(1, AtomicOrdering::Relaxed);
     if handshakes.len() >= 4096 {
         return;
     }
@@ -1072,13 +962,9 @@ async fn handle_udp_packet(
     }
     let ip = addr.ip();
     if !ctx.hs_limit.lock().unwrap().allow(ip) || !ctx.hs_global.lock().unwrap().allow_global() {
-        #[cfg(feature = "admin")]
-        if let Some(admin) = &ctx.admin {
-            admin
-                .metrics
-                .handshake_rate_limited
-                .fetch_add(1, AtomicOrdering::Relaxed);
-        }
+        ctx.metrics
+            .handshake_rate_limited
+            .fetch_add(1, AtomicOrdering::Relaxed);
         return;
     }
     let hcfg = match server_handshake_config(&cfg) {
@@ -1116,13 +1002,9 @@ async fn handle_udp_packet(
             );
         }
         Err(e) => {
-            #[cfg(feature = "admin")]
-            if let Some(admin) = &ctx.admin {
-                admin
-                    .metrics
-                    .handshake_errors
-                    .fetch_add(1, AtomicOrdering::Relaxed);
-            }
+            ctx.metrics
+                .handshake_errors
+                .fetch_add(1, AtomicOrdering::Relaxed);
             eprintln!("handshake error from {addr}: {e}")
         }
     }
@@ -1301,7 +1183,6 @@ async fn create_tcp_peer(
         proto: "tcp",
     });
     ctx.registry.insert(entry.clone());
-    #[cfg(feature = "admin")]
     notify_session_started(ctx, &entry);
     eprintln!("peer created: {addr}");
     Ok(())
@@ -1312,13 +1193,9 @@ async fn tcp_listener_loop(listener: TcpListener, ctx: ServerContext) {
         match listener.accept().await {
             Ok((stream, _)) => {
                 let Ok(permit) = ctx.tcp_limit.clone().try_acquire_owned() else {
-                    #[cfg(feature = "admin")]
-                    if let Some(admin) = &ctx.admin {
-                        admin
-                            .metrics
-                            .tcp_connections_rejected
-                            .fetch_add(1, AtomicOrdering::Relaxed);
-                    }
+                    ctx.metrics
+                        .tcp_connections_rejected
+                        .fetch_add(1, AtomicOrdering::Relaxed);
                     eprintln!("tcp connection limit reached, dropping {stream:?}");
                     continue;
                 };
@@ -1326,13 +1203,9 @@ async fn tcp_listener_loop(listener: TcpListener, ctx: ServerContext) {
                 tokio::spawn(async move {
                     let _permit = permit;
                     if let Err(e) = handle_tcp_conn(stream, ctx.clone()).await {
-                        #[cfg(feature = "admin")]
-                        if let Some(admin) = &ctx.admin {
-                            admin
-                                .metrics
-                                .handshake_errors
-                                .fetch_add(1, AtomicOrdering::Relaxed);
-                        }
+                        ctx.metrics
+                            .handshake_errors
+                            .fetch_add(1, AtomicOrdering::Relaxed);
                         eprintln!("tcp handshake failed: {e:#}");
                     }
                 });
@@ -1409,130 +1282,35 @@ fn main() {
     }
 }
 
-#[cfg(feature = "admin")]
-async fn start_admin(
-    args: &Args,
-    registry: Arc<Registry>,
-    configs: ConfigStore,
-    requests: mpsc::Sender<MainRequest>,
-    reloader: Arc<Reloader>,
-) -> Result<Option<Arc<AdminRuntime>>> {
-    if args.admin.is_empty() {
-        return Ok(None);
-    }
-    let db_path = PathBuf::from(&args.admin_db);
-    let store = match Store::open(&db_path) {
-        Ok(store) => Arc::new(store),
-        Err(error) => {
-            eprintln!("admin disabled: {error}");
-            return Ok(None);
-        }
-    };
-    match store.admin_count() {
-        Ok(0) => {
-            eprintln!(
-                "admin disabled: no admin user in {}; run: rustvpn-admin-passwd -db {}",
-                db_path.display(),
-                db_path.display()
-            );
-            return Ok(None);
-        }
-        Ok(_) => {}
-        Err(error) => {
-            eprintln!("admin disabled: {error}");
-            return Ok(None);
-        }
-    }
-    let disabled_path = if args.admin_disabled_conf.is_empty() {
-        let conf = PathBuf::from(&args.conf);
-        conf.parent()
-            .unwrap_or_else(|| std::path::Path::new("."))
-            .join("peers.disabled.yaml")
-    } else {
-        PathBuf::from(&args.admin_disabled_conf)
-    };
-    let backup_dir = db_path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or_else(|| std::path::Path::new("."))
-        .join("backups");
-    let paths = ConfigPaths {
-        enabled: PathBuf::from(&args.conf),
-        disabled: disabled_path,
-        backup_dir,
-    };
-    let history = History::spawn(store.clone());
-    let events = Arc::new(EventLog::new(2000));
-    let metrics = Arc::new(AdminMetrics::default());
-    let backend = Arc::new(ServerBackend {
-        registry,
-        configs,
-        requests,
-        reloader,
-        paths,
-        events: events.clone(),
-        metrics: metrics.clone(),
-        config_write: tokio::sync::Mutex::new(()),
-        bind: args.bind.clone(),
-        proto: args.proto.clone(),
-        admin_addr: args.admin.clone(),
-        started_at: SystemTime::now(),
-    });
-    let options = AdminOptions {
-        secure_cookies: args.admin_cookie_secure,
-        script_dirs: args.admin_script_dir.iter().map(PathBuf::from).collect(),
-    };
-    let state = AdminState::new(backend, store, history.clone(), options);
-    let listener = TcpListener::bind(&args.admin)
-        .await
-        .with_context(|| format!("bind admin {}", args.admin))?;
-    eprintln!("Listening on admin: {}", args.admin);
-    if !is_loopback_bind(&args.admin) {
-        eprintln!("warning: admin endpoint is not bound to loopback; use TLS and a firewall");
-    }
-    tokio::spawn(async move {
-        if let Err(error) = rustvpn_admin::serve(listener, state).await {
-            eprintln!("admin server failed: {error:#}");
-        }
-    });
-    Ok(Some(Arc::new(AdminRuntime {
-        history,
-        events,
-        metrics,
-    })))
-}
-
-#[cfg(feature = "admin")]
-fn is_loopback_bind(addr: &str) -> bool {
-    let host = addr
-        .rsplit_once(':')
-        .map(|(host, _)| host)
-        .unwrap_or(addr)
-        .trim_start_matches('[')
-        .trim_end_matches(']');
-    host == "127.0.0.1" || host == "::1" || host == "localhost"
-}
-
 async fn run(args: Args) -> Result<()> {
     if args.proto != "udp" && args.proto != "tcp" && args.proto != "all" {
         return Err(anyhow!("Unknown protocol specified"));
     }
-    #[cfg(not(feature = "admin"))]
-    {
-        if !args.admin.is_empty() {
-            return Err(anyhow!(
-                "admin support is not compiled in; rebuild with --features admin"
-            ));
-        }
-        let _ = (
-            &args.admin_db,
-            &args.admin_disabled_conf,
-            args.admin_cookie_secure,
-            &args.admin_script_dir,
-        );
-    }
     let conf_path = PathBuf::from(&args.conf);
     let set = ConfigSet::from_file(&conf_path)?;
+    let script_dirs: Vec<PathBuf> = args.script_dir.iter().map(PathBuf::from).collect();
+    validate_script_paths(&set, &script_dirs)?;
+
+    // Session identifiers must not collide across server restarts: the admin
+    // history database keys sessions by this value.  Start the process-local
+    // counter at a random 64-bit base and expose it as `server_instance`.
+    let instance = {
+        let mut rng = OsRng;
+        let value = rng.next_u64();
+        if value == 0 {
+            1
+        } else {
+            value
+        }
+    };
+    NEXT_PEER_TOKEN.store(instance, AtomicOrdering::Relaxed);
+    let metrics = Arc::new(ServerMetrics::default());
+    let control = if args.control.is_empty() {
+        None
+    } else {
+        Some(ControlRuntime::new())
+    };
+
     let configs: ConfigStore = Arc::new(RwLock::new(set));
     let registry = Arc::new(Registry::default());
     let stats = StatsState::new();
@@ -1546,17 +1324,9 @@ async fn run(args: Args) -> Result<()> {
         requests_tx.clone(),
         initial_bytes,
         1,
+        script_dirs,
+        control.as_ref().map(|runtime| runtime.sender()),
     ));
-
-    #[cfg(feature = "admin")]
-    let admin_runtime = start_admin(
-        &args,
-        registry.clone(),
-        configs.clone(),
-        requests_tx.clone(),
-        reloader.clone(),
-    )
-    .await?;
 
     let ctx = ServerContext {
         registry: registry.clone(),
@@ -1569,9 +1339,18 @@ async fn run(args: Args) -> Result<()> {
         hs_global: Arc::new(Mutex::new(RateLimiter::new(200.0, 400.0))),
         tcp_limit: Arc::new(Semaphore::new(512)),
         egd: egd.clone(),
-        #[cfg(feature = "admin")]
-        admin: admin_runtime.clone(),
+        reloader: reloader.clone(),
+        metrics: metrics.clone(),
+        control: control.clone(),
+        instance,
+        bind: args.bind.clone(),
+        proto: args.proto.clone(),
+        started_at: Instant::now(),
     };
+
+    if !args.control.is_empty() {
+        start_control(&args.control, &args.control_group, ctx.clone()).await?;
+    }
 
     if !args.stats.is_empty() {
         let listener = TcpListener::bind(&args.stats).await?;
@@ -1653,7 +1432,6 @@ async fn run(args: Args) -> Result<()> {
                             }
                         }
                     }
-                    #[cfg(feature = "admin")]
                     Some(MainRequest::Kick { id, reason, reply }) => {
                         let result = match registry.addr_by_id(&id) {
                             Some(addr) => match registry.get(&addr) {
@@ -1682,7 +1460,346 @@ async fn run(args: Args) -> Result<()> {
     for entry in registry.snapshot() {
         end_session(&ctx, entry, EndReason::Shutdown).await;
     }
+    if let Some(control) = &ctx.control {
+        control.shutdown();
+    }
     Ok(())
+}
+
+async fn start_control(path: &str, group: &str, ctx: ServerContext) -> Result<()> {
+    let socket_path = Path::new(path);
+    if let Some(parent) = socket_path.parent() {
+        if !parent.as_os_str().is_empty() && !parent.is_dir() {
+            bail!(
+                "control socket directory {} does not exist",
+                parent.display()
+            );
+        }
+    }
+    match std::fs::symlink_metadata(socket_path) {
+        Ok(metadata) => {
+            if !metadata.file_type().is_socket() {
+                bail!(
+                    "control path {} exists and is not a socket",
+                    socket_path.display()
+                );
+            }
+            match UnixStream::connect(socket_path).await {
+                Ok(_) => bail!("control socket {} is already in use", socket_path.display()),
+                Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => {
+                    std::fs::remove_file(socket_path).with_context(|| {
+                        format!("remove stale control socket {}", socket_path.display())
+                    })?;
+                }
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("probe control socket {}", socket_path.display()))
+                }
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("inspect control socket {}", socket_path.display()))
+        }
+    }
+    let listener = UnixListener::bind(socket_path)
+        .with_context(|| format!("bind control socket {}", socket_path.display()))?;
+    let gid = if group.is_empty() {
+        None
+    } else {
+        Some(resolve_gid(group)?)
+    };
+    let mode = if gid.is_some() { 0o660 } else { 0o600 };
+    std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(mode))
+        .with_context(|| format!("chmod control socket {}", socket_path.display()))?;
+    if let Some(gid) = gid {
+        std::os::unix::fs::chown(socket_path, None, Some(gid))
+            .with_context(|| format!("chown control socket {}", socket_path.display()))?;
+    }
+    eprintln!(
+        "Listening on control: {} (mode {:o}{})",
+        socket_path.display(),
+        mode,
+        if gid.is_some() {
+            ", group-restricted"
+        } else {
+            ""
+        }
+    );
+    tokio::spawn(async move {
+        control_accept_loop(listener, ctx, gid).await;
+    });
+    Ok(())
+}
+
+fn resolve_gid(name: &str) -> Result<u32> {
+    // Local groups only; keep this dependency-free and free of unsafe libc
+    // calls.  NSS/LDAP-only groups can use the numeric form if needed.
+    if let Ok(gid) = name.parse::<u32>() {
+        return Ok(gid);
+    }
+    let groups = std::fs::read_to_string("/etc/group")
+        .with_context(|| "read /etc/group to resolve -control-group")?;
+    for line in groups.lines() {
+        let mut fields = line.split(':');
+        if fields.next() == Some(name) {
+            let _password = fields.next();
+            if let Some(gid) = fields.next() {
+                return gid
+                    .parse()
+                    .with_context(|| format!("invalid gid for group {name}"));
+            }
+        }
+    }
+    bail!("control group {name} not found in /etc/group")
+}
+
+fn control_peer_allowed(stream: &UnixStream, gid: Option<u32>) -> bool {
+    let Ok(cred) = stream.peer_cred() else {
+        return false;
+    };
+    if cred.uid() == 0 {
+        return true;
+    }
+    match gid {
+        Some(gid) => cred.gid() == gid,
+        None => server_euid().is_some_and(|uid| cred.uid() == uid),
+    }
+}
+
+async fn control_accept_loop(listener: UnixListener, ctx: ServerContext, gid: Option<u32>) {
+    let limit = Arc::new(Semaphore::new(8));
+    loop {
+        match listener.accept().await {
+            Ok((stream, _)) => {
+                if !control_peer_allowed(&stream, gid) {
+                    eprintln!("control: rejected unauthorized peer");
+                    continue;
+                }
+                let Ok(permit) = limit.clone().try_acquire_owned() else {
+                    eprintln!("control: too many connections, dropping client");
+                    continue;
+                };
+                let ctx = ctx.clone();
+                tokio::spawn(async move {
+                    let _permit = permit;
+                    if let Err(error) = handle_control_connection(stream, ctx).await {
+                        eprintln!("control client failed: {error:#}");
+                    }
+                });
+            }
+            Err(error) => {
+                eprintln!("control accept failed: {error}");
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        }
+    }
+}
+
+async fn handle_control_connection(mut stream: UnixStream, ctx: ServerContext) -> Result<()> {
+    let Some(hello) = read_frame::<_, Request>(&mut stream).await? else {
+        return Ok(());
+    };
+    match hello {
+        Request::Hello { version } if version == PROTOCOL_VERSION => {
+            write_frame(
+                &mut stream,
+                &Response::Hello {
+                    version: PROTOCOL_VERSION,
+                    server_version: env!("CARGO_PKG_VERSION").to_string(),
+                    server_instance: ctx.instance,
+                },
+            )
+            .await?;
+        }
+        Request::Hello { version } => {
+            let _ = write_frame(
+                &mut stream,
+                &Response::Error {
+                    message: format!(
+                        "control protocol mismatch: client v{version}, server v{PROTOCOL_VERSION}"
+                    ),
+                },
+            )
+            .await;
+            return Ok(());
+        }
+        _ => {
+            let _ = write_frame(
+                &mut stream,
+                &Response::Error {
+                    message: "control handshake required".to_string(),
+                },
+            )
+            .await;
+            return Ok(());
+        }
+    }
+
+    loop {
+        let Some(request) = read_frame::<_, Request>(&mut stream).await? else {
+            return Ok(());
+        };
+        match request {
+            Request::Hello { .. } => {
+                write_frame(
+                    &mut stream,
+                    &Response::Error {
+                        message: "control session already initialized".to_string(),
+                    },
+                )
+                .await?;
+            }
+            Request::Status => {
+                write_frame(
+                    &mut stream,
+                    &Response::Status {
+                        status: control_status(&ctx).await,
+                    },
+                )
+                .await?;
+            }
+            Request::Sessions => {
+                write_frame(
+                    &mut stream,
+                    &Response::Sessions {
+                        sessions: control_sessions(&ctx),
+                    },
+                )
+                .await?;
+            }
+            Request::Kick { id, reason } => {
+                let response = match control_kick(&ctx, &id, &reason).await {
+                    Ok(report) => Response::Kick { report },
+                    Err(message) => Response::Error { message },
+                };
+                write_frame(&mut stream, &response).await?;
+            }
+            Request::Reload => {
+                let response = match ctx.reloader.reload_from_disk().await {
+                    Ok(applied) => Response::Reload {
+                        report: ReloadReport {
+                            applied,
+                            generation: ctx.reloader.generation(),
+                        },
+                    },
+                    Err(error) => Response::Error {
+                        message: format!("{error:#}"),
+                    },
+                };
+                write_frame(&mut stream, &response).await?;
+            }
+            Request::RecentSessions { limit } => {
+                let limit = (limit as usize).clamp(1, RECENT_SESSIONS_CAPACITY);
+                let sessions = ctx
+                    .control
+                    .as_ref()
+                    .map(|control| control.recent(limit))
+                    .unwrap_or_default();
+                write_frame(&mut stream, &Response::RecentSessions { sessions }).await?;
+            }
+            Request::Subscribe => {
+                let Some(control) = &ctx.control else {
+                    write_frame(
+                        &mut stream,
+                        &Response::Error {
+                            message: "control plane is not available".to_string(),
+                        },
+                    )
+                    .await?;
+                    return Ok(());
+                };
+                let mut events = control.events.subscribe();
+                write_frame(&mut stream, &Response::Subscribed).await?;
+                loop {
+                    match events.recv().await {
+                        Ok(event) => {
+                            if write_frame(&mut stream, &event).await.is_err() {
+                                return Ok(());
+                            }
+                        }
+                        Err(broadcast::error::RecvError::Lagged(missed)) => {
+                            let event = Event::Lagged { missed };
+                            if write_frame(&mut stream, &event).await.is_err() {
+                                return Ok(());
+                            }
+                        }
+                        Err(broadcast::error::RecvError::Closed) => return Ok(()),
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn control_status(ctx: &ServerContext) -> ServerStatus {
+    let configured_peers = ctx.configs.read().await.peers.len();
+    let last_loaded = ctx
+        .reloader
+        .last_loaded()
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map(|elapsed| rfc3339(elapsed.as_secs() as i64));
+    ServerStatus {
+        server_version: env!("CARGO_PKG_VERSION").to_string(),
+        server_instance: ctx.instance,
+        uptime_seconds: ctx.started_at.elapsed().as_secs(),
+        bind: ctx.bind.clone(),
+        proto: ctx.proto.clone(),
+        active_sessions: ctx.registry.snapshot().len(),
+        configured_peers,
+        config_generation: ctx.reloader.generation(),
+        config_last_loaded_at: last_loaded,
+        config_last_error: ctx.reloader.last_error(),
+        counters: ctx.metrics.snapshot(),
+    }
+}
+
+fn control_sessions(ctx: &ServerContext) -> Vec<SessionInfo> {
+    ctx.registry
+        .snapshot()
+        .into_iter()
+        .map(|entry| {
+            let stats = entry.stats.snapshot();
+            SessionInfo {
+                session_id: entry.token,
+                peer_id: id_hex(&entry.id),
+                name: entry.cfg.name.clone(),
+                addr: entry.addr.to_string(),
+                proto: entry.proto.to_string(),
+                mode: mode_name(entry.cfg.noise, entry.cfg.encless).to_string(),
+                mtu: entry.cfg.mtu,
+                established: rfc3339(stats.established.timestamp()),
+                started_at_unix: stats.established.timestamp(),
+                last_ping: rfc3339(stats.last_ping.timestamp()),
+                last_sent: rfc3339(stats.last_sent.timestamp()),
+                counters: counters_from(&stats),
+            }
+        })
+        .collect()
+}
+
+async fn control_kick(ctx: &ServerContext, id: &str, reason: &str) -> Result<KickReport, String> {
+    let bytes = hex::decode(id).map_err(|_| "peer id must be 32 hex characters".to_string())?;
+    if bytes.len() != 16 {
+        return Err("peer id must be 32 hex characters".to_string());
+    }
+    let mut peer_id = [0u8; 16];
+    peer_id.copy_from_slice(&bytes);
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    ctx.requests
+        .send(MainRequest::Kick {
+            id: peer_id,
+            reason: reason.to_string(),
+            reply: reply_tx,
+        })
+        .await
+        .map_err(|_| "server is shutting down".to_string())?;
+    match tokio::time::timeout(Duration::from_secs(5), reply_rx).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(_)) => Err("kick request was cancelled".to_string()),
+        Err(_) => Err("kick request timed out".to_string()),
+    }
 }
 
 async fn wait_signal() {
@@ -1698,5 +1815,57 @@ async fn wait_signal() {
     #[cfg(not(unix))]
     {
         let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn script(dir: &Path, mode: u32) -> PathBuf {
+        let path = dir.join("hook.sh");
+        std::fs::write(&path, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+        path
+    }
+
+    #[test]
+    fn accepts_script_in_allowed_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let allowed = dir.path().canonicalize().unwrap();
+        let path = script(dir.path(), 0o755);
+        let uid = server_euid();
+        assert!(validate_script_path("up", &path, &[allowed], uid).is_ok());
+    }
+
+    #[test]
+    fn rejects_group_writable_script() {
+        let dir = tempfile::tempdir().unwrap();
+        let allowed = dir.path().canonicalize().unwrap();
+        let path = script(dir.path(), 0o775);
+        let uid = server_euid();
+        let error = validate_script_path("up", &path, &[allowed], uid).unwrap_err();
+        assert!(error.to_string().contains("writable by group or others"));
+    }
+
+    #[test]
+    fn rejects_script_outside_allowed_directories() {
+        let allowed_dir = tempfile::tempdir().unwrap();
+        let other_dir = tempfile::tempdir().unwrap();
+        let allowed = allowed_dir.path().canonicalize().unwrap();
+        let path = script(other_dir.path(), 0o755);
+        let uid = server_euid();
+        let error = validate_script_path("up", &path, &[allowed], uid).unwrap_err();
+        assert!(error.to_string().contains("outside the allowed"));
+    }
+
+    #[test]
+    fn rejects_directory_as_script() {
+        let dir = tempfile::tempdir().unwrap();
+        let allowed = dir.path().canonicalize().unwrap();
+        let uid = server_euid();
+        let error = validate_script_path("up", dir.path(), &[allowed], uid).unwrap_err();
+        assert!(error.to_string().contains("not a regular file"));
     }
 }

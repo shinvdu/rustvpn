@@ -1,4 +1,4 @@
-//! Create or reset an admin account for `rustvpn-server -admin`.
+//! Create or reset an admin account for `rustvpn-admind`.
 
 use std::env;
 use std::path::PathBuf;

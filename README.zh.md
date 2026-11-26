@@ -15,7 +15,7 @@ RustVPN 是从零开始用 Rust 实现的 GoVPN 5.7 协议。它不是一套新�
 - **无加密模式（encless）** —— 通过 AONT + Chaffing-and-Winnowing，在不使用加密函数的情况下提供机密性（客户端仅支持 TCP）。
 - **运维对等** —— 相同的 CLI 标志与默认值，相同的 `peers.yaml` 格式与 60 秒热重载，相同的 `up`/`down` 脚本环境，相同的 JSON 统计字段，相同的 UDP/TCP/HTTP-CONNECT 代理行为。
 - **性能优化** —— 稳态零分配编解码器，`recvmmsg`/`sendmmsg` 批量处理，带 epoll 回退的 io_uring TAP 后端，以及支持运行时分派的 AVX2 Salsa20 后端。
-- **可选管理端** —— `--features admin` 构建后可用 Web UI 查看客户端与流量、增删改/禁用/轮换/踢下线，并安全管理 `peers.yaml`；默认构建不受影响。
+- **可选管理端** —— 独立进程 `rustvpn-admind` 提供 Web UI，查看客户端与流量、增删改/禁用/轮换/踢下线，并安全管理 `peers.yaml`；它通过本地控制 socket 与 `rustvpn-server` 协作，默认构建不受影响。
 
 ## 状态
 

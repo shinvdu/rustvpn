@@ -1,0 +1,28 @@
+[Unit]
+Description=RustVPN server
+Documentation=file:///usr/share/doc/rustvpn/admin-web-ui.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=rustvpn
+Group=rustvpn-adm
+SupplementaryGroups=rustvpn
+RuntimeDirectory=rustvpn
+RuntimeDirectoryMode=0750
+ExecStart=/usr/local/bin/rustvpn-server -proto all -bind 0.0.0.0:1194 \
+    -conf /etc/rustvpn/peers.yaml \
+    -stats 127.0.0.1:1294 \
+    -control /run/rustvpn/control.sock \
+    -control-group rustvpn-adm \
+    -script-dir /etc/rustvpn/scripts
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW
+NoNewPrivileges=yes
+ProtectSystem=full
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

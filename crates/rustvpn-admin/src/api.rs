@@ -1752,6 +1752,8 @@ mod tests {
                     etag: "test-etag".into(),
                 },
                 counters: ServerCounters::default(),
+                server_online: true,
+                server_instance: Some(1),
             }
         }
 

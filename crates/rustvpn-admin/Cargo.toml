@@ -6,6 +6,10 @@ rust-version.workspace = true
 license.workspace = true
 
 [[bin]]
+name = "rustvpn-admind"
+path = "src/bin/rustvpn-admind.rs"
+
+[[bin]]
 name = "rustvpn-admin-passwd"
 path = "src/bin/rustvpn-admin-passwd.rs"
 
@@ -13,6 +17,7 @@ path = "src/bin/rustvpn-admin-passwd.rs"
 rustvpn-crypto = { path = "../rustvpn-crypto" }
 rustvpn-net = { path = "../rustvpn-net" }
 rustvpn-proto = { path = "../rustvpn-proto" }
+rustvpn-control = { path = "../rustvpn-control" }
 axum = "0.8"
 rust-embed = "8"
 async-trait = "0.1"

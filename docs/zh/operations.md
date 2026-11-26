@@ -203,26 +203,35 @@ ssh root@server 'curl -s 127.0.0.1:1294/ | jq .'
 
 ## 管理端 Web UI（可选）
 
-管理端通过 `--features admin` 编译进 `rustvpn-server`，不启用时默认构建与 GoVPN 部署完全一致：
+管理端是独立进程 `rustvpn-admind`，通过本地控制 socket 控制 `rustvpn-server`；不启用时 server 与 GoVPN 部署完全一致：
 
 ```bash
-cargo build --release -p rustvpn-server --features admin
-cargo build --release -p rustvpn-admin --bin rustvpn-admin-passwd
+cargo build --release -p rustvpn-server
+cargo build --release -p rustvpn-admin --bins
 sudo rustvpn-admin-passwd -db /var/lib/rustvpn/admin.db -user admin
 ```
 
-启动时增加：
+启动时给 server 增加控制 socket：
 
 ```bash
--admin 127.0.0.1:8080 -admin-db /var/lib/rustvpn/admin.db
+-control /run/rustvpn/control.sock -control-group rustvpn-adm \
+-script-dir /etc/rustvpn/scripts
+```
+
+再启动管理端：
+
+```bash
+rustvpn-admind -listen 127.0.0.1:8080 -control /run/rustvpn/control.sock \
+    -db /var/lib/rustvpn/admin.db -conf /etc/rustvpn/peers.yaml
 ```
 
 要点：
 
-- 默认只绑回环；远程访问用 SSH 隧道或 TLS 反代，并在启用了 TLS 时加 `-admin-cookie-secure`。
-- 管理端要写 `peers.yaml`/备份，unit 需允许 `ReadWritePaths=/etc/rustvpn /var/lib/rustvpn`，目录组可写（见[管理端文档](../admin-web-ui.md)）。
-- 管理端可禁用/轮换/踢下线，但**不能编辑 `up`/`down` 脚本内容**；脚本仍以服务权限执行。
-- 详细用法、API、统计口径与限制见 [`admin-web-ui.md`](../admin-web-ui.md)。
+- `rustvpn-admind` 不需要 `CAP_NET_ADMIN`，以独立用户运行；踢线/立即重载经控制命令完成。
+- 默认只绑回环；远程访问用 SSH 隧道或 TLS 反代，并在启用了 TLS 时加 `-cookie-secure`。
+- 管理端要写 `peers.yaml`/备份，unit 需允许 `ReadWritePaths=/etc/rustvpn /var/lib/rustvpn`，目录组可写；脚本目录必须 root 所有且管理组不可写（见[管理端文档](../admin-web-ui.md)）。
+- 管理端可禁用/轮换/踢下线，但**不能编辑 `up`/`down` 脚本内容**；server 侧 `-script-dir` 是最终校验。
+- 详细用法、权限、API、统计口径与限制见 [`admin-web-ui.md`](../admin-web-ui.md)。
 
 <a id="passphrase-rotation"></a>
 ## 口令轮换

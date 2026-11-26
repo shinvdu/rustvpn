@@ -1,0 +1,28 @@
+[Unit]
+Description=RustVPN admin daemon
+Documentation=file:///usr/share/doc/rustvpn/admin-web-ui.md
+After=rustvpn-server.service
+Wants=rustvpn-server.service
+
+[Service]
+Type=simple
+User=rustvpn-admin
+Group=rustvpn-adm
+StateDirectory=rustvpn
+StateDirectoryMode=0750
+ExecStart=/usr/local/bin/rustvpn-admind -listen 127.0.0.1:8080 \
+    -control /run/rustvpn/control.sock \
+    -db /var/lib/rustvpn/admin.db \
+    -conf /etc/rustvpn/peers.yaml \
+    -disabled-conf /etc/rustvpn/peers.disabled.yaml \
+    -backup-dir /var/lib/rustvpn/backups \
+    -script-dir /etc/rustvpn/scripts
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadWritePaths=/etc/rustvpn /var/lib/rustvpn
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target

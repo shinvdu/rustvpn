@@ -3,8 +3,10 @@
 > 日期：2026-11-26
 > 对象：`~/rustvpn`（GoVPN 5.7 线兼容 Rust 实现）
 > 目标：为服务端增加管理端 Web UI，支持查看客户端、流量统计、客户端管理及必要的运维能力
-> 方式：只读分析现有代码 + 方案调研；本文不修改代码
+> 方式：设计调研 + 实现记录（0.1 为早期内嵌原型，0.2/0.3 为最终独立进程架构与实现状态）
 > 依赖版本：2026-11-26 通过 crates.io 查询（axum 0.8.9、tower-http 0.7.1、rust-embed 8.14.0、rusqlite 0.43.0、tokio-rusqlite 0.10.0、redb 5.0.0、totp-rs 6.0.0）
+>
+> **最终架构（2026-11-26）**：服务端与管理端拆分为独立进程（`rustvpn-server` + `rustvpn-admind`，本地控制 socket）。0 节的“内嵌”结论是历史分析；0.2 是目标架构，0.3 是已完成实现的状态与偏差。
 
 ---
 
@@ -40,6 +42,208 @@ MVP 已在分支 `feature/admin-web-ui` 落地，使用说明见 [`admin-web-ui.
 - 为消除并行测试下的脚本超时抖动，`run_script` 的**测试专用**超时从 300ms 调整为 2s（生产仍为 10s）。
 
 已实现：feature 门控、Argon2id 登录 + 会话 + CSRF + 登录限速、客户端/会话列表、10 秒采样与 1h/24h/7d/30d 图表、会话历史、终身/月度用量、新增/编辑/禁用/启用/删除/轮换/踢下线、配置预览/应用/备份/恢复、审计、SSE、Prometheus、健康检查、systemd/反代文档、API 与配置写入测试、musl admin 构建检查。
+
+**已知正确性问题（已修复，见 0.3）**：`NEXT_PEER_TOKEN` 原是进程内计数器，每次 server 启动从 1 开始；SQLite 的 `session` 表以 `session_id = token` 为主键。server 重启后新会话会与历史行撞号，导致 `INSERT OR IGNORE` 丢会话、`UPDATE ... WHERE session_id` 改到旧行。现在每次启动生成随机 64 位 `server_instance` 并作为 token 基数，既避免撞号又无需改 schema。
+
+---
+
+## 0.2 架构修订：服务端也拆分为独立管理进程（2026-11-26）
+
+> **本节取代 §2.1 中“内嵌 A 作为最终形态”的结论。** 新约束：服务端命令行程序与管理端程序也要像客户端一样**彼此独立**，只共享库。当前分支已完成拆分，实现状态见 0.3 节。
+
+### 结论
+
+采用 §2.1 的方案 C，但把它作为**正式架构**而不是“以后再说”的演进方向：
+
+```text
+rustvpn-server（数据面 + 可选本地控制 socket）
+        │  /run/rustvpn/control.sock
+        │  JSON-RPC + SO_PEERCRED
+rustvpn-admind（HTTP UI + SQLite + 采样 + 审计）
+        │
+        └── Caddy/Nginx / SSH 隧道
+```
+
+- `rustvpn-server`：现有 CLI、数据面、`/stats` 完全不变；**不再链接 axum/rusqlite/rust-embed**，只增加一个轻量控制面（无 HTTP）。
+- `rustvpn-admind`（名称暂定，也可继续叫 `rustvpn-admin`）：独立二进制/服务，承载管理 API、内嵌 UI、管理员认证、SQLite 历史/审计、配置校验与备份。
+- 共享库：`rustvpn-crypto`、`rustvpn-proto`、`rustvpn-net`（`ConfigSet`/`StatsState`/`PeerStats`），新增 `rustvpn-control`（协议 DTO + 客户端/服务端骨架）。
+- **即时踢线与立即生效仍然成立**：管理端通过 `kick`、`reload` 控制命令，服务端在主循环里走同一个 `end_session()` 路径，不需要 60 秒轮询。
+- 服务端可以在完全没有管理端的情况下独立运行；管理端可以在服务端离线时降级为“配置/历史查看”，恢复后自动重连。
+
+### 为什么改
+
+1. **权限边界**：server 带 `CAP_NET_ADMIN`；HTTP 解析器、静态资源、SQLite、管理员口令哈希不应进入这个进程。拆开后，管理端被攻破不等于拿到数据面能力。
+2. **独立升级/重启**：管理端崩溃或升级不影响隧道；服务端升级不需要重建管理端 UI/DB；两者只受控制协议版本约束。
+3. **管理端可降权**：`rustvpn-admind` 以独立用户运行，不需要任何 capability；只有写配置目录和 SQLite 的权限。
+4. **与客户端一致**：CLI + daemon + GUI 的分层在服务端复现为“server + admind + browser/UI”，理解和维护成本更低。
+5. **为多服务器留口**：控制协议是本地 socket，未来管理端可以同时连接多台 server（中央看板），内嵌方案做不到。
+6. **默认构建更接近 GoVPN**：普通 `rustvpn-server` 不引入任何管理端依赖。
+
+代价：多一个进程、一条本地协议、两个 systemd unit；需要处理事件缓冲、版本协商、权限模型。相对收益明确。
+
+### 控制面设计
+
+- 路径：`/run/rustvpn/control.sock`，`-control PATH` 启用（默认关闭，保持现有运行行为）；管理端 `-control PATH` 连接。
+- 传输：Unix domain socket；4 字节大端长度 + JSON，单条 ≤ 1 MiB；不做 HTTP。
+- 认证：`SO_PEERCRED` 校验 uid/gid（只允许 `rustvpn-admin` 用户或 `rustvpn-adm` 组）；socket 模式 `0660`，属组 `rustvpn-adm`。**不监听 TCP**。
+- 命令（草案）：
+
+```text
+hello {version}                  -> {version, caps, server_version}
+status                           -> {uptime, bind, proto, config_generation,
+                                     last_loaded_at, last_error, counts, counters}
+sessions                         -> [{id, token, addr, since, counters, mode, ...}]
+kick {id, reason}                -> {kicked: n}        // 幂等；无会话返回 0
+reload                           -> {generation}       // 触发 Reloader，立即生效
+recent_sessions {limit}           -> [{token, id, ended_at, reason, counters}]
+subscribe                        -> 事件流（见下）
+```
+
+- 事件：`session_started`、`session_ended`（含最终计数与原因）、`config_reloaded`、`handshake_rate_limited`/`handshake_errors`、`server_shutdown`。
+- 服务端维护一个有界环形缓冲（如最近 1024 条结束事件）；管理端断线重连时先拉 `sessions` + `recent_sessions` 对账，再继续订阅。管理端停机超过环容量时会丢历史，文档需说明。
+- **不提供** `write_config`/`shutdown` 命令：配置仍由管理端校验后原子写文件，server 只负责读取 + `reload`；启停交给 systemd。
+- 版本：`hello` 协商 major/minor；不兼容时管理端拒绝启动并给出明确错误，不做静默降级。
+
+### 服务端改动
+
+- 删除 `ServerBackend`、`AdminRuntime`、`AdminMetrics` 中的管理端耦合；把 `#[cfg(feature = "admin")]` 的会话钩子替换为轻量 `ControlObserver`：
+  - `end_session()` 仍集中抓最终计数（现有改造保留），改为把 `SessionEnd` 推给控制面；
+  - `notify_session_started` 同样推事件；
+  - `Reloader` 的 generation/last_loaded/last_error 改为控制面可查询。
+- `MainRequest::Kick` 从 admin feature 移到常驻控制面；`EndReason::AdminKick` 保留（审计语义）或改名 `ControlKick`。
+- 全局计数器（握手请求/限流/错误/会话数）改为常驻 `ServerMetrics`（几个原子变量，开销可忽略），通过 `status` 暴露；不再依赖 admin feature。
+- `Cargo.toml`：移除 `rustvpn-admin`、`async-trait` 可选依赖；新增 `rustvpn-control`；**不引入 axum/rusqlite/rust-embed**。
+- 新增标志：
+  - `-control PATH`：启用控制 socket；
+  - `-control-group GROUP`（可选）：socket 属组；
+  - `-script-dir PATH`（可重复）：**服务端侧**的 up/down 脚本允许目录；与旧 `-admin-script-dir` 语义相同，但由 server 强制执行（见安全）。
+- 删除 `-admin`、`-admin-db`、`-admin-disabled-conf`、`-admin-cookie-secure`、`-admin-script-dir`；这些迁移到管理端。
+
+### 管理端改动
+
+- 新增 `rustvpn-admind` 二进制（当前 crate 可保留为 lib + bins），标志：
+  - `-listen 127.0.0.1:8080`
+  - `-control /run/rustvpn/control.sock`
+  - `-db /var/lib/rustvpn/admin.db`
+  - `-conf /etc/rustvpn/peers.yaml`
+  - `-disabled-conf /etc/rustvpn/peers.disabled.yaml`
+  - `-backup-dir /var/lib/rustvpn/backups`
+  - `-cookie-secure`
+- `AdminBackend` 保留，但实现从 `ServerBackend` 换成 `ControlBackend`：
+  - `system_status`/`sessions`/`kick` 走控制协议；
+  - 配置读取/预览/写入/备份仍在管理端本地完成（复用 `config_edit` 与 `ConfigSet`）；
+  - `apply_config` 写盘后调用 `reload`；控制面离线时返回“已写入，等待 server 重载（≤60s）”，UI 显示 pending。
+- `history` 采样器改造：
+  - 每 10 秒通过 `sessions` 拉取活动会话（含计数）计算速率；
+  - 订阅 `session_started`/`session_ended` 获取会话边界与最终计数；
+  - 启动/重连时用 `sessions` + `recent_sessions` 对账，关闭数据库中的孤儿会话。
+- **实例标识**：server 每次启动生成随机 `server_instance`，避免重启后 `token` 重用导致历史串会话。实现时将其作为 token 基数（而非改 schema），见 0.3。
+- 认证、角色、CSRF、登录限速、审计、SSE、Prometheus、静态 UI 全部复用，不改 API 形状。
+- 管理端单实例：设计的 `flock` 锁未实现；当前依赖 systemd 单 unit，文档标注“只运行一个 admind”。
+- 版本不匹配、server 离线、控制面 lag 都要在 UI 顶部显示明确状态；`/readyz` 增加控制面连通性检查。
+
+### 权限、用户与部署
+
+推荐两个系统用户 + 一个共享组：
+
+| 对象 | 用户/组 | 权限 |
+|---|---|---|
+| `rustvpn-server` | `rustvpn`，附加组 `rustvpn-adm` | `CAP_NET_ADMIN`/`CAP_NET_RAW`；只读配置 |
+| `rustvpn-admind` | `rustvpn-admin`，组 `rustvpn-adm` | **无 capability**；读写 `/etc/rustvpn`、`/var/lib/rustvpn` |
+| 配置目录 | `root:rustvpn-adm` `2770` | server 读；admind 原子 rename 写 |
+| `peers.yaml` / `peers.disabled.yaml` | `root:rustvpn-adm` `0640` | server 读；admind 通过目录写新文件后 rename |
+| 脚本目录 | `root:root` `0755`，文件 root 所有 | 管理端组**不可写**；server 按 `-script-dir` 白名单执行 |
+| `admin.db` | `rustvpn-admin` `0600` | 仅 admind |
+| 备份 | `rustvpn-admin` `0700` | 仅 admind |
+| 控制 socket | `rustvpn:rustvpn-adm` `0660` | 仅 admind 组 |
+
+```ini
+# rustvpn-server.service
+[Service]
+User=rustvpn
+Group=rustvpn-adm
+SupplementaryGroups=rustvpn
+RuntimeDirectory=rustvpn
+RuntimeDirectoryMode=0750
+ExecStart=/usr/local/bin/rustvpn-server -proto all -bind 0.0.0.0:1194 \
+    -conf /etc/rustvpn/peers.yaml -stats 127.0.0.1:1294 \
+    -control /run/rustvpn/control.sock -script-dir /etc/rustvpn/scripts
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW
+
+# rustvpn-admind.service
+[Service]
+User=rustvpn-admin
+Group=rustvpn-adm
+After=rustvpn-server.service
+ExecStart=/usr/local/bin/rustvpn-admind -listen 127.0.0.1:8080 \
+    -control /run/rustvpn/control.sock -db /var/lib/rustvpn/admin.db \
+    -conf /etc/rustvpn/peers.yaml -disabled-conf /etc/rustvpn/peers.disabled.yaml
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/etc/rustvpn /var/lib/rustvpn
+```
+
+- 管理端 HTTP 仍只绑回环，通过 SSH/Caddy 反代访问 TLS；控制 socket 不出本机。
+- 远程/多机管理不在首版：控制面是本地 UDS；跨机需要 SSH 隧道或后续加 mTLS TCP（会扩大攻击面，暂不做）。
+- 服务端不再需要写 `/etc`，现有 unit 的 `ProtectSystem=full` 可继续；管理端单独放宽 `ReadWritePaths`。
+
+### 安全边界（拆分后必须补强）
+
+- **脚本白名单要放在 server 侧**：既然 `peers.yaml` 由非特权的 admind 用户写入，server 必须在每次加载时拒绝白名单外、非 root 所有、组/其他可写的 `up`/`down`；否则 admind 被攻破即可让 server 执行任意脚本。旧的 `-admin-script-dir` 只在管理端校验，拆分后不够。
+- 控制 socket 只允许 admind 用户/组；不要用“任何本地用户”或 TCP。
+- admind 没有 `CAP_NET_ADMIN`，不能直接碰 TAP/路由；它只能通过受控命令 `kick`/`reload` 影响数据面。
+- admind 能写 `peers.yaml` 就能新增 peer/改配置，这是管理端的职责；审计与 ETag 冲突检测保留。
+- `recent_sessions` 与事件流可能包含地址/流量元数据；socket 权限即访问控制，不写入 world-readable 路径。
+
+### 故障与一致性语义
+
+| 场景 | 行为 |
+|---|---|
+| admind 停机 | 隧道不受影响；采样/历史中断；server 环形事件缓冲保留最近结束会话；配置仍按 60s 热重载 |
+| server 停机 | admind 显示 offline；配置编辑仍可保存；连接/踢线/立即 reload 不可用；server 恢复后自动重连 |
+| admind 重启 | 拉 `status`+`sessions`+`recent_sessions` 对账；关闭孤儿会话；继续采样 |
+| server 重启 | `server_instance` 变化；admind 关闭旧实例的开放会话；server 侧环形缓冲丢失 |
+| 事件 lag | admind 收到 lagged 后重新拉取 `sessions`/`recent_sessions`，并记录一个事件缺口审计项 |
+| 版本不匹配 | 拒绝控制连接并显示明确错误；不尝试兼容旧协议 |
+| 配置竞态 | admind 的 ETag 乐观锁 + server 的 Reloader（互斥/内容比较/generation）继续生效 |
+
+### 与当前实现的关系与工作量
+
+- 当前分支的 API、UI、认证、SQLite、配置编辑、备份、审计代码**全部可复用**；主要改动是“后端从直接访问 Registry 改为控制协议客户端”以及“会话事件从进程内钩子改为控制事件流”。
+- 当前分支尚未合并，因此不存在已部署的 `--features admin` 兼容负担；建议在合并 master 前完成拆分，而不是同时维护内嵌/拆分两种形态。
+- 粗估：控制协议 + server 改造 5–8 人日；admind 后端/采样/对账 5–8 人日；打包、权限、文档、测试 3–5 人日；合计 **2–4 周**。
+- 若确实需要“单二进制内嵌”作为极简部署选项，可保留一个 `admin-embedded` feature 作为过渡，但它会形成两套后端路径，不作为长期方案。
+
+## 0.3 拆分实现状态（2026-11-26）
+
+服务端/管理端拆分已落地：
+
+- 新增 `crates/rustvpn-control`：长度前缀 JSON 协议、DTO、Unix socket 客户端/服务端骨架、协议版本。
+- `rustvpn-server`：新增 `-control`、`-control-group`、`-script-dir`；提供 `hello/status/sessions/kick/reload/recent_sessions/subscribe`；移除 `admin` feature、axum/SQLite/静态资源依赖以及全部 `-admin*` 标志。
+- `rustvpn-admind`：独立二进制，参数为 `-listen/-db/-control/-conf/-disabled-conf/-backup-dir/-cookie-secure/-script-dir`；`AdminBackend` 由 `ControlBackend` 实现。
+- `rustvpn-admin-passwd` 保留，用于初始化 admind 的数据库。
+
+相对 0.2 方案的实现取舍：
+
+- **会话唯一性**：没有新增 `(server_instance, token)` 复合主键；每次 server 启动生成随机 64 位 `server_instance` 并作为 `NEXT_PEER_TOKEN` 的基数，`session_id` 仍为 u64。效果相同且无需迁移 SQLite schema；status/事件均暴露 `server_instance`。
+- **控制协议**：长度前缀 JSON，不是完整 JSON-RPC；`hello` 强制版本匹配。`subscribe` 在响应 `Subscribed` 后单向推送事件；服务端用广播通道 + 最近 1024 条结束事件环形缓冲。
+- **认证**：socket 模式 `0600`（未配组）或 `0660`（配组）；配组时用 `SO_PEERCRED` 校验 root 或 primary gid。admind 服务因此应把共享组设为主组（systemd `Group=`）。
+- **脚本安全**：`-script-dir` 由 **server** 强制；脚本须位于白名单目录、常规文件、组/其他不可写、属主为 root 或 server 有效 uid。配置校验失败时保留上一份有效配置。
+- **历史采集**：admind 订阅事件获得开始/结束与最终计数；同时每 10 秒通过 `sessions` 拉取活动会话计算速率。重连/`lagged` 时用 `sessions` + `recent_sessions` 对账；控制面短暂失败时返回上次缓存，避免把在线会话误判为结束。
+- **孤儿会话**：`Store::open` 不再无条件关闭所有开放会话（否则 admind 单独重启会误终结在线会话）。对账时保留 server 仍报告的 active 会话和 recent 环中的结束会话，仅把 server 已不认识的行标记为 `server_restart`。
+- **离线降级**：server 离线时 admind 仍提供配置/历史/审计；`/api/system/status` 增加 `server_online` 与 `server_instance`，UI 显示“服务端离线”。配置写入后若无法 `reload`，返回 `applied:false` 加 warning，文件已落盘，server 恢复后加载。
+- **单实例**：建议只运行一个 admind；当前未加进程锁（systemd 单 unit 已足够），多实例会重复采样。
+- **旧内嵌模式**：已移除，不保留双后端；该分支尚未合并，无兼容负担。
+
+验证：
+
+- `cargo fmt --all -- --check`
+- `cargo clippy --workspace --all-targets -- -D warnings`
+- `cargo test --workspace`（含 control framing、脚本白名单、既有 admin API/存储测试）
+- 真实进程烟测：server + admind + passwd；登录、创建/禁用客户端、配置 generation 递增、备份、server 停机/重启、admind 自动重连、离线状态与事件。
+- 未覆盖：真实 TAP 客户端接入后的在线会话历史/踢线（需要 root/CAP_NET_ADMIN 与真实客户端）；控制面大量并发/长期 lag 的压测。
+
 
 ---
 
@@ -132,7 +336,9 @@ MVP 已在分支 `feature/admin-web-ui` 落地，使用说明见 [`admin-web-ui.
 | B. 独立 sidecar 轮询 `/stats` | 5–10 秒 | 否 | 只能改文件等重载 | 低 | 管理能力残缺 |
 | C. 独立 admin 守护进程 + 服务端 Unix socket 控制面 | 秒级 | 是 | 是 | 高 | 边界清晰，但需新协议/两进程 |
 
-**推荐 A 作为第一版**：单二进制、部署简单、直接复用 `Registry`。C 作为安全加固的演进方向：admin 进程不带 `CAP_NET_ADMIN`，通过 `/run/rustvpn/admin.sock` + `SO_PEERCRED` 与 server 通信，把 HTTP/模板攻击面与数据面隔离；等 MVP 稳定后再评估。
+**原推荐 A 作为第一版**：单二进制、部署简单、直接复用 `Registry`。C 曾作为安全加固的演进方向：admin 进程不带 `CAP_NET_ADMIN`，通过本地 socket + `SO_PEERCRED` 与 server 通信，把 HTTP/模板攻击面与数据面隔离。
+
+> **2026-11-26 修订**：按新约束（服务端 CLI 与管理端程序也必须独立，只共享库），最终采用 **C**。即时踢线/立即生效通过控制命令 `kick`/`reload` 实现，不再需要进程内耦合。详见 0.2 节；本节 A 的说明仅保留为历史决策记录。
 
 管理服务只新增一个**可选**监听，例如：
 
@@ -229,6 +435,8 @@ SQLite 建议参数：`journal_mode=WAL`、`synchronous=NORMAL`、`busy_timeout=
                     │      └─ embedded static UI    │
                     └──────────────────────────────┘
 ```
+
+> **0.2 修订后的目标架构**：上图中的 admin 部分（axum、auth、API、sampler、SQLite、静态 UI）移动到独立的 `rustvpn-admind` 进程；`rustvpn-server` 只保留数据面与本地控制 socket。本图及后续 3.x/7.x 中“进程内”的细节，除控制协议外仍然适用。详见 0.2 节。
 
 ### 3.1 新增 crate 与职责
 
@@ -795,6 +1003,8 @@ Kick {
 - 获取口令后立即派生并 `zeroize`，不把 `String` 长时间留在堆上。
 
 ### 7.7 权限与 systemd（必须改）
+
+> **0.2 修订**：下面是内嵌模式的权限方案（server 自己写 `/etc`）。拆分后由 `rustvpn-admind` 以独立用户写配置，server 只读，控制 socket 用组权限；以 0.2 节的用户/组表格与两个 unit 为准。
 
 现有 unit 的 `ProtectSystem=full` 使 `/etc` 只读（`docs/zh/operations.md:119-127`）。管理端要写 `peers.yaml`，需要：
 

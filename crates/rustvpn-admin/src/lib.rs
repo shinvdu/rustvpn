@@ -6,6 +6,7 @@
 
 pub mod api;
 pub mod auth;
+pub mod backend;
 pub mod config_edit;
 pub mod history;
 pub mod model;

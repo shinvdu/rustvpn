@@ -99,6 +99,9 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static SCRIPT_ID: AtomicU64 = AtomicU64::new(0);
+    // Script tests spawn processes; serialise them so a loaded CI runner
+    // cannot starve a trivial `echo` behind the hung-script timeout.
+    static SCRIPT_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     fn script(body: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!(
@@ -115,6 +118,7 @@ mod tests {
 
     #[tokio::test]
     async fn returns_stdout_on_success() {
+        let _guard = SCRIPT_TEST_LOCK.lock().await;
         let p = script("echo rsvpn0");
         let out = run_script(p.to_str().unwrap(), "tap0", "1.2.3.4")
             .await
@@ -126,6 +130,7 @@ mod tests {
 
     #[tokio::test]
     async fn failure_and_missing_are_errors() {
+        let _guard = SCRIPT_TEST_LOCK.lock().await;
         let p = script("exit 3");
         assert!(run_script(p.to_str().unwrap(), "tap0", "1.2.3.4")
             .await
@@ -138,6 +143,7 @@ mod tests {
 
     #[tokio::test]
     async fn hung_script_times_out() {
+        let _guard = SCRIPT_TEST_LOCK.lock().await;
         let p = script("sleep 30");
         let started = std::time::Instant::now();
         assert!(run_script(p.to_str().unwrap(), "tap0", "1.2.3.4")
@@ -149,6 +155,7 @@ mod tests {
 
     #[tokio::test]
     async fn call_up_uses_first_stdout_line_when_iface_empty() {
+        let _guard = SCRIPT_TEST_LOCK.lock().await;
         let p = script("echo rsvpn9; echo ignored");
         let iface = call_up(p.to_str().unwrap(), "", "1.2.3.4").await;
         assert_eq!(iface, "rsvpn9");
