@@ -2,8 +2,8 @@
 
 > 最后更新：2026-11-27
 > 分支：`feature/client-ui`
-> 状态：M1（核心接入）与 M2（服务 + 本地 IPC）已完成并提交；M3（网络配置）
-> 代码已在工作区实现，尚未提交，Windows 实机验收待执行
+> 状态：M1（核心接入）、M2（服务 + 本地 IPC）、M3（网络配置）已完成并提交；
+> M3 的 Windows 目标测试通过，真实路由/DNS/NRPT 冒烟留待 M6
 > 相关文档：
 > - [Windows 客户端调研与方案](windows-client-research.md)
 > - [Windows 开发环境与依赖](windows-dev-environment.md)
@@ -14,8 +14,8 @@
 
 ## 0. 一句话状态
 
-Windows 端已经完成 **开发环境 + Wintun/以太网垫片原型**，并完成了 **M1 核心接入**（`9bc1466`）和 **M2 服务 + 本地 IPC**（`8cef993`）：命名管道传输、DACL、客户端身份校验、Windows SCM 服务外壳、命名互斥量隧道锁，以及 `--console` 端到端 IPC 测试。**M3 网络配置**已在工作区实现（未提交）：Wintun 地址/路由、防环 `/32`、默认/分流路由、per-interface DNS + NRPT、全隧道 IPv6 泄漏阻断、崩溃恢复状态文件与启动清理。
-> 说明：M3 的 Windows 实机连接/清理验收尚未执行（当前开发机无可用 Windows SSH 主机）；Linux 单元测试、Windows 目标编译与 clippy 已通过。GUI 平台适配（M4）、MSI/服务注册（M5）仍未开始。
+Windows 端已经完成 **开发环境 + Wintun/以太网垫片原型**，并完成了 **M1 核心接入**（`9bc1466`）、**M2 服务 + 本地 IPC**（`8cef993`）和 **M3 网络配置**（`cac143a`，测试修正 `2fdd705`）：Wintun 地址/路由、防环 `/32`、默认/分流路由、per-interface DNS + NRPT、全隧道 IPv6 泄漏阻断、崩溃恢复状态文件与启动清理。
+> 说明：M3 的 Linux 测试、Windows 目标测试（72 + 99）与 clippy 通过；真实 Windows 路由/DNS/NRPT 冒烟、休眠/切网与崩溃验收留待 M6。GUI 平台适配（M4）、MSI/服务注册（M5）仍未开始。
 
 ---
 
@@ -24,11 +24,12 @@ Windows 端已经完成 **开发环境 + Wintun/以太网垫片原型**，并完
 | 项 | 状态 |
 |---|---|
 | 代码分支 | `feature/client-ui` |
-| 最近提交 | `8132f24 docs(windows): record M2 verification`（M2） |
-| 前一个提交 | `8cef993 feat(windows): add service, named-pipe IPC and tunnel lock`（M2） |
-| M2 验证 | Windows 实机命名管道 E2E、DACL、隧道锁测试通过 |
+| 最近提交 | `2fdd705 test(windows): make MTU floor assertions platform-aware` |
+| M3 代码 | `cac143a feat(windows): add network guard and crash recovery` |
+| M2 代码 | `8cef993 feat(windows): add service, named-pipe IPC and tunnel lock` |
+| M1 代码 | `9bc1466 feat(windows): integrate Wintun shim into client core` |
 | 远端 | 领先 `origin/feature/client-ui`，**未推送** |
-| 主仓库剩余改动 | M3 网络配置（未提交、未在 Windows 实机验收）；M2 已提交 |
+| 主仓库剩余改动 | M3 已提交；真实 Windows 路由/DNS/NRPT 验收留待 M6 |
 | Windows 原型位置 | `prototypes/windows-shim/`，独立 crate，不加入 workspace |
 | Windows CI | `.github/workflows/windows-shim.yml`，只测原型 |
 | 原型状态 | Phase 0 参考实现，不是生产代码 |
@@ -153,7 +154,7 @@ Windows 端已经完成 **开发环境 + Wintun/以太网垫片原型**，并完
     clientd 3+1），含命名管道 E2E、DACL、命名互斥量锁
   - 未执行：SCM 服务注册/启停（属 M5）、第二用户越权连接测试
 
-### 2.8 M3 网络配置（工作区实现，未提交）
+### 2.8 M3 网络配置（已提交 `cac143a`）
 
 - **平台拆分**：`rustvpn-client-core/src/netcfg.rs` 拆成 `netcfg/mod.rs` +
   `netcfg/linux.rs` + `netcfg/windows.rs` + `netcfg/winplan.rs`；公共
@@ -199,11 +200,11 @@ Windows 端已经完成 **开发环境 + Wintun/以太网垫片原型**，并完
   失败注入回滚、无状态 no-op、活 owner 跳过、kill-switch/IPv6 外层拒绝。
   `cargo test --workspace`、`cargo clippy --workspace --all-targets -D warnings`
   与 `cargo check/clippy --target x86_64-pc-windows-msvc` 通过。
-- **未执行**：Windows 实机的真实 Wintun + PowerShell 路由/DNS/NRPT 冒烟、
-  断线/崩溃清理验收；本轮无可用 Windows SSH 主机（本地 `win11` KVM 无登录
-  凭据），只做编译/单测。已提供只读的
-  `windows_read_only_probe`（`#[ignore]`）供后续在 Windows 上校验
-  PowerShell 脚本/JSON 契约且不改网络状态。未触碰宿主机 VPN/NAT/防火墙，未重启。
+- **Windows 目标测试**：client-core 72 passed、net 99 passed（1 ignored manual smoke）
+- **未执行**：真实 Windows Wintun + PowerShell 路由/DNS/NRPT 冒烟、
+  断线/崩溃清理验收（M6）。已提供只读的 `windows_read_only_probe`
+  （`#[ignore]`）供后续在 Windows 上校验 PowerShell 脚本/JSON 契约且不改网络状态。
+  未触碰宿主机 VPN/NAT/防火墙，未重启。
 
 ---
 
@@ -212,8 +213,8 @@ Windows 端已经完成 **开发环境 + Wintun/以太网垫片原型**，并完
 ### 3.1 核心集成（M1 已完成）
 
 `TapConfig`/平台门面、`Tap` ↔ shim、异步桥接、Engine 接线与共享 MTU/Mode
-已在 `9bc1466` 完成。地址/网关/DNS、路由与 IPv6 阻断已在 M3 工作区实现，
-Windows 实机验收待做。
+已在 `9bc1466` 完成。地址/网关/DNS、路由与 IPv6 阻断已在 M3 `cac143a`
+实现；Windows 目标测试通过，真实 Windows 路由/DNS/NRPT 验收留待 M6。
 
 ### 3.2 Windows 服务与 IPC（M2 已实装，剩余项）
 
@@ -228,7 +229,7 @@ Windows 实机验收待做。
 | 服务停止清理 | ✅ 与 Linux 共用 shutdown 路径；Windows 清理由 M3 guard + 启动/停止清理实现 |
 | 多用户/会话策略 | ⬜ M5 安装器创建 `RustVPN` 组并加用户；当前默认 INTERACTIVE |
 
-### 3.3 Windows 网络配置（M3 已实现，实机验收待做）
+### 3.3 Windows 网络配置（M3 已实现并提交，实机验收待 M6）
 
 | 项 | 状态 |
 |---|---|
@@ -348,12 +349,13 @@ Windows 实机验收待做。
 | M0.5 原型 | Wintun + Ethernet shim + ARP + MTU | ✅ 完成 | Windows 烟测 PASS，测试通过 |
 | M1 核心接入 | `TapConfig`、shim 接入、async 桥接、Engine | ✅ 已提交 `9bc1466` | Windows 能连接 Linux 服务端并 ping |
 | M2 服务/IPC | Windows 服务 + 命名管道 + DACL + 锁 | ✅ 已提交 `8cef993`/`8132f24` | GUI 可连接/断开，无权限越界 |
-| M3 网络 | 路由/DNS/NRPT、防环、IPv6 阻断、清理 | 🟡 代码完成（未提交）；Windows 实机验收待跑 | 全隧道无泄漏，断开恢复 |
+| M3 网络 | 路由/DNS/NRPT、防环、IPv6 阻断、清理 | 🟡 已提交；Windows 实机路由/DNS 验收待 M6 | 全隧道无泄漏，断开恢复 |
 | M4 GUI | 路径/钥匙串/自启/语言/状态显示 | ⬜ 未开始 | 普通用户完整操作 |
 | M5 安装 | MSI、服务安装、签名、Wintun DLL | ⬜ 未开始 | 干净 Win10/11 安装/升级/卸载 |
 | M6 硬化 | E2E、休眠/切网、fuzz、CI、性能 | ⬜ 未开始 | 验收矩阵通过 |
 
-**当前阻塞：** M3 代码已在工作区，但还没有 Windows 实机验收。需要在真实
+**当前状态：** M3 代码已提交，Windows 目标测试通过；真实 Windows 路由/DNS/NRPT
+验收留待 M6，不阻塞 M4/M5。需要在真实
 Windows 主机（服务或管理员 `--console`）上完成：连接后地址/默认路由/DNS/
 NRPT/IPv6 规则的实际检查、断开与崩溃后的恢复检查、以及 M2 的 SCM 启停和
 越权连接测试。本轮开发机没有可用的 Windows SSH 目标（本地 KVM 无登录凭据），
@@ -386,7 +388,7 @@ NRPT/IPv6 规则的实际检查、断开与崩溃后的恢复检查、以及 M2 
    - `cargo test -p rustvpn-clientd -p rustvpn-client-ipc -p rustvpn-client-core --target x86_64-pc-windows-msvc`
      （`ipc_e2e` 会用唯一命名管道启动 `--console` daemon）
    - 用独立本地组/第二用户验证管道越权被拒绝；不要安装服务。
-4. M3 代码完成后，在 Windows 实机验证：握手后地址/默认路由/DNS/NRPT/
+4. M3 代码已提交；M6 在 Windows 实机验证：握手后地址/默认路由/DNS/NRPT/
    IPv6 规则；断开与崩溃后的恢复；不要在生产默认路由上直接测分流冲突。
 5. 所有 Windows 网络测试只使用 `10.88.0.0/24` 和临时适配器；不碰现有 VPN/路由/防火墙。
 6. 每完成一个里程碑，更新本文件的“已完成/未开始/隐患”和提交记录。
