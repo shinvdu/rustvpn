@@ -1,0 +1,22 @@
+[package]
+name = "rustvpn-client-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+rustvpn-crypto = { path = "../rustvpn-crypto" }
+rustvpn-proto = { path = "../rustvpn-proto" }
+rustvpn-net = { path = "../rustvpn-net" }
+rustvpn-client-ipc = { path = "../rustvpn-client-ipc" }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+anyhow = { workspace = true }
+rand_core = { workspace = true }
+getrandom = { workspace = true }
+ed25519-dalek = { workspace = true }
+base64 = { workspace = true }
+zeroize = { workspace = true }
+ipnet = "2"
+libc = { workspace = true }

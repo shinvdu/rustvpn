@@ -9,6 +9,10 @@ members = [
     "crates/rustvpn-client",
     "crates/rustvpn-control",
     "crates/rustvpn-admin",
+    "crates/rustvpn-client-ipc",
+    "crates/rustvpn-client-core",
+    "crates/rustvpn-clientd",
+    "crates/rustvpn-client-gui",
 ]
 # `cargo build` at the workspace root stays free of the optional admin
 # daemon and its axum/SQLite dependencies; build it explicitly with

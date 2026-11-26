@@ -123,6 +123,7 @@ English pages:
 - [FAQ](docs/en/faq.md)
 - [Design](docs/en/design.md)
 - [Performance](docs/en/performance.md)
+- [Desktop client UI (Linux MVP)](docs/client-ui.md)
 
 ## Tests and benchmarks
 

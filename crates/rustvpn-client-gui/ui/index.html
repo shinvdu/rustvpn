@@ -1,0 +1,223 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark light">
+  <title>RustVPN</title>
+  <link rel="stylesheet" href="app.css">
+</head>
+<body>
+  <div class="app">
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="brand-mark">RV</div>
+        <div><strong>RustVPN</strong><span>客户端</span></div>
+      </div>
+      <nav class="nav">
+        <button class="nav-item active" data-page="home">连接</button>
+        <button class="nav-item" data-page="profiles">配置</button>
+        <button class="nav-item" data-page="logs">日志</button>
+        <button class="nav-item" data-page="settings">设置</button>
+      </nav>
+      <div class="daemon" id="daemon-box">
+        <span class="dot" id="daemon-dot"></span>
+        <div>
+          <strong id="daemon-text">检测守护进程…</strong>
+          <small id="daemon-socket">rustvpn-clientd</small>
+        </div>
+      </div>
+    </aside>
+
+    <main class="main">
+      <header class="topbar">
+        <div>
+          <h1 id="page-title">连接</h1>
+          <p id="page-subtitle">本地守护进程管理隧道，UI 不持有特权。</p>
+        </div>
+        <span class="badge" id="conn-badge">未连接</span>
+      </header>
+
+      <section class="page active" id="page-home">
+        <div class="card connect-card">
+          <div class="connect-head">
+            <div class="profile-picker">
+              <label for="home-profile">配置</label>
+              <select id="home-profile"></select>
+              <button class="link" id="go-profiles">管理配置</button>
+            </div>
+            <div class="connect-actions">
+              <button class="primary" id="connect-btn">连接</button>
+              <button class="danger hidden" id="disconnect-btn">断开</button>
+            </div>
+          </div>
+
+          <div class="status-line">
+            <span class="dot" id="state-dot"></span>
+            <div>
+              <strong id="state-title">空闲</strong>
+              <p id="state-detail">选择配置后连接。</p>
+            </div>
+          </div>
+
+          <div class="meta-grid">
+            <div><span>服务器</span><strong id="meta-remote">—</strong></div>
+            <div><span>协议 / 模式</span><strong id="meta-proto">—</strong></div>
+            <div><span>接口</span><strong id="meta-iface">—</strong></div>
+            <div><span>连接时长</span><strong id="meta-uptime">—</strong></div>
+          </div>
+        </div>
+
+        <div class="stats-grid">
+          <div class="card stat">
+            <span>下行速率</span>
+            <strong class="down" id="rx-rate">0 B/s</strong>
+            <small id="rx-total">累计 0 B</small>
+          </div>
+          <div class="card stat">
+            <span>上行速率</span>
+            <strong class="up" id="tx-rate">0 B/s</strong>
+            <small id="tx-total">累计 0 B</small>
+          </div>
+          <div class="card stat">
+            <span>载荷下行</span>
+            <strong id="rx-payload">0 B</strong>
+            <small>不含线路开销</small>
+          </div>
+          <div class="card stat">
+            <span>载荷上行</span>
+            <strong id="tx-payload">0 B</strong>
+            <small>不含线路开销</small>
+          </div>
+        </div>
+
+        <div class="card chart-card">
+          <div class="card-head">
+            <h2>实时流量</h2>
+            <span class="muted">最近 60 秒 · 线路字节</span>
+          </div>
+          <canvas id="traffic-chart" height="180"></canvas>
+        </div>
+
+        <div class="card hint-card hidden" id="home-hint">
+          <strong>还没有配置</strong>
+          <p>先到“配置”页添加服务器地址、verifier 和地址分配。</p>
+          <button class="primary" id="hint-add">添加配置</button>
+        </div>
+      </section>
+
+      <section class="page" id="page-profiles">
+        <div class="toolbar">
+          <p class="muted">配置保存在 <code>~/.config/rustvpn/profiles/</code>，口令不会写入磁盘。</p>
+          <button class="primary" id="add-profile">添加配置</button>
+        </div>
+        <div id="profile-list" class="profile-list"></div>
+        <div class="empty hidden" id="profiles-empty">
+          <strong>暂无配置</strong>
+          <p>添加一个 RustVPN/GoVPN 服务端配置即可开始。</p>
+        </div>
+      </section>
+
+      <section class="page" id="page-logs">
+        <div class="toolbar">
+          <div class="filter-row">
+            <label for="log-level">级别</label>
+            <select id="log-level">
+              <option value="">全部</option>
+              <option value="info">info</option>
+              <option value="warn">warn</option>
+              <option value="error">error</option>
+            </select>
+            <button class="secondary" id="refresh-logs">刷新</button>
+            <button class="link" id="clear-logs">清空视图</button>
+          </div>
+          <span class="muted" id="log-count">0 行</span>
+        </div>
+        <pre class="log-view" id="log-lines"></pre>
+      </section>
+
+      <section class="page" id="page-settings">
+        <div class="card settings-card">
+          <h2>守护进程</h2>
+          <dl>
+            <dt>Socket</dt><dd id="set-socket">—</dd>
+            <dt>UI 版本</dt><dd id="set-version">—</dd>
+            <dt>认证</dt><dd>本地 Unix socket，SO_PEERCRED / 组权限</dd>
+          </dl>
+          <button class="secondary" id="check-daemon">重新检测</button>
+        </div>
+        <div class="card settings-card">
+          <h2>安全边界</h2>
+          <ul class="plain-list">
+            <li>UI 以普通用户运行，不创建 TAP、不改路由。</li>
+            <li>隧道由 <code>rustvpn-clientd</code> 在最小权限下运行。</li>
+            <li>配置里不保存口令，日志不会记录口令。</li>
+            <li>GUI 不执行用户提供的 up/down 脚本。</li>
+          </ul>
+        </div>
+        <div class="card settings-card">
+          <h2>关于</h2>
+          <p class="muted">RustVPN 客户端 · GPL-3.0-or-later · Tauri 2 + GTK WebView</p>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <div class="modal hidden" id="password-modal" role="dialog" aria-modal="true">
+    <div class="modal-box">
+      <h2 id="password-title">输入口令</h2>
+      <p class="muted">口令仅在内存中传给守护进程，用于派生 Argon2d 密钥。</p>
+      <form id="password-form">
+        <label>口令 <input id="password-input" type="password" autocomplete="current-password" required></label>
+        <div class="modal-actions">
+          <button type="button" class="secondary" data-close="password-modal">取消</button>
+          <button type="submit" class="primary" id="password-submit">连接</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <div class="modal hidden" id="profile-modal" role="dialog" aria-modal="true">
+    <div class="modal-box wide">
+      <h2 id="profile-title">添加配置</h2>
+      <form id="profile-form">
+        <div class="form-grid">
+          <label>名称 <input id="f-name" required maxlength="64" placeholder="office"></label>
+          <label>服务器 <input id="f-remote" required placeholder="vpn.example.com:1194"></label>
+          <label>协议
+            <select id="f-proto">
+              <option value="udp">UDP</option>
+              <option value="tcp">TCP</option>
+            </select>
+          </label>
+          <label>MTU <input id="f-mtu" type="number" min="68" max="9015" value="1515"></label>
+          <label>超时（秒） <input id="f-timeout" type="number" min="1" value="60"></label>
+          <label>Timesync <input id="f-timesync" type="number" value="0"></label>
+          <label class="wide-field">Verifier（短格式） <textarea id="f-verifier" required rows="2" placeholder="$argon2d$m=...$..."></textarea></label>
+          <label>代理 <input id="f-proxy" placeholder="可选，HTTP CONNECT 代理"></label>
+          <label>代理认证 <input id="f-proxy-auth" placeholder="user:pass"></label>
+          <label>CPR（KiB/s） <input id="f-cpr" type="number" min="0" value="0"></label>
+          <label>接口名 <input id="f-iface" value="rsvpn-gui" maxlength="15"></label>
+          <label>地址 <input id="f-address" placeholder="10.88.0.2/24"></label>
+          <label>网关 <input id="f-gateway" placeholder="10.88.0.1"></label>
+          <label>DNS <input id="f-dns" placeholder="10.88.0.1, 1.1.1.1"></label>
+          <label>路由 <input id="f-routes" placeholder="default, 192.168.50.0/24"></label>
+        </div>
+        <div class="checks">
+          <label class="check"><input type="checkbox" id="f-noise"> Noise（等长填充）</label>
+          <label class="check"><input type="checkbox" id="f-encless"> Encless（仅 TCP）</label>
+          <label class="check disabled"><input type="checkbox" id="f-ipv6" disabled> IPv6（全隧道时阻断，暂不支持隧道）</label>
+        </div>
+        <p class="muted small">GUI 配置由守护进程内置的地址/路由管理生效；不接受 up/down 脚本。全隧道（routes 包含 default）必须填写地址、网关和 DNS；全隧道连接期间 IPv6 默认路由会被阻断，避免泄漏。</p>
+        <div class="modal-actions">
+          <button type="button" class="secondary" data-close="profile-modal">取消</button>
+          <button type="submit" class="primary" id="profile-save">保存</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <div class="toast hidden" id="toast"></div>
+  <script src="app.js"></script>
+</body>
+</html>

@@ -1,0 +1,788 @@
+"use strict";
+
+const TAURI = window.__TAURI__ || {};
+const invoke = TAURI.core && TAURI.core.invoke;
+const listen = TAURI.event && TAURI.event.listen;
+
+const state = {
+  profiles: [],
+  selected: localStorage.getItem("rustvpn.profile") || "",
+  status: { state: "idle", traffic: {} },
+  logs: [],
+  logKeys: new Set(),
+  samples: [],
+  editingName: null,
+  pendingProfile: null,
+  daemonOnline: false,
+  page: "home",
+};
+
+const pageNames = {
+  home: ["连接", "本地守护进程管理隧道，UI 不持有特权。"],
+  profiles: ["配置", "服务器、verifier 与地址分配；口令不会落盘。"],
+  logs: ["日志", "守护进程的连接、路由与重连记录。等级过滤只影响显示。"],
+  settings: ["设置", "守护进程位置、安全边界与版本信息。"],
+};
+
+document.addEventListener("DOMContentLoaded", init);
+
+async function init() {
+  bindNavigation();
+  bindButtons();
+  bindModals();
+
+  if (!invoke || !listen) {
+    setDaemon(false, "Tauri API 未注入");
+    toast("请通过 Tauri 窗口打开：当前页面没有 IPC 注入。", true);
+    return;
+  }
+
+  await loadDaemonInfo();
+  await loadProfiles();
+  await pollStatus(true);
+  await refreshLogs();
+
+  await listen("daemon-event", (event) => handleEvent(event.payload));
+  await listen("daemon-online", () => setDaemon(true));
+  await listen("daemon-offline", () => setDaemon(false));
+
+  setInterval(() => pollStatus(false), 3000);
+  setInterval(updateUptime, 1000);
+  window.addEventListener("resize", drawChart);
+}
+
+function bindNavigation() {
+  document.querySelectorAll(".nav-item").forEach((button) => {
+    button.addEventListener("click", () => showPage(button.dataset.page));
+  });
+}
+
+function bindButtons() {
+  const on = (id, fn) => {
+    const element = document.getElementById(id);
+    if (element) element.addEventListener("click", fn);
+  };
+
+  on("connect-btn", () => {
+    const profile = currentProfile();
+    if (!profile) {
+      showPage("profiles");
+      toast("请先添加配置");
+      return;
+    }
+    openPassword(profile);
+  });
+  on("disconnect-btn", disconnect);
+  on("go-profiles", () => showPage("profiles"));
+  on("hint-add", () => openProfileModal(null));
+  on("add-profile", () => openProfileModal(null));
+  on("refresh-logs", refreshLogs);
+  on("clear-logs", () => {
+    state.logs = [];
+    state.logKeys.clear();
+    renderLogs();
+  });
+  on("check-daemon", async () => {
+    const ok = await pollStatus(true);
+    toast(ok ? "守护进程在线" : "守护进程不可达", !ok);
+  });
+
+  const homeProfile = document.getElementById("home-profile");
+  homeProfile.addEventListener("change", () => {
+    state.selected = homeProfile.value;
+    localStorage.setItem("rustvpn.profile", state.selected);
+    renderHome();
+    renderProfiles();
+  });
+
+  const logLevel = document.getElementById("log-level");
+  logLevel.addEventListener("change", renderLogs);
+
+  document.getElementById("profile-list").addEventListener("click", (event) => {
+    const button = event.target.closest("button[data-action]");
+    if (!button) return;
+    const name = button.dataset.name;
+    const profile = state.profiles.find((item) => item.name === name);
+    if (!profile) return;
+    if (button.dataset.action === "connect") {
+      state.selected = profile.name;
+      localStorage.setItem("rustvpn.profile", state.selected);
+      renderHome();
+      renderProfiles();
+      openPassword(profile);
+    } else if (button.dataset.action === "edit") {
+      openProfileModal(profile);
+    } else if (button.dataset.action === "delete") {
+      deleteProfile(profile);
+    }
+  });
+}
+
+function bindModals() {
+  document.querySelectorAll("[data-close]").forEach((button) => {
+    button.addEventListener("click", () => {
+      hide(button.dataset.close);
+    });
+  });
+
+  document.querySelectorAll(".modal").forEach((modal) => {
+    modal.addEventListener("click", (event) => {
+      if (event.target === modal) hide(modal.id);
+    });
+  });
+
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") {
+      hide("password-modal");
+      hide("profile-modal");
+    }
+  });
+
+  document.getElementById("password-form").addEventListener("submit", submitPassword);
+  document.getElementById("profile-form").addEventListener("submit", submitProfile);
+
+  const encless = document.getElementById("f-encless");
+  const proto = document.getElementById("f-proto");
+  encless.addEventListener("change", () => {
+    if (encless.checked) proto.value = "tcp";
+  });
+}
+
+function showPage(page) {
+  if (!pageNames[page]) return;
+  state.page = page;
+  document.querySelectorAll(".nav-item").forEach((button) => {
+    button.classList.toggle("active", button.dataset.page === page);
+  });
+  document.querySelectorAll(".page").forEach((section) => {
+    section.classList.toggle("active", section.id === `page-${page}`);
+  });
+  const [title, subtitle] = pageNames[page];
+  document.getElementById("page-title").textContent = title;
+  document.getElementById("page-subtitle").textContent = subtitle;
+  if (page === "logs") refreshLogs();
+  if (page === "home") drawChart();
+}
+
+async function loadDaemonInfo() {
+  try {
+    const info = await invoke("daemon_info");
+    document.getElementById("daemon-socket").textContent = info.socket || "rustvpn-clientd";
+    document.getElementById("set-socket").textContent = info.socket || "—";
+    document.getElementById("set-version").textContent = info.version || "—";
+  } catch (error) {
+    document.getElementById("set-version").textContent = "—";
+  }
+}
+
+function setDaemon(online, text) {
+  state.daemonOnline = online;
+  const dot = document.getElementById("daemon-dot");
+  dot.className = `dot ${online ? "ok" : "err"}`;
+  document.getElementById("daemon-text").textContent = online
+    ? "守护进程在线"
+    : text || "守护进程离线";
+}
+
+async function loadProfiles() {
+  try {
+    state.profiles = await invoke("list_profiles");
+  } catch (error) {
+    toast(`读取配置失败：${error}`, true);
+    state.profiles = [];
+  }
+  if (!state.profiles.some((profile) => profile.name === state.selected)) {
+    state.selected = state.profiles[0] ? state.profiles[0].name : "";
+    localStorage.setItem("rustvpn.profile", state.selected);
+  }
+  renderProfileOptions();
+  renderProfiles();
+  renderHome();
+}
+
+function currentProfile() {
+  return state.profiles.find((profile) => profile.name === state.selected) || null;
+}
+
+function renderProfileOptions() {
+  const select = document.getElementById("home-profile");
+  select.innerHTML = "";
+  if (!state.profiles.length) {
+    const option = document.createElement("option");
+    option.value = "";
+    option.textContent = "暂无配置";
+    select.appendChild(option);
+    select.disabled = true;
+    return;
+  }
+  select.disabled = false;
+  state.profiles.forEach((profile) => {
+    const option = document.createElement("option");
+    option.value = profile.name;
+    option.textContent = profile.name;
+    select.appendChild(option);
+  });
+  select.value = state.selected;
+}
+
+function renderProfiles() {
+  const list = document.getElementById("profile-list");
+  const empty = document.getElementById("profiles-empty");
+  empty.classList.toggle("hidden", state.profiles.length > 0);
+  if (!state.profiles.length) {
+    list.innerHTML = "";
+    return;
+  }
+  list.innerHTML = state.profiles
+    .map((profile) => {
+      const mode = profile.encless ? "encless" : profile.noise ? "noise" : "plain";
+      const active = profile.name === state.selected ? " active" : "";
+      return `
+        <article class="profile-card${active}">
+          <div>
+            <h3>${escapeHtml(profile.name)}</h3>
+            <div class="profile-meta">
+              <span>${escapeHtml(profile.remote)}</span>
+              <span>${escapeHtml((profile.proxy ? "tcp(proxy)" : profile.proto).toUpperCase())} · ${mode}</span>
+              <span>MTU ${Number(profile.mtu) || "—"}</span>
+              ${profile.address ? `<span><code>${escapeHtml(profile.address)}</code></span>` : ""}
+            </div>
+          </div>
+          <div class="profile-actions">
+            <button class="primary" data-action="connect" data-name="${escapeAttr(profile.name)}">连接</button>
+            <button class="secondary" data-action="edit" data-name="${escapeAttr(profile.name)}">编辑</button>
+            <button class="danger" data-action="delete" data-name="${escapeAttr(profile.name)}">删除</button>
+          </div>
+        </article>`;
+    })
+    .join("");
+}
+
+function renderHome() {
+  const status = state.status || {};
+  const profile = currentProfile();
+  const stateName = status.state || "idle";
+  const badge = document.getElementById("conn-badge");
+
+  const labels = {
+    idle: "未连接",
+    connecting: "连接中",
+    connected: "已连接",
+    reconnecting: "重连中",
+    disconnecting: "断开中",
+    error: "错误",
+  };
+  badge.textContent = labels[stateName] || stateName;
+  badge.className = `badge ${stateName}`;
+
+  const dot = document.getElementById("state-dot");
+  const dotClass =
+    stateName === "connected"
+      ? "ok"
+      : stateName === "error"
+      ? "err"
+      : stateName === "idle"
+      ? ""
+      : "warn";
+  dot.className = `dot ${dotClass}`;
+
+  const title = document.getElementById("state-title");
+  const detail = document.getElementById("state-detail");
+  if (stateName === "connected") {
+    title.textContent = "已连接";
+    detail.textContent = `${status.profile || profile?.name || "配置"} · ${status.remote || ""}`;
+  } else if (stateName === "connecting") {
+    title.textContent = "正在连接…";
+    detail.textContent = status.remote ? `握手 ${status.remote}` : "解析地址并建立握手";
+  } else if (stateName === "reconnecting") {
+    title.textContent = "正在重连";
+    const retry = status.next_retry_in != null ? `，${status.next_retry_in} 秒后重试` : "";
+    detail.textContent = `${status.last_error || "连接已结束"}${retry}`;
+  } else if (stateName === "error") {
+    title.textContent = "连接失败";
+    detail.textContent = status.last_error || "查看日志获取详情";
+  } else if (stateName === "disconnecting") {
+    title.textContent = "正在断开…";
+    detail.textContent = "恢复路由与 DNS";
+  } else {
+    title.textContent = "空闲";
+    detail.textContent = profile ? `已选择 ${profile.name}` : "选择配置后连接。";
+  }
+
+  const connected = stateName === "connected";
+  const busy = stateName === "connecting" || stateName === "reconnecting" || stateName === "disconnecting";
+  const connectBtn = document.getElementById("connect-btn");
+  const disconnectBtn = document.getElementById("disconnect-btn");
+  connectBtn.classList.toggle("hidden", connected || busy);
+  disconnectBtn.classList.toggle("hidden", !(connected || busy));
+  connectBtn.disabled = !state.profiles.length;
+
+  document.getElementById("home-hint").classList.toggle("hidden", state.profiles.length > 0);
+
+  const remote = status.remote || profile?.remote || "—";
+  document.getElementById("meta-remote").textContent = remote;
+  const proto = status.proto || (profile?.proxy ? "tcp" : profile?.proto) || "—";
+  const mode = status.mode || (profile ? (profile.encless ? "encless" : profile.noise ? "noise" : "plain") : "—");
+  document.getElementById("meta-proto").textContent = `${String(proto).toUpperCase()} · ${mode}`;
+  document.getElementById("meta-iface").textContent = status.iface || profile?.iface || "—";
+  updateUptime();
+
+  const traffic = status.traffic || {};
+  document.getElementById("rx-rate").textContent = formatRate(traffic.rx_bps);
+  document.getElementById("tx-rate").textContent = formatRate(traffic.tx_bps);
+  document.getElementById("rx-total").textContent = `累计 ${formatBytes(traffic.rx_bytes)}`;
+  document.getElementById("tx-total").textContent = `累计 ${formatBytes(traffic.tx_bytes)}`;
+  document.getElementById("rx-payload").textContent = formatBytes(traffic.rx_payload_bytes);
+  document.getElementById("tx-payload").textContent = formatBytes(traffic.tx_payload_bytes);
+
+  renderProfileOptions();
+  setDaemon(state.daemonOnline);
+}
+
+function updateUptime() {
+  const status = state.status || {};
+  const element = document.getElementById("meta-uptime");
+  if (status.state === "connected" && status.since_unix) {
+    const seconds = Math.max(0, Math.floor(Date.now() / 1000) - Number(status.since_unix));
+    element.textContent = formatDuration(seconds);
+  } else if (status.traffic && status.traffic.uptime_s) {
+    element.textContent = formatDuration(status.traffic.uptime_s);
+  } else {
+    element.textContent = "—";
+  }
+}
+
+async function pollStatus(report) {
+  try {
+    const status = await invoke("get_status");
+    if (!state.daemonOnline) setDaemon(true);
+    applyStatus(status);
+    if (report) toast("守护进程在线");
+    return true;
+  } catch (error) {
+    if (state.daemonOnline || report) setDaemon(false);
+    if (report) toast(`守护进程不可达：${error}`, true);
+    return false;
+  }
+}
+
+function applyStatus(status) {
+  state.status = status || { state: "idle", traffic: {} };
+  const active = ["connected", "connecting", "reconnecting", "error"].includes(
+    state.status.state
+  );
+  if (
+    active &&
+    state.status.profile &&
+    state.profiles.some((profile) => profile.name === state.status.profile)
+  ) {
+    state.selected = state.status.profile;
+    localStorage.setItem("rustvpn.profile", state.selected);
+  }
+  if (state.status.state === "idle") {
+    state.samples = [];
+    drawChart();
+  }
+  renderHome();
+}
+
+function handleEvent(payload) {
+  if (!payload || !payload.event) return;
+  if (payload.event === "state") {
+    applyStatus(payload.data);
+  } else if (payload.event === "traffic") {
+    state.status.traffic = payload.data;
+    pushSample(payload.data);
+    renderHome();
+    drawChart();
+  } else if (payload.event === "log") {
+    appendLog(payload.data);
+  } else if (payload.event === "lagged") {
+    pollStatus(false);
+  }
+}
+
+function pushSample(traffic) {
+  state.samples.push({ rx: Number(traffic.rx_bps) || 0, tx: Number(traffic.tx_bps) || 0 });
+  if (state.samples.length > 60) state.samples.shift();
+}
+
+function drawChart() {
+  const canvas = document.getElementById("traffic-chart");
+  if (!canvas) return;
+  const rect = canvas.getBoundingClientRect();
+  if (rect.width === 0) return;
+  const dpr = window.devicePixelRatio || 1;
+  canvas.width = Math.floor(rect.width * dpr);
+  canvas.height = Math.floor(rect.height * dpr);
+  const ctx = canvas.getContext("2d");
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  const width = rect.width;
+  const height = rect.height;
+  ctx.clearRect(0, 0, width, height);
+
+  ctx.strokeStyle = "rgba(78,166,255,.10)";
+  ctx.lineWidth = 1;
+  for (let i = 1; i < 4; i += 1) {
+    const y = (height / 4) * i;
+    ctx.beginPath();
+    ctx.moveTo(0, y);
+    ctx.lineTo(width, y);
+    ctx.stroke();
+  }
+
+  if (state.samples.length < 2) {
+    ctx.fillStyle = "rgba(139,151,171,.7)";
+    ctx.font = "12px sans-serif";
+    ctx.fillText(state.status.state === "connected" ? "等待流量采样…" : "连接后显示实时速率", 12, 18);
+    return;
+  }
+
+  const max = Math.max(1024, ...state.samples.map((sample) => Math.max(sample.rx, sample.tx)));
+  const step = width / Math.max(1, state.samples.length - 1);
+  const drawLine = (key, color, fill) => {
+    ctx.beginPath();
+    state.samples.forEach((sample, index) => {
+      const x = index * step;
+      const y = height - 14 - (sample[key] / max) * (height - 28);
+      if (index === 0) ctx.moveTo(x, y);
+      else ctx.lineTo(x, y);
+    });
+    ctx.lineWidth = 2;
+    ctx.strokeStyle = color;
+    ctx.stroke();
+    if (fill) {
+      ctx.lineTo(width, height);
+      ctx.lineTo(0, height);
+      ctx.closePath();
+      const gradient = ctx.createLinearGradient(0, 0, 0, height);
+      gradient.addColorStop(0, fill);
+      gradient.addColorStop(1, "rgba(0,0,0,0)");
+      ctx.fillStyle = gradient;
+      ctx.fill();
+    }
+  };
+  drawLine("rx", "#3ddc97", "rgba(61,220,151,.20)");
+  drawLine("tx", "#4ea6ff", "rgba(78,166,255,.16)");
+
+  ctx.fillStyle = "rgba(139,151,171,.7)";
+  ctx.font = "11px ui-monospace, monospace";
+  ctx.fillText(`峰值 ${formatRate(max)}`, 10, height - 5);
+}
+
+function validateProfileForConnect(profile) {
+  if (!profile) return "请选择配置";
+  if (!String(profile.name || "").trim()) return "配置名称为空";
+  if (!String(profile.remote || "").trim()) return "服务器地址为空";
+  if (!String(profile.verifier || "").trim()) return "verifier 为空";
+  if (!String(profile.address || "").trim()) {
+    return "请填写 TAP 地址（例如 10.88.0.2/24）";
+  }
+  if (!String(profile.iface || "").trim()) return "接口名为空";
+  const routes = (profile.routes || []).map((route) => String(route).trim().toLowerCase());
+  const fullTunnel = routes.includes("default") || routes.includes("0.0.0.0/0");
+  if (fullTunnel && !String(profile.gateway || "").trim()) {
+    return "全隧道配置需要网关（例如 10.88.0.1）";
+  }
+  if (fullTunnel && !(profile.dns || []).map(String).filter(Boolean).length) {
+    return "全隧道配置需要至少一个 DNS 服务器";
+  }
+  if (profile.encless && profile.proto !== "tcp") {
+    return "Encless 只能配合 TCP";
+  }
+  return null;
+}
+
+function openPassword(profile) {
+  const error = validateProfileForConnect(profile);
+  if (error) {
+    toast(error, true);
+    openProfileModal(profile);
+    return;
+  }
+  state.pendingProfile = profile;
+  document.getElementById("password-title").textContent = `连接 ${profile.name}`;
+  document.getElementById("password-input").value = "";
+  show("password-modal");
+  setTimeout(() => document.getElementById("password-input").focus(), 30);
+}
+
+async function submitPassword(event) {
+  event.preventDefault();
+  const profile = state.pendingProfile;
+  if (!profile) return;
+  const password = document.getElementById("password-input").value;
+  if (!password) {
+    toast("请输入口令", true);
+    return;
+  }
+  const submit = document.getElementById("password-submit");
+  submit.disabled = true;
+  submit.textContent = "提交中…";
+  try {
+    await invoke("connect", { profile, password });
+    document.getElementById("password-input").value = "";
+    hide("password-modal");
+    applyStatus({
+      state: "connecting",
+      profile: profile.name,
+      remote: profile.remote,
+      proto: profile.proxy ? "tcp" : profile.proto,
+      mode: profile.encless ? "encless" : profile.noise ? "noise" : "plain",
+      iface: profile.iface,
+      last_error: null,
+      next_retry_in: null,
+      traffic: {},
+    });
+    toast("已提交连接请求");
+  } catch (error) {
+    toast(`连接失败：${error}`, true);
+    document.getElementById("password-input").value = "";
+  } finally {
+    submit.disabled = false;
+    submit.textContent = "连接";
+  }
+}
+
+async function disconnect() {
+  const button = document.getElementById("disconnect-btn");
+  button.disabled = true;
+  try {
+    await invoke("disconnect");
+    toast("正在断开");
+  } catch (error) {
+    toast(`断开失败：${error}`, true);
+  } finally {
+    button.disabled = false;
+  }
+}
+
+function openProfileModal(profile) {
+  state.editingName = profile ? profile.name : null;
+  document.getElementById("profile-title").textContent = profile ? "编辑配置" : "添加配置";
+  const spec = profile || {
+    name: "",
+    remote: "",
+    proto: "udp",
+    verifier: "",
+    mtu: 1515,
+    timeout: 60,
+    timesync: 0,
+    noise: false,
+    encless: false,
+    cpr: 0,
+    proxy: "",
+    proxy_auth: "",
+    iface: "rsvpn-gui",
+    address: "",
+    gateway: "",
+    dns: [],
+    routes: ["default"],
+    ipv6: false,
+  };
+  setValue("f-name", spec.name);
+  setValue("f-remote", spec.remote);
+  setValue("f-proto", spec.proto || "udp");
+  setValue("f-mtu", spec.mtu);
+  setValue("f-timeout", spec.timeout);
+  setValue("f-timesync", spec.timesync);
+  setValue("f-verifier", spec.verifier);
+  setValue("f-proxy", spec.proxy);
+  setValue("f-proxy-auth", spec.proxy_auth);
+  setValue("f-cpr", spec.cpr);
+  setValue("f-iface", spec.iface);
+  setValue("f-address", spec.address);
+  setValue("f-gateway", spec.gateway);
+  setValue("f-dns", (spec.dns || []).join(", "));
+  setValue("f-routes", (spec.routes || []).join(", "));
+  document.getElementById("f-noise").checked = Boolean(spec.noise);
+  document.getElementById("f-encless").checked = Boolean(spec.encless);
+  document.getElementById("f-ipv6").checked = false;
+  show("profile-modal");
+  setTimeout(() => document.getElementById("f-name").focus(), 30);
+}
+
+function setValue(id, value) {
+  document.getElementById(id).value = value == null ? "" : value;
+}
+
+function readProfileForm() {
+  const splitList = (value) =>
+    String(value || "")
+      .split(/[\n,]/)
+      .map((item) => item.trim())
+      .filter(Boolean);
+  return {
+    name: document.getElementById("f-name").value.trim(),
+    remote: document.getElementById("f-remote").value.trim(),
+    proto: document.getElementById("f-proto").value,
+    verifier: document.getElementById("f-verifier").value.trim(),
+    mtu: Number(document.getElementById("f-mtu").value) || 1515,
+    timeout: Number(document.getElementById("f-timeout").value) || 60,
+    timesync: Number(document.getElementById("f-timesync").value) || 0,
+    noise: document.getElementById("f-noise").checked,
+    encless: document.getElementById("f-encless").checked,
+    cpr: Number(document.getElementById("f-cpr").value) || 0,
+    proxy: document.getElementById("f-proxy").value.trim(),
+    proxy_auth: document.getElementById("f-proxy-auth").value.trim(),
+    iface: document.getElementById("f-iface").value.trim() || "rsvpn-gui",
+    address: document.getElementById("f-address").value.trim(),
+    gateway: document.getElementById("f-gateway").value.trim(),
+    dns: splitList(document.getElementById("f-dns").value),
+    routes: splitList(document.getElementById("f-routes").value),
+    ipv6: false,
+  };
+}
+
+async function submitProfile(event) {
+  event.preventDefault();
+  const profile = readProfileForm();
+  if (!profile.name) {
+    toast("名称不能为空", true);
+    return;
+  }
+  const error = validateProfileForConnect(profile);
+  if (error) {
+    toast(error, true);
+    return;
+  }
+  try {
+    await invoke("save_profile", {
+      profile,
+      previousName: state.editingName,
+    });
+    hide("profile-modal");
+    await loadProfiles();
+    state.selected = profile.name;
+    localStorage.setItem("rustvpn.profile", state.selected);
+    renderProfileOptions();
+    renderHome();
+    toast("配置已保存");
+  } catch (error) {
+    toast(`保存失败：${error}`, true);
+  }
+}
+
+async function deleteProfile(profile) {
+  if (!window.confirm(`删除配置“${profile.name}”？此操作不会影响正在运行的隧道。`)) return;
+  try {
+    await invoke("delete_profile", { name: profile.name });
+    if (state.selected === profile.name) {
+      state.selected = "";
+      localStorage.setItem("rustvpn.profile", "");
+    }
+    await loadProfiles();
+    toast("配置已删除");
+  } catch (error) {
+    toast(`删除失败：${error}`, true);
+  }
+}
+
+async function refreshLogs() {
+  try {
+    const lines = await invoke("get_logs", { limit: 800 });
+    state.logs = [];
+    state.logKeys.clear();
+    (lines || []).forEach(appendLog);
+    renderLogs();
+  } catch (error) {
+    if (state.page === "logs") toast(`读取日志失败：${error}`, true);
+  }
+}
+
+function appendLog(line) {
+  if (!line) return;
+  const key = `${line.ts_ms}|${line.level}|${line.line}`;
+  if (state.logKeys.has(key)) return;
+  state.logKeys.add(key);
+  state.logs.push(line);
+  if (state.logs.length > 1200) {
+    const removed = state.logs.shift();
+    state.logKeys.delete(`${removed.ts_ms}|${removed.level}|${removed.line}`);
+  }
+  if (state.page === "logs") renderLogs();
+}
+
+function renderLogs() {
+  const level = document.getElementById("log-level").value;
+  const lines = state.logs.filter((line) => !level || line.level === level);
+  const view = document.getElementById("log-lines");
+  const atBottom = view.scrollTop + view.clientHeight >= view.scrollHeight - 30;
+  view.innerHTML = lines
+    .slice(-1000)
+    .map(
+      (line) =>
+        `<span class="log-line ${escapeAttr(line.level)}">${formatLogTime(line.ts_ms)} [${escapeHtml(
+          line.level
+        )}] ${escapeHtml(line.line)}</span>`
+    )
+    .join("\n");
+  document.getElementById("log-count").textContent = `${lines.length} 行`;
+  if (atBottom) view.scrollTop = view.scrollHeight;
+}
+
+function formatLogTime(ms) {
+  if (!ms) return "--:--:--";
+  const date = new Date(Number(ms));
+  return `${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(
+    2,
+    "0"
+  )}:${String(date.getSeconds()).padStart(2, "0")}.${String(date.getMilliseconds()).padStart(3, "0")}`;
+}
+
+function formatBytes(value) {
+  const bytes = Number(value) || 0;
+  if (bytes < 1024) return `${bytes} B`;
+  const units = ["KiB", "MiB", "GiB", "TiB"];
+  let amount = bytes / 1024;
+  let index = 0;
+  while (amount >= 1024 && index < units.length - 1) {
+    amount /= 1024;
+    index += 1;
+  }
+  return `${amount >= 100 ? amount.toFixed(0) : amount.toFixed(1)} ${units[index]}`;
+}
+
+function formatRate(value) {
+  return `${formatBytes(value)}/s`;
+}
+
+function formatDuration(seconds) {
+  const total = Math.max(0, Math.floor(Number(seconds) || 0));
+  const hours = Math.floor(total / 3600);
+  const minutes = Math.floor((total % 3600) / 60);
+  const secs = total % 60;
+  if (hours > 0) return `${hours}h ${minutes}m ${secs}s`;
+  if (minutes > 0) return `${minutes}m ${secs}s`;
+  return `${secs}s`;
+}
+
+function show(id) {
+  document.getElementById(id).classList.remove("hidden");
+}
+
+function hide(id) {
+  document.getElementById(id).classList.add("hidden");
+}
+
+let toastTimer = null;
+function toast(message, isError) {
+  const element = document.getElementById("toast");
+  element.textContent = message;
+  element.className = `toast${isError ? " error" : ""}`;
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => element.classList.add("hidden"), 3200);
+}
+
+function escapeHtml(value) {
+  return String(value == null ? "" : value)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+function escapeAttr(value) {
+  return escapeHtml(value).replace(/`/g, "&#96;");
+}

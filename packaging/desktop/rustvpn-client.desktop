@@ -1,0 +1,10 @@
+[Desktop Entry]
+Name=RustVPN
+Comment=RustVPN desktop client
+Exec=rustvpn-client-ui
+Icon=rustvpn
+Terminal=false
+Type=Application
+Categories=Network;VPN;
+Keywords=vpn;rustvpn;govpn;
+StartupWMClass=RustVPN

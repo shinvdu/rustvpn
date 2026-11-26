@@ -1,0 +1,19 @@
+[package]
+name = "rustvpn-clientd"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "rustvpn-clientd"
+path = "src/main.rs"
+
+[dependencies]
+rustvpn-client-core = { path = "../rustvpn-client-core" }
+rustvpn-client-ipc = { path = "../rustvpn-client-ipc" }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+anyhow = { workspace = true }
+zeroize = { workspace = true }
+libc = { workspace = true }

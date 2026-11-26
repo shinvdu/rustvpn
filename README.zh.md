@@ -100,6 +100,7 @@ alice:
 - [设计](docs/zh/design.md)
 - [性能](docs/zh/performance.md)
 - [管理端 Web UI（可选）](docs/admin-web-ui.md)
+- [客户端桌面 UI（Linux MVP）](docs/client-ui.md)
 
 ## 测试与基准
 

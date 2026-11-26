@@ -13,6 +13,7 @@ path = "src/main.rs"
 rustvpn-crypto = { path = "../rustvpn-crypto" }
 rustvpn-proto = { path = "../rustvpn-proto" }
 rustvpn-net = { path = "../rustvpn-net" }
+rustvpn-client-core = { path = "../rustvpn-client-core" }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 anyhow = { workspace = true }

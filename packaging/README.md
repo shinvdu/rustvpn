@@ -75,3 +75,46 @@ If the admin daemon fails to start, the data plane is unaffected; stop
 
 The control socket lives in `/run/rustvpn` and is local-only. Do not expose it
 over TCP or mount it from an untrusted namespace.
+
+## Desktop client (Linux)
+
+- `systemd/rustvpn-clientd.service` — privileged client daemon (TAP, routes,
+  DNS, reconnect); keeps `CAP_NET_ADMIN`/`CAP_NET_RAW`.
+- `desktop/rustvpn-client.desktop` — desktop entry for the Tauri UI.
+
+The GUI (`rustvpn-client-ui`) runs as the logged-in user and talks to the
+daemon over `/run/rustvpn-client/client.sock` (`0660`, group `rustvpn`). Users must be
+members of that group (primary or supplementary; the daemon checks
+`/proc/<pid>/status`). The CLI `rustvpn-client` remains independent and does
+not need the daemon, but both share `/run/rustvpn-client/tunnel.lock` so only one
+tunnel can own the host routes. If the CLI runs as a systemd service, give it
+`RuntimeDirectory=rustvpn-client` and `RuntimeDirectoryMode=0750` as well, otherwise
+it cannot see the shared lock created by the daemon.
+
+A GUI profile must have an IPv4 `address`. A full-tunnel profile (`routes`
+containing `default`/`0.0.0.0/0`) also needs a `gateway` and an IPv4 `dns`
+server; the daemon refuses to connect otherwise to avoid accidentally
+installing an unreachable default route or leaking DNS. On full-tunnel
+connections it installs an IPv6 blackhole default route for the duration of
+the tunnel; IPv6 is not tunnelled yet.
+
+```bash
+sudo groupadd --system rustvpn
+sudo useradd --system --no-create-home --shell /usr/sbin/nologin -g rustvpn rustvpn
+sudo usermod -aG rustvpn "$USER"
+
+cargo build --release -p rustvpn-clientd -p rustvpn-client-gui
+sudo install -m 0755 target/release/rustvpn-clientd /usr/local/bin/
+sudo install -m 0755 target/release/rustvpn-client-ui /usr/local/bin/
+sudo install -m 0644 packaging/systemd/rustvpn-clientd.service /etc/systemd/system/
+sudo install -Dm0644 packaging/desktop/rustvpn-client.desktop \
+    /usr/share/applications/rustvpn-client.desktop
+sudo install -Dm0644 packaging/desktop/rustvpn.png \
+    /usr/share/icons/hicolor/128x128/apps/rustvpn.png
+sudo systemctl daemon-reload
+sudo systemctl enable --now rustvpn-clientd.service
+```
+
+Build the GUI on Ubuntu 24.04 needs the Tauri dependencies:
+`libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev
+libxdo-dev libssl-dev`. See [`docs/client-ui.md`](../docs/client-ui.md).

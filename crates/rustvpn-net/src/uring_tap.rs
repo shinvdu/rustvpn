@@ -227,6 +227,11 @@ fn uring_thread<T: Send + 'static>(
                         if result > 0 {
                             let n = result as usize;
                             let _ = in_tx.try_send(read_buf[..n].to_vec());
+                        } else if result == 0 {
+                            // A down TAP can return 0 immediately.  Keep the
+                            // thread alive for the later up transition, but
+                            // back off so a down interface cannot spin at 100%.
+                            std::thread::sleep(std::time::Duration::from_millis(100));
                         } else if result < 0 && result != -libc::EAGAIN {
                             eprintln!("io_uring TAP read failed: {}", -result);
                             if -result == libc::EBADF || -result == libc::ENODEV {
