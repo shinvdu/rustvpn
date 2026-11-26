@@ -75,6 +75,11 @@ The Tauri client does not read CLI flags; it uses
 - `mtu` is a positive numeric **wire** MTU shared by both peers (see
   [MTU](#mtu)).  `auto` and `0` are rejected in v1; only the TAP interface IP
   MTU and MSS are derived from it.
+- Profiles that cannot be parsed are not silently hidden.  In particular a
+  legacy `mtu: auto` or `mtu: 0` file is reported in the UI (and on stderr)
+  with its path until it is migrated to the numeric wire MTU shared with the
+  server (for example `mtu: 1515`).  The daemon validates the same bounds
+  again before connecting.
 - `mss_clamp: true` (or `auto`) clamps TCP MSS with nftables on the daemon
   path; it is opt-in, best-effort if `nft` is missing, and removed on
   disconnect.  IPv4 and IPv6 get separate derived values.
@@ -222,7 +227,10 @@ Both scripts receive:
 | `GOVPN_REMOTE` | The peer's remote address. |
 
 Server order: **up script → TAP open → handshake**. Because the daemon
-opens the TAP itself, `up` must create a persistent device:
+opens the TAP itself, `up` must create a persistent device **unless** the
+peer uses `network:`, which owns TAP creation (an up script may still run for
+other work but must not create `<iface>`, or must mark it
+`rustvpn-managed`):
 
 ```sh
 #!/bin/sh
@@ -380,15 +388,26 @@ alice:
   `ip link set dev <iface> alias rustvpn-managed`.  A pre-existing TAP
   **without** that alias is refused and left untouched, so an administrator's
   address/routes/DNS are never destroyed.  A marked TAP is treated as an
-  orphan from a previous RustVPN run (crash/restart) and adopted; it is deleted
-  on shutdown.  When upgrading from a build that created an unmarked TAP,
-  delete it (or set the alias manually) before starting this version.
-- `up`/`down` remain fully supported escape hatches.  If both are present,
-  `up` runs first and the declarative setup is applied idempotently after it.
-  No script is required for the declarative path.
+  orphan from a previous RustVPN run (crash/restart) and adopted; before the
+  new `network:` config is applied, its stale IPv4 addresses, routes and
+  resolver state are flushed (the marker is the ownership proof), and it is
+  deleted on shutdown.  When upgrading from a build that created an unmarked
+  TAP, delete it (or set the alias manually) before starting this version.
+- **`network:` owns TAP creation.**  `up`/`down` may still run (for logging or
+  other side effects), but an `up` script configured alongside `network:` must
+  **not** create `<iface>`.  An unmarked pre-existing TAP is refused with an
+  explicit error; if a script must create it, the script must also set
+  `ip link set dev <iface> alias rustvpn-managed`, after which the server
+  adopts and deletes it like any other owned TAP.  No script is required for
+  the declarative path.
 - On any setup failure the address/routes/DNS/MTU changes and the RustVPN TAP
   are rolled back.  Successfully configured declarative state is removed on
   server shutdown.
+- **Reload/removal cleanup:** when a peer is removed, its `network:` section is
+  dropped, or its mode/MTU/network fields change, the old declarative guard is
+  removed after the affected session is revoked.  Guards still required by an
+  active unchanged peer are kept; changing a peer back to a pure script path
+  therefore no longer requires a server restart.
 - **Non-destructive installation:** addresses and routes are added with
   `ip addr add` / `ip route add`, never `replace`.  On `EEXIST`, an exactly
   matching pre-existing address/route is treated as idempotent (useful when
@@ -408,9 +427,10 @@ alice:
 - Server `mtu` stays the top-level numeric wire value; the TAP IP MTU and MSS
   are derived from it.  MSS clamp and kill-switch remain client-profile
   features, and `mtu: auto` is deferred to v2.
-- Switching an existing peer from `network:` back to a pure script path is not
-  auto-migrated while the server runs; restart the server (or clean the TAP
-  manually) so the declarative state is removed on shutdown.
+- Switching an existing peer from `network:` back to a pure script path is
+  detected on the next reload: the now-unused declarative guard is removed
+  after the old session is revoked.  If the script then creates the TAP, it
+  must do so after the cleanup (or the server will refuse an unmarked TAP).
 - Validate new TAP/route settings in a disposable network namespace (see
   [`docs/netns-client.md`](../netns-client.md)) before pointing a real server
   at them.

@@ -2,7 +2,7 @@
 
 use ipnet::IpNet;
 use serde::de::{self, Deserializer};
-use serde::ser::Serializer;
+use serde::ser::{Error as SerError, Serializer};
 use serde::{Deserialize, Serialize};
 
 /// Canonical default-route test shared by client profile handling.
@@ -28,6 +28,14 @@ pub fn is_default_route(route: &str) -> bool {
 /// v1 rejects both `mtu: auto` and `mtu: 0`; the constant is kept so callers
 /// can recognise profiles written by older builds and report a clear error.
 pub const MTU_AUTO: usize = 0;
+
+/// Valid wire-MTU range, mirrored from `rustvpn-proto` so this crate stays
+/// dependency-light.  The daemon remains authoritative; the GUI re-checks the
+/// same bounds before it writes a profile.
+pub const MTU_MIN: usize = 68;
+/// Padded modes (noise/encless) carry more per-frame overhead.
+pub const MTU_MIN_NOISE: usize = 120;
+pub const MTU_MAX: usize = 9015;
 
 fn default_mtu() -> usize {
     1515
@@ -72,10 +80,15 @@ where
     S: Serializer,
 {
     if *mtu == MTU_AUTO {
-        serializer.serialize_str("auto")
-    } else {
-        serializer.serialize_u64(*mtu as u64)
+        // Never rewrite the legacy sentinel into a non-numeric `"auto"`.
+        // Rejecting here makes a zero MTU a hard error at every serialization
+        // boundary instead of silently producing a profile v1 cannot load.
+        return Err(<S::Error as SerError>::custom(
+            "mtu 0/auto is invalid and cannot be serialized; \
+             use a numeric wire MTU (for example 1515)",
+        ));
     }
+    serializer.serialize_u64(*mtu as u64)
 }
 
 /// Accept `true`/`false`, or `auto`/`off` for options that can be derived.
@@ -152,6 +165,31 @@ pub struct ProfileSpec {
 impl ProfileSpec {
     pub fn mtu_is_auto(&self) -> bool {
         self.mtu == MTU_AUTO
+    }
+
+    /// Validate the numeric MTU before a profile is persisted.
+    ///
+    /// The daemon performs the authoritative validation before connecting;
+    /// this is a defense-in-depth check for the GUI, which serializes profiles
+    /// written by the webview.  Legacy `0`/`auto` values are rejected rather
+    /// than rewritten.
+    pub fn validate_mtu(&self) -> Result<(), String> {
+        if self.mtu == MTU_AUTO {
+            return Err(
+                "mtu: auto and mtu: 0 are not supported in v1; configure the numeric wire MTU \
+                 shared by both peers (for example 1515)"
+                    .into(),
+            );
+        }
+        if !(MTU_MIN..=MTU_MAX).contains(&self.mtu) {
+            return Err(format!("MTU must be between {MTU_MIN} and {MTU_MAX}"));
+        }
+        if (self.noise || self.encless) && self.mtu < MTU_MIN_NOISE {
+            return Err(format!(
+                "minimum permissible MTU for noise/encless mode is {MTU_MIN_NOISE}"
+            ));
+        }
+        Ok(())
     }
 
     pub fn mode_name(&self) -> &'static str {
@@ -533,6 +571,57 @@ mod tests {
         assert_eq!(spec.mtu, 1540);
         let encoded = serde_json::to_value(&spec).unwrap();
         assert_eq!(encoded["mtu"], 1540);
+    }
+
+    #[test]
+    fn zero_mtu_is_never_silently_serialized_as_auto() {
+        let spec = ProfileSpec {
+            mtu: MTU_AUTO,
+            ..ProfileSpec::default()
+        };
+        let json_error = serde_json::to_value(&spec).unwrap_err().to_string();
+        assert!(
+            json_error.contains("cannot be serialized"),
+            "unexpected JSON error: {json_error}"
+        );
+        let yaml_error = serde_yaml_ng::to_string(&spec).unwrap_err().to_string();
+        assert!(
+            yaml_error.contains("cannot be serialized"),
+            "unexpected YAML error: {yaml_error}"
+        );
+        // A numeric MTU remains numeric; the legacy string is never emitted.
+        let encoded = serde_json::to_value(ProfileSpec::default()).unwrap();
+        assert_eq!(encoded["mtu"], 1515);
+        assert_ne!(encoded["mtu"], "auto");
+    }
+
+    #[test]
+    fn validate_mtu_rejects_zero_auto_range_and_padded_minimum() {
+        let mut spec = ProfileSpec {
+            mtu: 1515,
+            ..ProfileSpec::default()
+        };
+        assert!(spec.validate_mtu().is_ok());
+
+        spec.mtu = MTU_AUTO;
+        assert!(spec.validate_mtu().unwrap_err().contains("auto"));
+
+        spec.mtu = MTU_MIN - 1;
+        assert!(spec.validate_mtu().unwrap_err().contains("between"));
+
+        spec.mtu = MTU_MAX + 1;
+        assert!(spec.validate_mtu().unwrap_err().contains("between"));
+
+        spec.mtu = MTU_MIN_NOISE - 1;
+        assert!(spec.validate_mtu().is_ok());
+        spec.noise = true;
+        assert!(spec.validate_mtu().unwrap_err().contains("noise"));
+        spec.noise = false;
+        spec.encless = true;
+        assert!(spec.validate_mtu().unwrap_err().contains("noise"));
+        spec.encless = false;
+        spec.mtu = MTU_MIN_NOISE;
+        assert!(spec.validate_mtu().is_ok());
     }
 
     #[test]

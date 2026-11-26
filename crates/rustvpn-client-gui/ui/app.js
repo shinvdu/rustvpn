@@ -342,6 +342,20 @@ async function loadAutostart() {
 async function loadProfiles() {
   try {
     state.profiles = await invoke("list_profiles");
+    try {
+      const errors = await invoke("profile_errors");
+      if (errors && errors.length) {
+        toast(
+          t("{count} 个配置无法加载：{first}", {
+            count: errors.length,
+            first: errors[0].message,
+          }),
+          true
+        );
+      }
+    } catch (reportError) {
+      // Reporting failures must not hide otherwise valid profiles.
+    }
   } catch (error) {
     toast(t("读取配置失败：{error}", { error }), true);
     state.profiles = [];

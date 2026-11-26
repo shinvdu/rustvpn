@@ -259,7 +259,8 @@ updater 面向 AppImage 自更新；通过本仓库 deb/rpm 安装的副本应�
 - 仅 Linux；Windows/macOS 需要 L3 适配器 + 以太网垫片，尚未实现。
 - `mtu: auto`/路径 MTU 自适应当前**未实现**（推迟到 v2 的 MTU 协商）；v1 必须使用
   双方一致的数值 MTU。升级旧 profile 时把 `mtu: auto`/`0` 改成 `1515`（或服务端
-  实际值）。
+  实际值）。无法解析的 profile 不再静默消失：`list_profiles` 仍只返回可用配置，
+  但 GUI 会通过 `profile_errors` 在界面提示文件路径与迁移方法，同时在 stderr 记录。
 - `rustvpn-verifier` 生成的 `rustvpn://profile` URI 仅作参考，**没有自动导入器**；
   文档不再宣称“扫码即连”。请用生成的 YAML profile 或 QR 图片手动导入。
 - kill-switch 只保护主机自身 `output` 流量；不保护 forward/容器/ICS/LAN 转发，

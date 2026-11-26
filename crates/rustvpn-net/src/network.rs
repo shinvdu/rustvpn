@@ -81,14 +81,41 @@ impl TapGuard {
                 .await;
         }
         if self.owned_tap {
-            let _ = self
-                .run(&[
-                    "link".into(),
-                    "del".into(),
-                    "dev".into(),
-                    self.iface.clone(),
-                ])
-                .await;
+            // A peer task cancelled by a reload may still hold the TAP file
+            // descriptor for a few milliseconds, making `ip link del` fail
+            // with EBUSY.  Retry briefly so a removed peer does not leave its
+            // declarative TAP behind until the server exits.
+            let mut deleted = false;
+            let mut last_error = String::new();
+            for attempt in 0..4 {
+                match self
+                    .run(&[
+                        "link".into(),
+                        "del".into(),
+                        "dev".into(),
+                        self.iface.clone(),
+                    ])
+                    .await
+                {
+                    Ok(output) if output.status.success() => {
+                        deleted = true;
+                        break;
+                    }
+                    Ok(output) => {
+                        last_error = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                    }
+                    Err(error) => last_error = error.to_string(),
+                }
+                if attempt < 3 {
+                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                }
+            }
+            if !deleted {
+                eprintln!(
+                    "delete declarative TAP {} failed after retries: {last_error}",
+                    self.iface
+                );
+            }
             self.owned_tap = false;
         }
     }
@@ -103,8 +130,9 @@ impl TapGuard {
 /// MTU (`Mode::max_payload(wire_mtu) - 14`), never the wire/frame budget.
 ///
 /// A pre-existing TAP without the [`TAP_ALIAS_MARKER`] alias is refused; a
-/// marked TAP is treated as an orphan from a previous RustVPN run and is
-/// deleted on cleanup.  On failure every change made so far is rolled back.
+/// marked TAP is treated as an orphan from a previous RustVPN run, has its
+/// stale IPv4 state flushed before the new config is applied, and is deleted
+/// on cleanup.  On failure every change made so far is rolled back.
 pub async fn configure_tap(
     iface: &str,
     inner_ip_mtu: usize,
@@ -125,6 +153,7 @@ pub async fn configure_tap(
     };
 
     let existing = show_link(&ip, iface).await?;
+    let mut adopted = false;
     match existing {
         Some(info) => {
             if !info.is_tap {
@@ -134,12 +163,16 @@ pub async fn configure_tap(
                 bail!(
                     "{iface} already exists but is not marked as RustVPN-owned \
                      (alias {TAP_ALIAS_MARKER:?}); refusing to modify a pre-existing TAP. \
+                     `network:` owns TAP creation, so an `up` script configured alongside it \
+                     must not create this interface (or must mark it itself with \
+                     `ip link set dev {iface} alias {TAP_ALIAS_MARKER}`). \
                      Remove it or use a different iface name"
                 );
             }
             // A marked TAP is an orphan from a previous RustVPN run (or a
             // previous config); adopt it and delete it on shutdown.
             guard.owned_tap = true;
+            adopted = true;
         }
         None => {
             let output = run_command(
@@ -181,6 +214,18 @@ pub async fn configure_tap(
         }
     }
 
+    // Only a marked (RustVPN-owned) orphan is flushed.  A pre-existing
+    // unmarked interface never reaches this point, so administrator state is
+    // untouched.  This removes stale addresses/routes/DNS left by the crashed
+    // run before the new `network:` config is applied; otherwise `addr add`
+    // would happily stack a second address on the adopted TAP.
+    if adopted {
+        if let Err(error) = guard.flush_adopted_state().await {
+            guard.cleanup().await;
+            return Err(error);
+        }
+    }
+
     if let Err(error) = guard.apply(inner_ip_mtu, network).await {
         guard.cleanup().await;
         return Err(error);
@@ -189,6 +234,50 @@ pub async fn configure_tap(
 }
 
 impl TapGuard {
+    /// Drop stale IPv4 state from a marked orphan before applying new config.
+    ///
+    /// This TAP carries the RustVPN ownership marker, so its addresses and
+    /// routes belong to a previous RustVPN instance.  IPv4-only matches the
+    /// declarative `network:` feature; IPv6 is never configured here.
+    async fn flush_adopted_state(&self) -> Result<()> {
+        let addr = self
+            .run(&[
+                "-4".into(),
+                "addr".into(),
+                "flush".into(),
+                "dev".into(),
+                self.iface.clone(),
+            ])
+            .await?;
+        if !addr.status.success() {
+            bail!(
+                "flush stale addresses on adopted TAP {}: {}",
+                self.iface,
+                String::from_utf8_lossy(&addr.stderr).trim()
+            );
+        }
+        let route = self
+            .run(&[
+                "-4".into(),
+                "route".into(),
+                "flush".into(),
+                "dev".into(),
+                self.iface.clone(),
+            ])
+            .await?;
+        if !route.status.success() {
+            bail!(
+                "flush stale routes on adopted TAP {}: {}",
+                self.iface,
+                String::from_utf8_lossy(&route.stderr).trim()
+            );
+        }
+        if let Some(resolvectl) = which_resolvectl() {
+            let _ = run_command(&resolvectl, &["revert".into(), self.iface.clone()]).await;
+        }
+        Ok(())
+    }
+
     async fn apply(&mut self, inner_ip_mtu: usize, network: &PeerNetwork) -> Result<()> {
         let link = self
             .run(&[
@@ -599,6 +688,22 @@ exit 0
         path
     }
 
+    fn fake_resolvectl(dir: &Path) -> PathBuf {
+        let path = dir.join("resolvectl");
+        std::fs::write(
+            &path,
+            r#"#!/bin/sh
+echo "resolvectl $*" >> "$FAKE_LOG"
+exit 0
+"#,
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms).unwrap();
+        path
+    }
+
     fn network() -> PeerNetwork {
         PeerNetwork {
             address: "10.88.0.1/24".into(),
@@ -614,7 +719,9 @@ exit 0
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("commands.log");
         let ip = fake_ip(dir.path());
+        let resolvectl = fake_resolvectl(dir.path());
         std::env::set_var("RUSTVPN_IP_BIN", &ip);
+        std::env::set_var("RUSTVPN_RESOLVECTL_BIN", &resolvectl);
         std::env::set_var("FAKE_LOG", &log);
         std::env::set_var("FAKE_ALIAS", TAP_ALIAS_MARKER);
         std::env::remove_var("FAKE_MISSING");
@@ -643,6 +750,7 @@ exit 0
         assert!(!text.contains("tuntap add"), "{text}");
 
         std::env::remove_var("RUSTVPN_IP_BIN");
+        std::env::remove_var("RUSTVPN_RESOLVECTL_BIN");
         std::env::remove_var("FAKE_LOG");
         std::env::remove_var("FAKE_ALIAS");
     }
@@ -664,6 +772,9 @@ exit 0
         assert!(error.to_string().contains("route"), "{error:#}");
         let text = std::fs::read_to_string(&log).unwrap();
         assert!(text.contains("tuntap add dev tap0 mode tap"), "{text}");
+        // A freshly created TAP has no stale RustVPN state to flush.
+        assert!(!text.contains("addr flush"), "{text}");
+        assert!(!text.contains("route flush"), "{text}");
         assert!(
             text.contains("link set dev tap0 alias rustvpn-managed"),
             "{text}"
@@ -692,6 +803,8 @@ exit 0
         let error = configure_tap("tap0", 1400, &network()).await.unwrap_err();
         let text = error.to_string();
         assert!(text.contains("not marked as RustVPN-owned"), "{text}");
+        // `up` + `network:` is explicit: network owns TAP creation.
+        assert!(text.contains("`network:` owns TAP creation"), "{text}");
         let log_text = std::fs::read_to_string(&log).unwrap();
         // Nothing may be changed on a pre-existing unmarked TAP.
         assert!(!log_text.contains("tuntap add"), "{log_text}");
@@ -709,7 +822,9 @@ exit 0
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("commands.log");
         let ip = fake_ip(dir.path());
+        let resolvectl = fake_resolvectl(dir.path());
         std::env::set_var("RUSTVPN_IP_BIN", &ip);
+        std::env::set_var("RUSTVPN_RESOLVECTL_BIN", &resolvectl);
         std::env::set_var("FAKE_LOG", &log);
         std::env::set_var("FAKE_ALIAS", TAP_ALIAS_MARKER);
         std::env::remove_var("FAKE_MISSING");
@@ -725,8 +840,61 @@ exit 0
         assert!(text.contains("link del dev tap0"), "{text}");
 
         std::env::remove_var("RUSTVPN_IP_BIN");
+        std::env::remove_var("RUSTVPN_RESOLVECTL_BIN");
         std::env::remove_var("FAKE_LOG");
         std::env::remove_var("FAKE_ALIAS");
+    }
+
+    #[tokio::test]
+    async fn adopting_marked_orphan_flushes_stale_state_before_new_config() {
+        let _guard = NET_TEST_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("commands.log");
+        let ip = fake_ip(dir.path());
+        let resolvectl = fake_resolvectl(dir.path());
+        std::env::set_var("RUSTVPN_IP_BIN", &ip);
+        std::env::set_var("RUSTVPN_RESOLVECTL_BIN", &resolvectl);
+        std::env::set_var("FAKE_LOG", &log);
+        std::env::set_var("FAKE_ALIAS", TAP_ALIAS_MARKER);
+        std::env::remove_var("FAKE_MISSING");
+        std::env::remove_var("FAKE_FAIL");
+        std::env::remove_var("FAKE_EXISTS");
+        std::env::remove_var("FAKE_ADDR_SHOW");
+        std::env::remove_var("FAKE_ROUTE_SHOW");
+
+        // New config differs from the one a crashed run would have installed.
+        let new_network = PeerNetwork {
+            address: "10.88.9.1/30".into(),
+            gateway: String::new(),
+            dns: vec!["10.88.9.2".into()],
+            routes: vec!["10.88.9.0/30".into()],
+        };
+        let guard = configure_tap("tap0", 1492, &new_network).await.unwrap();
+        guard.remove().await;
+        let text = std::fs::read_to_string(&log).unwrap();
+
+        // Stale state is flushed only after the ownership marker is verified.
+        assert!(text.contains("-4 addr flush dev tap0"), "{text}");
+        assert!(text.contains("-4 route flush dev tap0"), "{text}");
+        assert!(text.contains("resolvectl revert tap0"), "{text}");
+        let flush_at = text.find("addr flush").unwrap();
+        let add_at = text.find("addr add 10.88.9.1/30 dev tap0").unwrap();
+        assert!(
+            flush_at < add_at,
+            "stale state must be flushed before the new address:\n{text}"
+        );
+        assert!(!text.contains("tuntap add"), "{text}");
+
+        for var in [
+            "RUSTVPN_IP_BIN",
+            "RUSTVPN_RESOLVECTL_BIN",
+            "FAKE_LOG",
+            "FAKE_ALIAS",
+            "FAKE_ADDR_SHOW",
+            "FAKE_ROUTE_SHOW",
+        ] {
+            std::env::remove_var(var);
+        }
     }
 
     #[tokio::test]
@@ -735,7 +903,9 @@ exit 0
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("commands.log");
         let ip = fake_ip(dir.path());
+        let resolvectl = fake_resolvectl(dir.path());
         std::env::set_var("RUSTVPN_IP_BIN", &ip);
+        std::env::set_var("RUSTVPN_RESOLVECTL_BIN", &resolvectl);
         std::env::set_var("FAKE_LOG", &log);
         std::env::set_var("FAKE_ALIAS", TAP_ALIAS_MARKER);
         // Both the address and the route already exist with the same values
@@ -762,6 +932,7 @@ exit 0
 
         for var in [
             "RUSTVPN_IP_BIN",
+            "RUSTVPN_RESOLVECTL_BIN",
             "FAKE_LOG",
             "FAKE_ALIAS",
             "FAKE_EXISTS",
@@ -778,7 +949,9 @@ exit 0
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("commands.log");
         let ip = fake_ip(dir.path());
+        let resolvectl = fake_resolvectl(dir.path());
         std::env::set_var("RUSTVPN_IP_BIN", &ip);
+        std::env::set_var("RUSTVPN_RESOLVECTL_BIN", &resolvectl);
         std::env::set_var("FAKE_LOG", &log);
         std::env::set_var("FAKE_ALIAS", TAP_ALIAS_MARKER);
         // The route exists, but with a different next hop: adding it must
@@ -808,6 +981,7 @@ exit 0
 
         for var in [
             "RUSTVPN_IP_BIN",
+            "RUSTVPN_RESOLVECTL_BIN",
             "FAKE_LOG",
             "FAKE_ALIAS",
             "FAKE_EXISTS",
@@ -830,7 +1004,9 @@ exit 0
             let dir = tempfile::tempdir().unwrap();
             let log = dir.path().join("commands.log");
             let ip = fake_ip(dir.path());
+            let resolvectl = fake_resolvectl(dir.path());
             std::env::set_var("RUSTVPN_IP_BIN", &ip);
+            std::env::set_var("RUSTVPN_RESOLVECTL_BIN", &resolvectl);
             std::env::set_var("FAKE_LOG", &log);
             std::env::set_var("FAKE_ALIAS", TAP_ALIAS_MARKER);
             std::env::remove_var("FAKE_MISSING");
@@ -843,6 +1019,7 @@ exit 0
             assert!(text.contains(expected), "missing {expected:?} in:\n{text}");
 
             std::env::remove_var("RUSTVPN_IP_BIN");
+            std::env::remove_var("RUSTVPN_RESOLVECTL_BIN");
             std::env::remove_var("FAKE_LOG");
             std::env::remove_var("FAKE_ALIAS");
         }

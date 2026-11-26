@@ -1224,6 +1224,65 @@ fn guard_fingerprint_matches(applied: Option<&str>, expected: &str) -> bool {
     applied == Some(expected)
 }
 
+/// Interfaces whose applied declarative guard is no longer required by any
+/// peer in the current configuration.
+///
+/// The fingerprint includes mode, wire/inner MTU and the `network:` body, so a
+/// changed peer or a removed `network:` section makes its guard stale.  A peer
+/// with an empty `iface` (the up script prints the name) cannot be matched by
+/// interface name; it keeps any guard with the same fingerprint to avoid
+/// tearing down state that an active unchanged peer may still use.
+fn stale_declarative_guard_ifaces(
+    applied: &HashMap<String, String>,
+    set: &ConfigSet,
+) -> Vec<String> {
+    let mut stale: Vec<String> = applied
+        .iter()
+        .filter(|(iface, fingerprint)| {
+            let iface = iface.as_str();
+            let fingerprint = fingerprint.as_str();
+            !set.peers.iter().any(|cfg| {
+                let Some(network) = cfg.network.as_ref() else {
+                    return false;
+                };
+                declarative_network_fingerprint(cfg, network) == fingerprint
+                    && (cfg.iface == iface || cfg.iface.is_empty())
+            })
+        })
+        .map(|(iface, _)| iface.clone())
+        .collect();
+    stale.sort_unstable();
+    stale
+}
+
+/// Drop declarative state for peers that no longer exist or changed.
+///
+/// Runs after the reload revocation pass.  The registry is already updated, so
+/// any guard whose interface/fingerprint is not required by the current
+/// configuration belongs to a removed or changed peer.  Guards still used by
+/// an active unchanged peer match the current fingerprint and are kept.
+async fn prune_declarative_guards(ctx: &ServerContext) {
+    let set = ctx.configs.read().await.clone();
+    let mut guards = ctx.network_guards.lock().await;
+    let applied: HashMap<String, String> = guards
+        .iter()
+        .map(|(iface, entry)| (iface.clone(), entry.fingerprint.clone()))
+        .collect();
+    let stale = stale_declarative_guard_ifaces(&applied, &set);
+    if stale.is_empty() {
+        return;
+    }
+    // Let cancelled peer tasks drop their TAP handles while the guard lock
+    // prevents a concurrent handshake from reopening the same interface.
+    tokio::time::sleep(Duration::from_millis(25)).await;
+    for iface in stale {
+        if let Some(applied) = guards.remove(&iface) {
+            eprintln!("declarative network: {iface} no longer required; removing");
+            applied.guard.remove().await;
+        }
+    }
+}
+
 fn msg1_len(cfg: &PeerConfig) -> usize {
     if cfg.encless {
         ENCLESS_ENLARGE_SIZE + cfg.mtu
@@ -2060,6 +2119,9 @@ async fn run(args: Args) -> Result<()> {
                             }
                         }
                         eprintln!("reload: {summary}; revoked {revoked_count} active session(s)");
+                        // Removed/changed peers may have left declarative TAP
+                        // state with no live session to clean it up.
+                        prune_declarative_guards(&ctx).await;
                     }
                     Some(MainRequest::Kick { id, reason, reply }) => {
                         let result = match registry.addr_by_id(&id) {
@@ -2797,6 +2859,59 @@ mod tests {
         assert!(declarative_reapply_needed(Some(&noise_fp), &plain_fp));
         // Unchanged mode/MTU/network is still a no-op.
         assert!(!declarative_reapply_needed(Some(&plain_fp), &plain_fp));
+    }
+
+    #[test]
+    fn removed_or_changed_peers_prune_only_their_declarative_guards() {
+        let network = declarative_network();
+        let mut alice = test_peer("alice", [1u8; 16], 1515);
+        alice.network = Some(network.clone());
+        let mut bob = test_peer("bob", [2u8; 16], 1515);
+        bob.network = Some(network.clone());
+        let alice_fp = declarative_network_fingerprint(&alice, &network);
+        let bob_fp = declarative_network_fingerprint(&bob, &network);
+        let applied = HashMap::from([
+            ("tap-alice".to_string(), alice_fp.clone()),
+            ("tap-bob".to_string(), bob_fp.clone()),
+        ]);
+
+        // Both peers still exist: keep both guards.
+        let set = config_set(vec![alice.clone(), bob.clone()]);
+        assert!(stale_declarative_guard_ifaces(&applied, &set).is_empty());
+
+        // Removing alice must prune only alice's guard; bob is unchanged.
+        let set = config_set(vec![bob.clone()]);
+        assert_eq!(
+            stale_declarative_guard_ifaces(&applied, &set),
+            vec!["tap-alice"]
+        );
+
+        // A mode-only change alters the fingerprint, so the old guard is stale
+        // and the next handshake rebuilds the TAP with the mode-derived MTU.
+        let mut changed = bob.clone();
+        changed.noise = true;
+        let set = config_set(vec![changed]);
+        assert_eq!(
+            stale_declarative_guard_ifaces(&applied, &set),
+            vec!["tap-alice", "tap-bob"]
+        );
+
+        // Dropping the `network:` section also makes the guard stale.
+        let mut scripted = bob.clone();
+        scripted.network = None;
+        let set = config_set(vec![scripted]);
+        assert_eq!(
+            stale_declarative_guard_ifaces(&applied, &set),
+            vec!["tap-alice", "tap-bob"]
+        );
+
+        // Empty `iface` (the up script prints the name) cannot be matched by
+        // name; the same fingerprint is kept conservatively.
+        let mut up_named = alice.clone();
+        up_named.iface.clear();
+        let set = config_set(vec![up_named]);
+        let applied_runtime = HashMap::from([("runtime-tap".to_string(), alice_fp)]);
+        assert!(stale_declarative_guard_ifaces(&applied_runtime, &set).is_empty());
     }
 
     #[test]

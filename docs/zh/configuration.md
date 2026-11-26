@@ -63,6 +63,7 @@ Tauri 客户端不读取 CLI 参数，而是使用
 - 必须有 IPv4 `address`；全隧道（`routes` 含 `default`、`0.0.0.0/0` 或被规范化为前缀 0 的写法）还必须提供 `gateway` 和至少一个 IPv4 `dns`。
 - 默认 `iface` 为 `rsvpn-gui`，避免与本机 `rustvpn-client` 的 `tap0/rsvpn0` 冲突。
 - 不支持 `up`/`down` 脚本；地址、路由、DNS 和 IPv6 防护由 `rustvpn-clientd` 内置管理。
+- 无法解析的 profile 不会被静默隐藏。旧版 `mtu: auto` / `mtu: 0` 文件会在 UI 与 stderr 中带上路径提示，直到迁移为与服务端一致的数值线路 MTU（例如 `mtu: 1515`）；守护进程连接前还会按相同边界再次校验。
 - 界面/托盘语言与登录自启动是 GUI 设置，不写入 profile；语言保存在 WebView
   本地存储，自启动文件在 `~/.config/autostart/rustvpn-client.desktop`。
 - 更新源（Tauri updater）是构建时配置，位于 `tauri.conf.json`，不在 profile 中。
@@ -126,7 +127,7 @@ alice:
 | `GOVPN_IFACE` | 配置的接口名（服务器上可能为空）。 |
 | `GOVPN_REMOTE` | 该 peer 的远端地址。 |
 
-服务器顺序：**up 脚本 → 打开 TAP → 握手**。由于守护进程自行打开 TAP，`up` 必须创建持久化设备：
+服务器顺序：**up 脚本 → 打开 TAP → 握手**。由于守护进程自行打开 TAP，`up` 必须创建持久化设备；**但**使用 `network:` 的 peer 由声明式路径创建 TAP，`up` 只可执行其它副作用，不得创建 `<iface>`（若必须创建则需自行写入 `rustvpn-managed` 标记）：
 
 ```sh
 #!/bin/sh
@@ -183,10 +184,12 @@ ipv6_mss     = inner_ip_mtu - 60
 当 `peers.yaml` 条目包含可选的 `network:` 时，`rustvpn-server` 无需 up 脚本即可管理该 peer 的 TAP：
 
 - 缺失时创建 TAP，按数值线路 MTU 推导并设置 **接口 IP MTU**（`inner_ip_mtu = max_payload - 14`；plain 1515 → 1500、noise 1515 → 1476、encless 1515 → 1492），然后添加地址/路由，并在配置了 `dns` 时调用 `resolvectl`。
-- **严格所有权**：新建 TAP 会写入 `ip link set dev <iface> alias rustvpn-managed`；已存在但未带该标记的 TAP 会被拒绝并保持原样，避免破坏管理员的地址/路由/DNS。带标记的 TAP 视为上次崩溃/重启遗留，接管并在退出时删除。
+- **严格所有权**：新建 TAP 会写入 `ip link set dev <iface> alias rustvpn-managed`；已存在但未带该标记的 TAP 会被拒绝并保持原样，避免破坏管理员的地址/路由/DNS。带标记的 TAP 视为上次崩溃/重启遗留，接管时先清空该 TAP 上残留的 IPv4 地址/路由与 resolver 状态（标记即所有权证明），再应用新的 `network:` 配置，并在退出时删除。
+- **`network:` 负责创建 TAP**：`up`/`down` 仍可运行（例如日志或其它副作用），但与该 peer 的 `network:` 同时配置时，`up` **不得**创建 `<iface>`。未标记的既有 TAP 会被明确拒绝；若脚本必须创建，则脚本必须自行写入 `ip link set dev <iface> alias rustvpn-managed`，之后服务端会像其它自有 TAP 一样接管并在退出时删除。声明式路径无需任何脚本。
 - **非破坏式安装**：地址/路由使用 `ip addr add` / `ip route add`，**绝不使用 `replace`**。遇到 `EEXIST` 时，只有完全匹配的既有地址/路由才视为幂等（便于接管崩溃遗留）；其它冲突会中止并回滚。RustVPN 只记录并删除自己真正添加的项，既有路由（包括主机默认路由）绝不会被覆盖或删除。
 - `network.routes` 必须是显式 IPv4 CIDR；默认路由（包括非规范前缀 0 写法）会被拒绝，以免劫持服务器自身路由。设置 `gateway` 时它作为这些路由的下一跳。
-- 任一步失败都会回滚地址/路由/DNS/MTU 与 RustVPN 创建的 TAP；成功配置的状态在服务器退出时移除。运行中把某个 peer 从 `network:` 改回纯脚本路径不会自动迁移，需重启服务器（或手动清理）以移除声明式状态。
+- 任一步失败都会回滚地址/路由/DNS/MTU 与 RustVPN 创建的 TAP；成功配置的状态在服务器退出时移除。
+- **重载/移除清理**：peer 被移除、`network:` 被删除，或 mode/MTU/network 字段变化时，受影响会话吊销后会移除旧的声明式 guard。仍被未变化的活跃 peer 使用的 guard 会保留；因此把 peer 改回纯脚本路径不再需要重启服务器。
 - `network:` 是 RustVPN 扩展；不含该节的条目与 GoVPN 5.7 YAML 完全兼容，含该节的文件会被 Go 服务端拒绝。
 
 ## 超时与心跳

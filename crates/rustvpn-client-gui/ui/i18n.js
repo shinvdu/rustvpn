@@ -147,6 +147,8 @@
     "守护进程不可达": "Daemon unreachable",
     "守护进程不可达：{error}": "Daemon unreachable: {error}",
     "读取配置失败：{error}": "Failed to load profiles: {error}",
+    "{count} 个配置无法加载：{first}":
+      "{count} profile(s) could not be loaded: {first}",
     "已启用登录自启动": "Start at login enabled",
     "已关闭登录自启动": "Start at login disabled",
     "设置自启动失败：{error}": "Failed to set autostart: {error}",
@@ -321,6 +323,8 @@
     "守护进程不可达": "Демон недоступен",
     "守护进程不可达：{error}": "Демон недоступен: {error}",
     "读取配置失败：{error}": "Не удалось загрузить профили: {error}",
+    "{count} 个配置无法加载：{first}":
+      "Не удалось загрузить профилей: {count}. Первая ошибка: {first}",
     "已启用登录自启动": "Автозапуск включён",
     "已关闭登录自启动": "Автозапуск выключен",
     "设置自启动失败：{error}": "Не удалось настроить автозапуск: {error}",

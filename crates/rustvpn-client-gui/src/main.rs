@@ -64,6 +64,15 @@ struct AppState {
     tray_available: Arc<AtomicBool>,
     tray_items: Mutex<Option<TrayItems>>,
     language: Mutex<UiLang>,
+    /// Profiles found on disk that could not be parsed.  Kept so the UI can
+    /// report them instead of silently hiding the files.
+    profile_errors: Mutex<Vec<ProfileLoadError>>,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+struct ProfileLoadError {
+    path: String,
+    message: String,
 }
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -316,13 +325,31 @@ fn autostart_path() -> Option<PathBuf> {
 }
 
 #[tauri::command]
-fn list_profiles() -> Result<Vec<ProfileSpec>, String> {
-    let dir = profiles_dir();
-    if !dir.exists() {
-        return Ok(Vec::new());
+fn list_profiles(state: tauri::State<'_, AppState>) -> Result<Vec<ProfileSpec>, String> {
+    let (profiles, errors) = collect_profiles(&profiles_dir())?;
+    if let Ok(mut slot) = state.profile_errors.lock() {
+        *slot = errors;
     }
-    let entries = std::fs::read_dir(&dir).map_err(|error| error.to_string())?;
+    Ok(profiles)
+}
+
+/// Return the parse failures recorded by the most recent `list_profiles`.
+#[tauri::command]
+fn profile_errors(state: tauri::State<'_, AppState>) -> Vec<ProfileLoadError> {
+    state
+        .profile_errors
+        .lock()
+        .map(|errors| errors.clone())
+        .unwrap_or_default()
+}
+
+fn collect_profiles(dir: &Path) -> Result<(Vec<ProfileSpec>, Vec<ProfileLoadError>), String> {
+    if !dir.exists() {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    let entries = std::fs::read_dir(dir).map_err(|error| error.to_string())?;
     let mut profiles = Vec::new();
+    let mut errors = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
         if !matches!(
@@ -331,17 +358,35 @@ fn list_profiles() -> Result<Vec<ProfileSpec>, String> {
         ) {
             continue;
         }
-        match std::fs::read_to_string(&path)
-            .map_err(|error| error.to_string())
-            .and_then(|text| {
-                serde_yaml_ng::from_str::<ProfileSpec>(&text).map_err(|error| error.to_string())
-            }) {
+        match read_profile(&path) {
             Ok(profile) => profiles.push(profile),
-            Err(error) => eprintln!("skip profile {}: {error}", path.display()),
+            Err(error) => {
+                let message = describe_profile_error(&error);
+                eprintln!("profile {} not loaded: {message}", path.display());
+                errors.push(ProfileLoadError {
+                    path: path.display().to_string(),
+                    message,
+                });
+            }
         }
     }
     profiles.sort_by_key(|a| a.name.to_lowercase());
-    Ok(profiles)
+    errors.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok((profiles, errors))
+}
+
+/// Make legacy `mtu: auto`/`mtu: 0` failures actionable instead of a generic
+/// parse error.  These files were valid in older builds but v1 requires a
+/// numeric two-sided wire MTU.
+fn describe_profile_error(error: &str) -> String {
+    if error.contains("mtu: auto") || error.contains("mtu: 0") {
+        format!(
+            "legacy profile rejected: {error}. Migrate it to the numeric wire MTU shared \
+             with the server (for example 1515); see docs/client-ui.md"
+        )
+    } else {
+        error.to_string()
+    }
 }
 
 #[tauri::command]
@@ -377,6 +422,10 @@ fn save_profile_at(
     if profile.verifier.trim().is_empty() {
         return Err("verifier is empty".into());
     }
+    // Defense in depth before serializer/file IO: the daemon is still the
+    // authoritative validator, but a compromised webview must not persist a
+    // non-numeric or out-of-range MTU (and serialization itself rejects 0).
+    profile.validate_mtu()?;
     std::fs::create_dir_all(dir).map_err(|error| error.to_string())?;
     set_dir_private(dir);
 
@@ -569,6 +618,7 @@ fn main() {
                 tray_available: Arc::new(AtomicBool::new(false)),
                 tray_items: Mutex::new(None),
                 language: Mutex::new(initial_language()),
+                profile_errors: Mutex::new(Vec::new()),
             };
             app.manage(state);
             if let Err(error) = setup_tray(app) {
@@ -597,6 +647,7 @@ fn main() {
             disconnect,
             get_logs,
             list_profiles,
+            profile_errors,
             save_profile,
             delete_profile,
             get_password,
@@ -767,6 +818,81 @@ mod tests {
         save_profile_at(&dir, &profile("other lab"), None).unwrap();
         let error = save_profile_at(&dir, &profile("other-lab"), None).unwrap_err();
         assert!(error.contains("collides"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn saves_a_valid_numeric_mtu_profile() {
+        let dir = temp_dir();
+        let mut spec = profile("valid");
+        spec.mtu = 1515;
+        save_profile_at(&dir, &spec, None).unwrap();
+        let path = profile_path(&dir, "valid").unwrap();
+        let saved = read_profile(&path).unwrap();
+        assert_eq!(saved.mtu, 1515);
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("mtu: 1515"), "{text}");
+        assert!(!text.contains("auto"), "{text}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn rejects_zero_and_out_of_range_mtu_before_writing() {
+        let dir = temp_dir();
+        for mtu in [0, 67, 9016] {
+            let mut spec = profile("bad-mtu");
+            spec.mtu = mtu;
+            let error = save_profile_at(&dir, &spec, None).unwrap_err();
+            assert!(
+                error.contains("MTU") || error.contains("mtu"),
+                "unexpected error for {mtu}: {error}"
+            );
+            assert!(
+                !profile_path(&dir, "bad-mtu").unwrap().exists(),
+                "invalid MTU {mtu} must not be written"
+            );
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn rejects_padded_mode_mtu_below_the_mode_minimum() {
+        let dir = temp_dir();
+        for padded in [true, false] {
+            let mut spec = profile("padded");
+            spec.noise = padded;
+            spec.encless = !padded;
+            spec.mtu = 119;
+            let error = save_profile_at(&dir, &spec, None).unwrap_err();
+            assert!(error.contains("noise"), "unexpected error: {error}");
+            assert!(!profile_path(&dir, "padded").unwrap().exists());
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn collect_profiles_reports_legacy_mtu_auto_instead_of_hiding_it() {
+        let dir = temp_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let valid = serde_yaml_ng::to_string(&profile("valid")).unwrap();
+        std::fs::write(dir.join("valid.yaml"), valid).unwrap();
+        for (name, mtu) in [("legacy-auto", "auto"), ("legacy-zero", "0")] {
+            let yaml =
+                format!("name: {name}\nremote: vpn.example.com:1194\nverifier: v\nmtu: {mtu}\n");
+            std::fs::write(dir.join(format!("{name}.yaml")), yaml).unwrap();
+        }
+
+        let (profiles, errors) = collect_profiles(&dir).unwrap();
+        assert_eq!(profiles.len(), 1);
+        assert_eq!(errors.len(), 2);
+        for error in &errors {
+            assert!(
+                error.message.contains("legacy profile rejected"),
+                "{}",
+                error.message
+            );
+            assert!(error.message.contains("1515"), "{}", error.message);
+        }
         let _ = std::fs::remove_dir_all(dir);
     }
 }

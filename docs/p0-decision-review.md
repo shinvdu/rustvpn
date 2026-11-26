@@ -11,8 +11,8 @@
 
 | # | 决策点 | 最终决定与已执行修复 | 状态 |
 |---|---|---|---|
-| P0-1 | `mtu: auto` 破坏双方线路尺寸 | v1 将 `mtu` 定义为**双方一致的线路契约**；移除自动推导；拒绝 `auto`/`0`；数字默认 1515；仅推导 TAP IP MTU/MSS；新增双方同数值与 auto 拒绝回归测试 | **已修复** |
-| P0-2 | 服务端声明式 TAP 把接口 MTU 设为帧预算 | 服务端与客户端均使用 `inner_ip_mtu = Mode::max_payload(wire) - 14`；plain 1515→1500、noise 1515→1476；有单测；客户端 `bring_link_up` 审计通过 | **已修复** |
+| P0-1 | `mtu: auto` 破坏双方线路尺寸 | v1 将 `mtu` 定义为**双方一致的线路契约**；移除自动推导；拒绝 `auto`/`0`；数字默认 1515；仅推导 TAP IP MTU/MSS。收尾：`save_profile_at` 写盘前校验数值范围与 noise/encless 下限；`ser_mtu` 不再把 0 静默改写为 `"auto"`（序列化直接报错）；GUI 通过 `profile_errors` 上报旧 `mtu:auto`/`0` 文件而非静默跳过；新增 IPC/GUI 回归测试 | **CLOSED** |
+| P0-2 | 服务端声明式 TAP 把接口 MTU 设为帧预算 | 服务端与客户端均使用 `inner_ip_mtu = Mode::max_payload(wire) - 14`；plain 1515→1500、noise 1515→1476、encless 1515→1492；声明式指纹包含 mode/inner-IP-MTU，仅改模式也会在下一会话前重配 TAP；`configure_tap` 与 mode-only 指纹均有回归测试 | **CLOSED** |
 | 1 | MTU 来源与失败回退 | 不再使用链路/路径 MTU 推导；`underlay_mtu` 显式覆盖与主动 PMTU **不实现**，路径 MTU 协商列入 v2 | **已改为数值契约；auto 推迟 v2** |
 | 2 | `mtu: 0` 含义 | 客户端 IPC/profile 与服务端 `peers.yaml` 均明确拒绝显式 0；省略服务端字段仍为 1515 | **已修复** |
 | 3 | MSS clamp 缺 `nft` | 默认 best-effort 并记录 `mss_applied`；`mss_clamp: required` 严格模式**未实现** | **部分修复；required 延后** |
@@ -25,10 +25,10 @@
 | 10 | `rekey_time` 默认值 | daemon/CLI 默认 0；新 GUI/onboarding profile 默认 1800；GUI 只读显示 | **已修复** |
 | 11 | keepalive 上下限 | 默认关闭；plain 10 s、noise/encless 25 s、上限 3600 s；noise 成本告警 | **已修复** |
 | 12 | 时间重协商丢包 | 接受短暂断流；默认关闭（daemon）；文档明确非零丢包；零丢包留给 v2 | **已接受并文档化** |
-| 13 | 服务端声明式 TAP 所有权 | 严格 RustVPN 所有权：创建时写 `alias rustvpn-managed`；拒绝未标记的既有 TAP；标记 TAP 视为崩溃孤儿接管并在退出时删除；地址/路由使用 `add`（非 `replace`），`EEXIST` 仅在完全匹配时幂等，只记录/删除自己添加的项；移除 `network:` 仍需重启 | **已修复（P1-1 加固；热移除延后）** |
+| 13 | 服务端声明式 TAP 所有权 | 严格 RustVPN 所有权：创建时写 `alias rustvpn-managed`；拒绝未标记的既有 TAP；接管标记 TAP 前先清空残留 IPv4 地址/路由/DNS；地址/路由使用 `add`（非 `replace`），`EEXIST` 仅在完全匹配时幂等，只记录/删除自己添加的项。收尾：reload 移除/修改 peer 后按当前配置剪枝遗留 guard（未变化的活跃 peer 保留）；`network:` 明确负责创建 TAP，`up` 若创建未标记 TAP 会收到明确错误（或脚本自行打标记）；移除 `network:` 不再需要重启 | **CLOSED** |
 | 14 | diff reload 吊销范围 | 保持严格吊销；日志列出变化字段；创建/插入 peer 前重查 config fingerprint；UDP 在 `registry.insert` 之后再次校验，过期则结束会话并清理本路径的声明式 guard | **已修复（P1-3 加固）** |
 | P1-1 | 默认路由前缀 0 规范化 + 声明式安装非破坏性 | 新增共享 `is_default_route`（`default` 或解析为 `IpNet` 且 `prefix_len()==0`，覆盖 `00.0.0.0/0` 等）；服务端 `network.routes` 拒绝全部前缀 0；客户端全隧道检测覆盖所有写法；声明式地址/路由改为 `add` + `EEXIST` 校验，只回滚自己添加的项 | **已修复** |
-| P1-2 | 仅改模式时复用旧 TAP MTU | 声明式 guard 指纹加入 `mode` 与派生的 `inner_ip_mtu`；复用旧 TAP 前检测指纹，变化则重建；plain 1515→1500、noise→1476、encless→1492 有回归测试 | **已修复** |
+| P1-2 | 仅改模式时复用旧 TAP MTU | 声明式 guard 指纹加入 `mode` 与派生的 `inner_ip_mtu`；复用旧 TAP 前检测指纹，变化则重建；plain 1515→1500、noise→1476、encless→1492 有回归测试；另新增 reload 剪枝回归测试，删除/修改 peer 不会遗留旧 guard | **CLOSED** |
 | P1-3 | UDP 配置吊销 TOCTOU | UDP 建 peer 在派生任务中运行；改为 `registry.insert` 后重新校验 fingerprint，过期则 `end_session` + 仅移除匹配指纹的声明式 guard + 计数/日志；纠正“与主任务串行”的错误注释；新增插入后重载的可单测判定 | **已修复** |
 | P1-4 | 文档仍教“线路 MTU 当作接口 MTU”、zh/ru 的 0/auto 语义 | en/zh/ru 的入门/配置/运维文档 up 脚本改为接口 IP MTU（1515 plain→1500、noise→1476、encless→1492），给出公式；删除 `mtu: 0 = 1515`，统一为 0/auto 拒绝、省略默认 1515 | **已修复** |
 
@@ -41,7 +41,7 @@
 - MSS 使用独立 IPv4/IPv6 值（`inner-40` / `inner-60`）。
 - QR/URI：URI 补齐网络字段，但**没有自动导入器**；文档改为“参考用途”，不再宣称扫码即连。
 
-**明确延后（未在本批实现）**：`mtu: auto`/v2 MTU 协商、`mss_clamp: required`、内置 QR 库、`rustvpn://profile` 自动导入器、GUI 安全开关复选框、声明式 TAP 热移除、zh/ru 全量翻译。
+**明确延后（未在本批实现）**：`mtu: auto`/v2 MTU 协商、`mss_clamp: required`、内置 QR 库、`rustvpn://profile` 自动导入器、GUI 安全开关复选框、zh/ru 全量翻译。声明式 TAP 的 reload/移除清理已在本次收尾中实现，不再列为延后项。
 
 ---
 
