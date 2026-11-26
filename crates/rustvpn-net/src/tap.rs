@@ -314,6 +314,29 @@ impl Tap {
         &self.name
     }
 
+    /// Stop the platform's dedicated data-plane reader thread **without**
+    /// closing the device.
+    ///
+    /// On Windows the Wintun shim owns a blocking reader thread; it must be
+    /// joined before any route/address teardown so no thread is inside a
+    /// Wintun read while the network guard runs.  The adapter itself is closed
+    /// afterwards by dropping the last [`Tap`] handle.
+    ///
+    /// Linux has no separate reader thread (peer tasks read the async device
+    /// and are cancelled/joined by the session), so this is a no-op there.
+    pub fn stop_reader(&self) {
+        #[cfg(target_os = "windows")]
+        {
+            // On Windows this is the only backend variant.
+            let TapBackend::Wintun(tap) = self.inner.as_ref();
+            tap.stop_reader();
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let _ = self;
+        }
+    }
+
     pub async fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
         match self.inner.as_ref() {
             #[cfg(not(target_os = "windows"))]

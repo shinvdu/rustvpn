@@ -352,11 +352,39 @@ impl NetworkGuard {
     }
 
     /// Undo everything recorded by this guard and delete the state file.
+    ///
+    /// This is the crash-recovery/compatibility form: it removes the recorded
+    /// address too.  The normal connection teardown uses
+    /// [`Self::remove_connection_state`].
     pub async fn remove(mut self) {
         let Some(state) = self.state.take() else {
             return;
         };
         let report = winplan::cleanup_state(&self.runner, &state).await;
+        self.finish_cleanup(report);
+    }
+
+    /// Remove the state that outlives the Wintun adapter, then let the caller
+    /// close the adapter.
+    ///
+    /// Routes (including the anti-loop `/32`), DNS, NRPT, the interface metric
+    /// and the IPv6 block are removed here.  The profile IPv4 address is
+    /// **kept**: closing the created Wintun adapter removes it together with
+    /// its implicit connected route, and issuing `Remove-NetIPAddress` against
+    /// the still-open session is the suspected cause of the disconnect hang.
+    ///
+    /// Contract: the engine stops the peer tasks and the Wintun reader before
+    /// calling this, then drops the last `Tap`/adapter handle after it returns.
+    /// No network query may run after that close.
+    pub async fn remove_connection_state(mut self) {
+        let Some(state) = self.state.take() else {
+            return;
+        };
+        let report = winplan::cleanup_state_with(&self.runner, &state, false).await;
+        self.finish_cleanup(report);
+    }
+
+    fn finish_cleanup(&self, report: winplan::CleanupReport) {
         if report.ok() {
             if let Err(error) = self.store.clear() {
                 eprintln!(
@@ -365,8 +393,9 @@ impl NetworkGuard {
                 );
             }
         } else {
-            // Keep the state file so the next daemon start retries; the host
-            // may still be fail-closed for IPv6 but is already blocked by state.
+            // Keep the state file so the next daemon start retries (before any
+            // adapter is opened); the host may still be fail-closed for IPv6
+            // but is already blocked by state.
             eprintln!(
                 "warning: Windows network cleanup was incomplete; keeping {} for crash \
                  recovery: {}",

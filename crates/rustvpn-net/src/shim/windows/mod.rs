@@ -99,6 +99,16 @@ impl WindowsTap {
         &self.adapter
     }
 
+    /// Join the dedicated blocking Wintun reader thread without closing the
+    /// session or adapter.
+    ///
+    /// The engine calls this before removing routes/DNS so that no Wintun read
+    /// can race the network guard.  [`Drop`] calls it again (idempotently)
+    /// immediately before the adapter handle is released.
+    pub fn stop_reader(&self) {
+        self.pump.shutdown();
+    }
+
     /// OS -> tunnel. Drains shim-internal ARP/outbound frames first, then
     /// awaits an OS packet.
     pub async fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {

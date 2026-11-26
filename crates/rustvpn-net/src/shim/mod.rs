@@ -1150,6 +1150,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pump_shutdown_joins_the_dedicated_reader_thread() {
+        let device = Arc::new(FakeDevice::new());
+        let pump = ShimPump::new(shim_config(), device.clone(), 8, 2048).expect("pump");
+
+        // Let the blocking reader enter the device before shutting down.
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert!(
+            pump.reader
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .is_some(),
+            "the reader thread must be running before shutdown"
+        );
+
+        pump.shutdown();
+
+        // `shutdown` takes and joins the handle: the thread cannot still be
+        // inside Wintun when the caller closes the session/adapter.
+        assert!(
+            pump.reader
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .is_none(),
+            "shutdown must take and join the reader handle"
+        );
+        assert!(pump.stop.load(AtomicOrdering::SeqCst));
+    }
+
+    #[tokio::test]
     async fn pump_drains_outbound_before_waiting_for_os_packets() {
         let device = Arc::new(FakeDevice::new());
         let pump = ShimPump::new(shim_config(), device.clone(), 8, 2048).expect("pump");

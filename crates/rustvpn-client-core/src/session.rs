@@ -40,9 +40,14 @@ pub struct Session {
 }
 
 impl Session {
-    /// Stop the peer tasks and remove the live stats entry.
-    pub fn close(&mut self, stats_state: &StatsState) {
-        self.handle.cancel.cancel();
+    /// Stop the peer tasks, wait until every task has released its `Tap`
+    /// clone, and remove the live stats entry.
+    ///
+    /// Joining here is part of the teardown contract: the caller may close the
+    /// TAP/Wintun device immediately after this returns, so no task may still
+    /// be inside `tap.recv()` or `tap.send()`.
+    pub async fn close(&mut self, stats_state: &StatsState) {
+        self.handle.shutdown().await;
         stats_state.remove(&self.stats.addr);
     }
 

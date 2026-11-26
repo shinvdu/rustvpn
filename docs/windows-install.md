@@ -392,10 +392,36 @@ existing `windows-shim.yml` prototype workflow is separate.
   `tunnel stopped`/`disconnected` before the loss, so the cleanup commands
   (removing routes/address while the Wintun adapter is still open), the
   Wintun/NDIS adapter teardown, and an immediate post-disconnect OS network
-  query (WMI/netsh) are all suspects. Do not use connect/disconnect on a host you cannot physically
-  recover until this is fixed and verified in a disposable VM. Disconnect
-  cleanup, crash recovery, full-tunnel DNS/NRPT/IPv6, resume/network-switch and
-  performance remain unverified; see the status document.
+  query (WMI/netsh) are all suspects.
+- **Teardown fix in the working tree (not committed, NOT yet verified on
+  Windows):**
+  1. `Session::close` is now async and cancels **and joins** every peer task;
+     tasks no longer keep the last `Arc<Tap>`, so the adapter close is
+     deterministic and happens after the data plane is stopped.
+  2. The Windows shim's dedicated blocking Wintun reader is explicitly joined
+     (`Tap::stop_reader`) before any route/DNS command runs.
+  3. The disconnect path no longer issues `Remove-NetIPAddress`: it removes
+     NRPT, DNS, split/default routes (anti-loop `/32` last), the interface
+     metric and the IPv6 firewall rule, then closes the Wintun session and
+     adapter. Closing the created adapter removes the profile address and its
+     implicit connected route as one NDIS teardown.
+  4. No `Get-Net*`/PowerShell/netsh query runs after the adapter close; a
+     failed cleanup is retried on the next daemon start (before any adapter is
+     opened). Idle status is published only after the close.
+  Install failure rollback keeps the address for the same adapter close.
+  Unit tests cover the order, reader join, peer-task join/abort and the
+  address-retaining cleanup on Linux; Linux teardown behaviour is unchanged.
+- **Still unverified:** this is a code-level hypothesis. Do not use
+  connect/disconnect on a host you cannot physically recover. A disposable VM
+  must run the matrix in the status document before the physical host is used:
+  (1) disconnect with no OS query, wait 120 s, check ARP/ping/SSH; (2) query
+  after a 60 s delay; (3) bisect the old build (close adapter only vs remove
+  address only); (4) injected cleanup failure + daemon restart; (5) install
+  failure rollback; (6) full-tunnel DNS/NRPT/IPv6 disconnect. If the VM still
+  hangs, the cause is Wintun/NDIS close itself, not the explicit address
+  removal. Disconnect cleanup, crash recovery, full-tunnel DNS/NRPT/IPv6,
+  resume/network-switch and performance remain unverified; see the status
+  document.
 - If a test host was left with this build installed, uninstall the test MSI and
   delete any temporary credential/profile directories after verifying the
   network state file has been cleaned.

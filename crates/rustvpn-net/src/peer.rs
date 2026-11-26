@@ -9,6 +9,7 @@ use rustvpn_proto::{Decoder, Encoder, Ordering as PktOrdering, TransportError, M
 use tokio::io::AsyncReadExt;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 use tokio::time::{Duration, Instant, MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
 use zeroize::Zeroizing;
@@ -19,6 +20,13 @@ use crate::tap::Tap;
 
 const OUTBOUND_QUEUE: usize = 256;
 const INBOUND_QUEUE: usize = 512;
+/// Upper bound for joining cancelled peer tasks before they are aborted.
+///
+/// All peer tasks are cancel-aware, so a healthy task exits immediately.  The
+/// timeout only matters if a transport write is wedged; aborting it is safe
+/// because the task owns no state the teardown needs, and it guarantees that
+/// no task keeps an `Arc<Tap>` alive after [`PeerHandle::shutdown`] returns.
+const TASK_JOIN_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Debug)]
 pub enum Outbound {
@@ -95,12 +103,47 @@ impl WireWriter {
 }
 
 pub struct PeerHandle {
-    pub tap: Arc<Tap>,
     pub stats: Arc<LiveStats>,
     pub cancel: CancellationToken,
     pub outbound: mpsc::Sender<Outbound>,
     pub inbound: Option<mpsc::Sender<Vec<u8>>>,
     pub events: mpsc::Receiver<PeerEvent>,
+    /// Every task spawned for this peer.  The handle owns the only strong
+    /// reference to their join handles so [`Self::shutdown`] can join (or
+    /// abort) them before the caller closes the shared TAP/Wintun device.
+    tasks: Vec<JoinHandle<()>>,
+}
+
+impl PeerHandle {
+    /// Stop every peer task and wait until each one has released its `Tap`
+    /// clone.  Cancel-aware tasks exit on the cancellation token; a task that
+    /// does not finish within [`TASK_JOIN_TIMEOUT`] is aborted and joined, so
+    /// this never returns while a task still holds the device.
+    ///
+    /// This is idempotent: a second call finds no tasks left.
+    pub async fn shutdown(&mut self) {
+        join_tasks_after_cancel(&self.cancel, &mut self.tasks, TASK_JOIN_TIMEOUT).await;
+    }
+}
+
+/// Cancel `cancel`, then join every task, aborting any task that does not
+/// finish within `timeout`.  Aborting still drops the task's `Tap` clone, so
+/// this guarantees the device has no task readers/writers once it returns.
+async fn join_tasks_after_cancel(
+    cancel: &CancellationToken,
+    tasks: &mut Vec<JoinHandle<()>>,
+    timeout: Duration,
+) {
+    cancel.cancel();
+    for mut task in tasks.drain(..) {
+        match tokio::time::timeout(timeout, &mut task).await {
+            Ok(_) => {}
+            Err(_) => {
+                task.abort();
+                let _ = task.await;
+            }
+        }
+    }
 }
 
 fn event(tx: &mpsc::Sender<PeerEvent>, ev: PeerEvent) {
@@ -468,10 +511,15 @@ pub fn spawn_udp_peer(
     let (outbound_tx, outbound_rx) = mpsc::channel(OUTBOUND_QUEUE);
     let (inbound_tx, inbound_rx) = mpsc::channel(INBOUND_QUEUE);
     let (events_tx, events_rx) = mpsc::channel(4);
+    let mut tasks = Vec::with_capacity(5);
     if let Some(delay) = rekey_delay(&cfg, is_client) {
-        tokio::spawn(rekey_task(delay, cancel.clone(), events_tx.clone()));
+        tasks.push(tokio::spawn(rekey_task(
+            delay,
+            cancel.clone(),
+            events_tx.clone(),
+        )));
     }
-    tokio::spawn(sender_task(
+    tasks.push(tokio::spawn(sender_task(
         writer,
         Encoder::new(key, is_client),
         cfg.clone(),
@@ -479,32 +527,37 @@ pub fn spawn_udp_peer(
         outbound_rx,
         cancel.clone(),
         events_tx.clone(),
-    ));
-    tokio::spawn(tap_reader_task(
+    )));
+    tasks.push(tokio::spawn(tap_reader_task(
         tap.clone(),
         cfg.clone(),
         outbound_tx.clone(),
         cancel.clone(),
         events_tx.clone(),
-    ));
-    tokio::spawn(udp_receiver_task(
+    )));
+    tasks.push(tokio::spawn(udp_receiver_task(
         Decoder::new(key, is_client),
-        tap.clone(),
+        tap,
         cfg.clone(),
         stats.clone(),
         inbound_rx,
         cancel.clone(),
         events_tx.clone(),
         is_client,
-    ));
-    tokio::spawn(monitor_task(stats.clone(), cfg, cancel.clone(), events_tx));
+    )));
+    tasks.push(tokio::spawn(monitor_task(
+        stats.clone(),
+        cfg,
+        cancel.clone(),
+        events_tx,
+    )));
     PeerHandle {
-        tap,
         stats,
         cancel,
         outbound: outbound_tx,
         inbound: Some(inbound_tx),
         events: events_rx,
+        tasks,
     }
 }
 
@@ -520,10 +573,15 @@ pub fn spawn_tcp(
     let cancel = CancellationToken::new();
     let (outbound_tx, outbound_rx) = mpsc::channel(OUTBOUND_QUEUE);
     let (events_tx, events_rx) = mpsc::channel(4);
+    let mut tasks = Vec::with_capacity(5);
     if let Some(delay) = rekey_delay(&cfg, is_client) {
-        tokio::spawn(rekey_task(delay, cancel.clone(), events_tx.clone()));
+        tasks.push(tokio::spawn(rekey_task(
+            delay,
+            cancel.clone(),
+            events_tx.clone(),
+        )));
     }
-    tokio::spawn(sender_task(
+    tasks.push(tokio::spawn(sender_task(
         WireWriter::Tcp(write),
         Encoder::new(key, is_client),
         cfg.clone(),
@@ -531,32 +589,37 @@ pub fn spawn_tcp(
         outbound_rx,
         cancel.clone(),
         events_tx.clone(),
-    ));
-    tokio::spawn(tap_reader_task(
+    )));
+    tasks.push(tokio::spawn(tap_reader_task(
         tap.clone(),
         cfg.clone(),
         outbound_tx.clone(),
         cancel.clone(),
         events_tx.clone(),
-    ));
-    tokio::spawn(tcp_receiver_task(
+    )));
+    tasks.push(tokio::spawn(tcp_receiver_task(
         Decoder::new(key, is_client),
         read,
-        tap.clone(),
+        tap,
         cfg.clone(),
         stats.clone(),
         cancel.clone(),
         events_tx.clone(),
         is_client,
-    ));
-    tokio::spawn(monitor_task(stats.clone(), cfg, cancel.clone(), events_tx));
+    )));
+    tasks.push(tokio::spawn(monitor_task(
+        stats.clone(),
+        cfg,
+        cancel.clone(),
+        events_tx,
+    )));
     PeerHandle {
-        tap,
         stats,
         cancel,
         outbound: outbound_tx,
         inbound: None,
         events: events_rx,
+        tasks,
     }
 }
 
@@ -670,6 +733,58 @@ mod tests {
         cancel.cancel();
         tokio::time::advance(Duration::from_secs(31)).await;
         assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn shutdown_joins_cancelled_tasks_and_aborts_wedged_ones() {
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+        let cancel = CancellationToken::new();
+        let stopped = Arc::new(AtomicUsize::new(0));
+
+        let token = cancel.clone();
+        let flag = stopped.clone();
+        let cancelled = tokio::spawn(async move {
+            token.cancelled().await;
+            flag.fetch_add(1, AtomicOrdering::SeqCst);
+        });
+        let token = cancel.clone();
+        let flag = stopped.clone();
+        let also_cancelled = tokio::spawn(async move {
+            token.cancelled().await;
+            flag.fetch_add(1, AtomicOrdering::SeqCst);
+        });
+        // Ignores cancellation forever: the join timeout must abort it.
+        let wedged = tokio::spawn(async { std::future::pending::<()>().await });
+
+        let mut tasks = vec![cancelled, also_cancelled, wedged];
+        join_tasks_after_cancel(&cancel, &mut tasks, Duration::from_millis(25)).await;
+
+        assert!(
+            tasks.is_empty(),
+            "every handle must be drained after shutdown"
+        );
+        assert_eq!(stopped.load(AtomicOrdering::SeqCst), 2);
+        assert!(cancel.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn shutdown_is_idempotent_and_reports_no_remaining_tasks() {
+        let cancel = CancellationToken::new();
+        let (outbound, _rx) = mpsc::channel(1);
+        let (_events_tx, events) = mpsc::channel(1);
+        let stats = LiveStats::new("test".into(), [1u8; 16], false, 0, false, 1515);
+        let mut handle = PeerHandle {
+            stats,
+            cancel,
+            outbound,
+            inbound: None,
+            events,
+            tasks: Vec::new(),
+        };
+        handle.shutdown().await;
+        // A second call is a no-op and must not panic or block.
+        handle.shutdown().await;
     }
 
     async fn spawn_sender_for_test(

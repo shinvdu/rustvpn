@@ -452,10 +452,61 @@ PowerShell IPC 客户端驱动 `Connect/Status/Disconnect`；未修改现有 VPN
   `guard.remove()`、`drop(tap)` 和 engine 的 idle 状态之后，说明断开逻辑
   至少跑到了结尾；因此挂起不一定在 `Remove-NetRoute`/`Remove-NetIPAddress`，
   也可能（甚至更可能）是 **Wintun 适配器关闭/NDIS 异步拆除** 触发的网络栈
-  死锁。当前代码在 `guard.remove()` 之后才 `drop(tap)`
-  （`crates/rustvpn-client-core/src/engine.rs` 约 819–835 行），清理会在
-  Wintun 适配器仍打开时删路由/地址；两条路径都需在一次性 VM 中用二分法
-  验证（先只关闭适配器、不删地址；再只删地址、不关闭适配器）。
+  死锁。**修复前**代码在 `guard.remove()` 之后才 `drop(tap)`，清理会在
+  Wintun 适配器仍打开时删路由/**地址**；另外 `Session::close` 只取消而不
+  join peer 任务，任务仍持有 `Arc<Tap>`，`drop(tap)` 未必真正关闭会话/适配器。两
+  条路径都需在一次性 VM 中用二分法验证（先只关闭适配器、不删地址；再只删
+  地址、不关闭适配器）。
+- **已实现的修复（当前工作区，未提交；未在 Windows 验证，禁止物理机重试）：**
+  - **根因假设（按可能性排序）：** (a) 关闭适配器前显式
+    `Remove-NetIPAddress` 删除 Wintun 上唯一的 profile 地址（并触发隐式
+    connected 路由拆除），与仍打开的 NDIS 会话冲突；(b) shim 专用阻塞读线程
+    在删路由/地址时仍可能位于 Wintun `recv` 内，且 `drop(tap)` 不是最后一个
+    `Arc` 引用，适配器关闭时机不确定；(c) 断开后 engine 立即执行的
+    `cleanup_owned_network()`（`Get-NetAdapter`/`Get-NetRoute`）落在
+    teardown 之后。
+  - **新 teardown 契约（`engine.rs::teardown_connection`）：**
+    1. `session.close().await` 取消并 **join** 全部 peer 任务（`peer.rs` 为
+       `PeerHandle` 记录 `JoinHandle`；超时则 abort+join），保证没有任务再用
+       `tap.recv()`/`tap.send()`，也不再持有 `Arc<Tap>`；
+    2. `tap.stop_reader()` 在 Windows join Wintun 垫片读线程（`ShimPump`
+       已有 join；新增 `WindowsTap::stop_reader`/`Tap::stop_reader`）；
+    3. `guard.remove_connection_state()` 只删 NRPT → DNS → 路由（分流/默认，
+       防环 `/32` 最后）→ 接口 metric → IPv6 防火墙；**保留 profile 地址与隐式
+       connected 路由**，不再执行 `Remove-NetIPAddress`；
+    4. `drop(tap)`（此时为最后一个 `Arc`）→ `WintunAdapter` 先
+       `Session::shutdown` 再 `WintunCloseAdapter`，地址/connected 路由随创建
+       的适配器一并移除；
+    5. close 之后不再执行任何 `Get-Net*`/PowerShell/`netsh` 查询；
+    6. 最后才发布 `tunnel stopped` / idle 状态。
+  - **断开后不再立即重试清理：** 连接刚结束时跳过
+    `cleanup_owned_network()`；若清理失败，状态文件保留，由下次 daemon 启动
+    （打开适配器之前）的 crash recovery 重试。install 失败回滚同样保留地址
+    （紧随其后的适配器关闭会移除）。
+  - **测试（Linux 可跑，无需 Wintun）：** `engine::teardown_stops_reader_removes_state_then_closes_device`
+    （顺序）；`shim::pump_shutdown_joins_the_dedicated_reader_thread`；
+    `peer::shutdown_joins_cancelled_tasks_and_aborts_wedged_ones`；
+    `winplan::connection_cleanup_keeps_the_address_for_the_adapter_close`；
+    `winplan::crash_cleanup_removes_the_address_after_routes_and_nrpt`；
+    `winplan::injected_route_failure_rolls_back_routes_and_state_but_keeps_the_address`。
+    Linux 的 `NetworkGuard::remove_connection_state` 完全委托给原有
+    `remove()`，行为不变。
+  - **仍未验证：** 上述修复只是代码层假设，未在 Windows 上执行过一次断开。
+    在一次性 VM 中必须完成下面的矩阵后才可考虑物理机；若 VM 仍挂起，则
+    (a)/(b) 不成立，需要转向 Wintun 驱动/NDIS 关闭本身（例如保留适配器句柄
+    到进程退出、升级或更换 Wintun 版本）。
+- **一次性 VM 验证矩阵（修复后必须执行）：**
+  1. connect → disconnect → **不做任何 OS 查询**，等待 120s，检查 ARP/ping/SSH/RDP；
+  2. 同样流程，断开后延迟 60s 再做 `Get-Net*`/`netsh`，检查是否挂起；
+  3. 旧构建二分：只关闭适配器不删地址；只删地址不关闭适配器（在 VM 快照上
+     逐项执行，每次失败后回滚快照）；
+  4. 断开清理失败注入（如临时阻断 PowerShell），重启 daemon，确认启动清理
+     补删遗留项；
+  5. install 失败回滚路径（例如故意让 `New-NetRoute` 失败）后断开；
+  6. 全隧道（DNS/NRPT/IPv6 阻断）connect/disconnect，确认 DNS 恢复、NRPT/
+     防火墙规则删除、无 IPv6 泄漏。
+  记录 `clientd.log` 最后几行和 System 事件（1074/109/41/42、NDIS/Wintun），
+  并确认全程无 `Remove-NetIPAddress`、close 后无任何网络查询。
 - **第三嫌疑：断开后的 OS 网络查询。** 两次失联都发生在断开完成后紧接着
   执行 `Get-Net*`/`netsh` 检查时；第二次 harness 已排除重 WMI 快照，但仍
   调用了 `netsh interface ipv4 show ...`。若 Wintun/NDIS 拆除是异步的，
@@ -554,8 +605,8 @@ PowerShell IPC 客户端驱动 `Connect/Status/Disconnect`；未修改现有 VPN
 | Windows 实机 E2E | 🟡 分流 plain/UDP 两次通过（第二次 ping 4/4、TCP 横幅）；noise/encless 未实测 |
 | 基本连通 | 🟡 ping 网关与新增分流路由、TCP 双向已实测；DNS 解析、大包未实测 |
 | 模式覆盖 | ⬜ plain 已测；noise、encless（TCP）、UDP/TCP 外层未实测 |
-| 断线恢复 | ⛔ 断开路径 2/2 复现导致 Windows 主机网络栈失联；超时/重连/切网/休眠未测 |
-| 路由/DNS 清理 | ⛔ 连接态正确；断开清理会触发主机失联，无法验收，需 VM 修复 |
+| 断线恢复 | 🟡 工作区已重排断开顺序（stop/join reader → 删路由/DNS/NRPT 保留地址 → 关适配器 → 无后续查询），未提交、未在 VM 验证；超时/重连/切网/休眠未测 |
+| 路由/DNS 清理 | 🟡 连接态正确；断开清理新顺序已实现并有 Linux 单测，仍须一次性 VM 按矩阵验收 |
 | kill-switch | ⛔ Windows 明确不支持；profile/guard 拒绝 |
 | 安装测试 | 🟡 MSI 安装 + 真实隧道已实测；升级/卸载在 M5 已实测；干净 VM 待补 |
 | 安全测试 | 🟡 `verify-client-access`、非成员拒绝、口令不落盘、DLL 哈希已测；假服务端/签名固定未补 |
@@ -629,16 +680,19 @@ PowerShell IPC 客户端驱动 `Connect/Status/Disconnect`；未修改现有 VPN
 | M3 网络 | 路由/DNS/NRPT、防环、IPv6 阻断、清理 | 🟡 已提交；Windows 实机路由/DNS 验收待 M6 | 全隧道无泄漏，断开恢复 |
 | M4 GUI | 路径/钥匙串/自启/语言/状态/服务端身份 | ✅ 已提交 `7b73a82`，Windows RDP 实机验证 | 普通用户基础操作（真实服务端 E2E 归 M6） |
 | M5 安装 | MSI、服务安装、组/DACL、Wintun、签名钩子、Windows CI | ✅ 已提交 `cb39124`；MSI 静态检查、安装/升级/卸载、标准用户/非成员、GUI RDP 已实测 | 干净 Win10/11 安装/升级/卸载；无证书构建标记为 unsigned |
-| M6 硬化 | E2E、休眠/切网、fuzz、CI、性能 | 🟡 代码已提交 `06a092b`：分流 E2E、5 个实机 bug 修复、fuzz、手动 CI 完成；**断开路径 2/2 复现致 Windows 主机网络栈失联**，断开/崩溃清理、全隧道、性能被阻塞 | 修复断开清理并在一次性 VM 验收 |
+| M6 硬化 | E2E、休眠/切网、fuzz、CI、性能 | 🟡 `06a092b`：分流 E2E、5 个实机 bug 修复、fuzz、手动 CI；**断开路径 2/2 复现致 Windows 主机网络栈失联**。工作区已有 teardown 重排修复（未提交），断开/崩溃清理、全隧道、性能仍被阻塞 | 按 2.11 矩阵在一次性 VM 验收断开修复 |
 
 **当前状态：** M1–M5 已提交，M6 代码已提交为 `06a092b`。分流隧道 E2E（plain/UDP）
 两次通过，修复了 4 个 Windows 10 实机契约 bug 和 1 个 fuzz 发现的移位溢出，新增
 垫片 fuzz 与手动 E2E 工作流。**关键阻塞：** 发送 `Disconnect` 后 Windows 主机
 两次（2/2）从网络失联；第一次的事件日志显示无 Kernel-Power 41、无睡眠支持、
-约 2 小时后由 `winlogon.exe` 干净关机并重启。断连清理顺序（Wintun 适配器仍
-打开时执行 `Remove-NetRoute`/`Remove-NetIPAddress`）是主要嫌疑，尚未修复/验证。
-M6 未完成项（断开/崩溃清理、全隧道 DNS/NRPT/IPv6、休眠/切网、性能）须先在
-一次性 VM 中补测，再决定 M6 是否签收。
+约 2 小时后由 `winlogon.exe` 干净关机并重启。修复前断连顺序在 Wintun 适配器
+仍打开时执行 `Remove-NetRoute`/`Remove-NetIPAddress`，且 peer 任务未 join、
+close 后仍有 `Get-Net*` 查询，是主要嫌疑。**当前工作区已实现 teardown 重排**
+（stop reader → join peer 任务 → 删路由/DNS/NRPT 保留地址 → 关闭适配器 → 不再
+查询，见 2.11），但**未提交、未在 Windows 验证**；M6 未完成项（断开/崩溃清理、
+全隧道 DNS/NRPT/IPv6、休眠/切网、性能）须先在一次性 VM 中按 2.11 的矩阵补测，
+再决定 M6 是否签收。**在 VM 通过前禁止在物理机再次连接/断开。**
 
 ---
 

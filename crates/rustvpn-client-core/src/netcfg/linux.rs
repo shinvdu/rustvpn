@@ -465,6 +465,17 @@ impl NetworkGuard {
         }
     }
 
+    /// Teardown for a closed/exiting connection.
+    ///
+    /// Linux keeps its historical ordering here (routes, address, link down,
+    /// anti-loop route, IPv6 blackhole, DNS revert, firewall last), so this is
+    /// exactly [`Self::remove`].  The method exists so the engine can share one
+    /// teardown call with Windows, where the address is deliberately retained
+    /// for the adapter close.
+    pub async fn remove_connection_state(self) {
+        self.remove().await;
+    }
+
     /// Whether the MSS clamp table was applied successfully.
     pub fn mss_applied(&self) -> bool {
         self.mss

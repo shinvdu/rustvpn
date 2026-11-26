@@ -1103,7 +1103,11 @@ pub async fn install_with(
     )
     .await
     {
-        let report = cleanup_state(ctx.runner, &state).await;
+        // The engine closes the Wintun adapter immediately after a failed
+        // install, so keep the profile address here as well: the adapter close
+        // removes it together with its implicit connected route, avoiding a
+        // `Remove-NetIPAddress` against a live session.
+        let report = cleanup_state_with(ctx.runner, &state, false).await;
         if report.ok() {
             let _ = ctx.store.clear();
         }
@@ -1561,7 +1565,32 @@ impl CleanupReport {
 
 /// Remove everything recorded in `state`, verifying each entry before touching
 /// it.  Never removes an entry that is not in the state file.
+///
+/// This is the crash-recovery form: it also removes the recorded IPv4 address.
 pub async fn cleanup_state(runner: &dyn WinRunner, state: &PersistedState) -> CleanupReport {
+    cleanup_state_with(runner, state, true).await
+}
+
+/// Remove RustVPN-owned network state, optionally keeping the Wintun address.
+///
+/// `remove_address == false` is the **normal disconnect/teardown** form.  The
+/// Wintun adapter is closed immediately afterwards by the engine, and closing
+/// a created Wintun adapter removes its address and the implicit connected
+/// route.  Removing them explicitly first (`Remove-NetIPAddress` while the
+/// session is still open) is the suspected trigger of the Windows network-stack
+/// hang, so the connection path keeps the address and lets the adapter close
+/// remove it.  Everything that outlives the adapter (anti-loop/split routes,
+/// DNS, NRPT, interface metric, IPv6 firewall rule) is still removed here.
+///
+/// Crash recovery and stale-state cleanup keep `remove_address == true`: the
+/// owning adapter may still exist (for example a pre-existing adapter that was
+/// opened rather than created), and there is no following adapter close to
+/// rely on.
+pub async fn cleanup_state_with(
+    runner: &dyn WinRunner,
+    state: &PersistedState,
+    remove_address: bool,
+) -> CleanupReport {
     let mut report = CleanupReport::default();
 
     // NRPT first: once the tunnel routes go away, a rule forcing all DNS into
@@ -1737,7 +1766,17 @@ pub async fn cleanup_state(runner: &dyn WinRunner, state: &PersistedState) -> Cl
     }
 
     if let Some(address) = &state.address {
-        if !alias_matches(address.ifindex, &state.iface) {
+        if !remove_address {
+            // Normal teardown: the adapter is closed next.  Closing a created
+            // Wintun adapter removes the address and its implicit connected
+            // route as part of the same NDIS teardown; issuing
+            // `Remove-NetIPAddress` first while the session is open is the
+            // suspected hang trigger.
+            report.actions.push(format!(
+                "keep address {}/{} on interface {} for the adapter close",
+                address.address, address.prefix_len, address.ifindex
+            ));
+        } else if !alias_matches(address.ifindex, &state.iface) {
             report.actions.push(format!(
                 "skip address removal on interface {}: index now belongs to another adapter",
                 address.ifindex
@@ -2699,8 +2738,14 @@ mod tests {
             format!("{error:#}").contains("refusing to overwrite"),
             "{error:#}"
         );
-        // The address that was added before the conflict was rolled back.
-        assert!(system.addresses.lock().unwrap().is_empty());
+        // Routes are rolled back, but the address added before the conflict is
+        // left for the engine's adapter close (which follows every failed
+        // install) instead of being removed against the live session.
+        assert!(!system
+            .commands()
+            .iter()
+            .any(|command| matches!(command, WinCommand::RemoveIpAddress { .. })));
+        assert_eq!(system.addresses.lock().unwrap().len(), 1);
         assert!(system.routes.lock().unwrap().len() == 1);
     }
 
@@ -2729,7 +2774,14 @@ mod tests {
             format!("{error:#}").contains("would still win"),
             "{error:#}"
         );
-        assert!(system.addresses.lock().unwrap().is_empty());
+        // The address is left for the following adapter close; the competing
+        // physical default route is untouched.
+        assert!(!system
+            .commands()
+            .iter()
+            .any(|command| matches!(command, WinCommand::RemoveIpAddress { .. })));
+        assert_eq!(system.addresses.lock().unwrap().len(), 1);
+        assert_eq!(system.routes.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -2756,7 +2808,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn injected_route_failure_rolls_back_the_address_and_state() {
+    async fn injected_route_failure_rolls_back_routes_and_state_but_keeps_the_address() {
         let system = FakeSystem::new();
         system.fail_on("add-route");
         let store = TempStore::new("inject");
@@ -2774,10 +2826,21 @@ mod tests {
             format!("{error:#}").contains("injected add route failure"),
             "{error:#}"
         );
+        // Rollback removes the routes/DNS/NRPT it added, but deliberately
+        // leaves the profile address for the adapter close (which follows in
+        // the engine and removes the address + connected route together).
         assert!(
-            system.addresses.lock().unwrap().is_empty(),
-            "address must be rolled back"
+            !system
+                .commands()
+                .iter()
+                .any(|command| matches!(command, WinCommand::RemoveIpAddress { .. })),
+            "rollback must not issue Remove-NetIPAddress against the live adapter"
         );
+        assert!(
+            !system.addresses.lock().unwrap().is_empty(),
+            "the address is removed by the following adapter close"
+        );
+        assert!(system.routes.lock().unwrap().is_empty());
         assert!(
             store.load().unwrap().is_none(),
             "state file must be removed"
@@ -2891,6 +2954,89 @@ mod tests {
         assert!(system.nrpt.lock().unwrap().is_empty());
         assert!(system.firewall.lock().unwrap().is_empty());
         assert_eq!(system.interfaces.lock().unwrap()[0].metric, 5000);
+    }
+
+    #[tokio::test]
+    async fn connection_cleanup_keeps_the_address_for_the_adapter_close() {
+        // Normal teardown contract: remove routes/DNS/NRPT/metric/IPv6 but
+        // never issue Remove-NetIPAddress on the live adapter; the engine
+        // closes the adapter next and Wintun removes the address + connected
+        // route as one NDIS teardown.
+        let system = FakeSystem::new();
+        let store = TempStore::new("keep-address");
+        let probe = Probe { alive: false };
+        let state = install_with(
+            ctx(&system, &store, &probe),
+            &full_spec(),
+            Some("203.0.113.10:1194".parse().unwrap()),
+            1500,
+            NetOptions::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(system.addresses.lock().unwrap().len(), 1);
+
+        let report = cleanup_state_with(&system, &state, false).await;
+        assert!(report.ok(), "{report:?}");
+        assert!(
+            !system
+                .commands()
+                .iter()
+                .any(|command| matches!(command, WinCommand::RemoveIpAddress { .. })),
+            "{:?}",
+            system.commands()
+        );
+        assert_eq!(
+            system.addresses.lock().unwrap().len(),
+            1,
+            "the address must be left for the adapter close"
+        );
+        // Everything that outlives the adapter is still removed.
+        assert!(system.routes.lock().unwrap().is_empty());
+        assert!(system.nrpt.lock().unwrap().is_empty());
+        assert!(system.firewall.lock().unwrap().is_empty());
+        assert_eq!(system.interfaces.lock().unwrap()[0].metric, 5000);
+    }
+
+    #[tokio::test]
+    async fn crash_cleanup_removes_the_address_after_routes_and_nrpt() {
+        // Crash/stale cleanup has no following adapter close, so it must still
+        // remove the address; the order keeps routes/NRPT gone first so a
+        // leftover address cannot keep tunnel routing alive.
+        let system = FakeSystem::new();
+        let store = TempStore::new("address-order");
+        let probe = Probe { alive: false };
+        let state = install_with(
+            ctx(&system, &store, &probe),
+            &full_spec(),
+            Some("203.0.113.10:1194".parse().unwrap()),
+            1500,
+            NetOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        let report = cleanup_state(&system, &state).await;
+        assert!(report.ok(), "{report:?}");
+        let commands = system.commands();
+        let position = |predicate: &dyn Fn(&WinCommand) -> bool| {
+            commands
+                .iter()
+                .rposition(predicate)
+                .unwrap_or_else(|| panic!("missing command in {commands:?}"))
+        };
+        let address = position(&|c| matches!(c, WinCommand::RemoveIpAddress { .. }));
+        let route = position(&|c| matches!(c, WinCommand::RemoveRoute { .. }));
+        let nrpt = position(&|c| matches!(c, WinCommand::RemoveNrpt { .. }));
+        assert!(
+            address > route,
+            "address removal must follow routes: {commands:?}"
+        );
+        assert!(
+            address > nrpt,
+            "address removal must follow NRPT: {commands:?}"
+        );
+        assert!(system.addresses.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

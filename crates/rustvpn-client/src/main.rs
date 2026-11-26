@@ -569,7 +569,7 @@ async fn run_once(
         *first_up = false;
     }
     let end = session.wait(&shutdown).await;
-    session.close(&stats_state);
+    session.close(&stats_state).await;
     Ok(end)
 }
 

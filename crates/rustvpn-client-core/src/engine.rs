@@ -120,11 +120,21 @@ impl Engine {
         }
 
         let mut current: Option<(CancellationToken, JoinHandle<()>)> = None;
+        // True once a connection task has completed, i.e. the Wintun adapter
+        // may just have been closed.  Windows must not issue a network query
+        // immediately after that close; a failed cleanup is retried on the
+        // next daemon start instead.
+        #[cfg(windows)]
+        let mut connection_closed = false;
         loop {
             tokio::select! {
                 cmd = commands.recv() => {
                     match cmd {
                         Some(Command::Connect { profile, password }) => {
+                            #[cfg(windows)]
+                            if current.is_some() {
+                                connection_closed = true;
+                            }
                             stop_current(&mut current).await;
                             let cancel = CancellationToken::new();
                             let handle = tokio::spawn(run_connection(
@@ -137,7 +147,13 @@ impl Engine {
                             current = Some((cancel, handle));
                         }
                         Some(Command::Disconnect) => {
+                            #[cfg(windows)]
+                            let was_active = current.is_some();
                             stop_current(&mut current).await;
+                            #[cfg(windows)]
+                            if was_active {
+                                connection_closed = true;
+                            }
                             // An explicit disconnect restores connectivity even
                             // when the daemon is idle with a crash-preserved
                             // kill-switch table (no connection guard to remove).
@@ -145,13 +161,22 @@ impl Engine {
                             crate::firewall::cleanup_stale(&options.firewall_scope).await;
                             // A crashed Windows daemon may have left state even
                             // when the engine is idle (no guard to remove).
+                            //
+                            // Only the idle path may query the network here.
+                            // When a connection just ended, its adapter has
+                            // already been closed; a `Get-Net*` query at this
+                            // point is the suspected second trigger of the
+                            // Windows hang and must be deferred to the next
+                            // daemon start (before any adapter is opened).
                             #[cfg(windows)]
-                            if let Err(error) = crate::netcfg::cleanup_owned_network().await {
-                                emit_log(
-                                    &events,
-                                    "warn",
-                                    format!("cannot clean Windows network state: {error:#}"),
-                                );
+                            if !was_active {
+                                if let Err(error) = crate::netcfg::cleanup_owned_network().await {
+                                    emit_log(
+                                        &events,
+                                        "warn",
+                                        format!("cannot clean Windows network state: {error:#}"),
+                                    );
+                                }
                             }
                             let _ = events.send(Event::State(EngineStatus {
                                 state: "idle".into(),
@@ -160,6 +185,10 @@ impl Engine {
                             emit_log(&events, "info", "disconnected");
                         }
                         Some(Command::Shutdown) | None => {
+                            #[cfg(windows)]
+                            if current.is_some() {
+                                connection_closed = true;
+                            }
                             stop_current(&mut current).await;
                             break;
                         }
@@ -171,20 +200,28 @@ impl Engine {
                     }
                 }, if current.is_some() => {
                     current = None;
+                    #[cfg(windows)]
+                    {
+                        connection_closed = true;
+                    }
                 }
             }
         }
 
-        // Final retry for a normal stop: a cleanup that failed during
-        // guard.remove() keeps its state file; retry it now that no connection
-        // is active.  Only this process's recorded state is touched.
+        // Final retry for a daemon that never ran a connection (for example a
+        // crash-preserved state found while idle).  If a connection did run,
+        // its teardown already handled cleanup; querying the network now would
+        // happen right after the adapter close, which is exactly what this
+        // contract forbids.  A failed cleanup is retried on the next start.
         #[cfg(windows)]
-        if let Err(error) = crate::netcfg::cleanup_owned_network().await {
-            emit_log(
-                &events,
-                "warn",
-                format!("cannot finish Windows network cleanup: {error:#}"),
-            );
+        if !connection_closed {
+            if let Err(error) = crate::netcfg::cleanup_owned_network().await {
+                emit_log(
+                    &events,
+                    "warn",
+                    format!("cannot finish Windows network cleanup: {error:#}"),
+                );
+            }
         }
     }
 }
@@ -194,6 +231,47 @@ async fn stop_current(current: &mut Option<(CancellationToken, JoinHandle<()>)>)
         cancel.cancel();
         let _ = handle.await;
     }
+}
+
+/// Device half of the teardown contract, fakeable in unit tests.
+trait TeardownDevice {
+    /// Stop the platform reader thread without closing the device.
+    fn stop_reader(&self);
+    /// Close the device (Windows: session shutdown + adapter close).
+    fn close(self);
+}
+
+impl TeardownDevice for Arc<Tap> {
+    fn stop_reader(&self) {
+        Tap::stop_reader(self.as_ref());
+    }
+
+    fn close(self) {
+        drop(self);
+    }
+}
+
+/// Ordered host teardown for a connection.
+///
+/// The contract, in order:
+///
+/// 1. stop the platform reader (Windows: join the Wintun shim reader),
+/// 2. remove the RustVPN-owned routes/DNS/NRPT (Windows keeps the profile
+///    address for the adapter close),
+/// 3. close the device (Windows: session shutdown + adapter close, which also
+///    removes the address and its implicit connected route).
+///
+/// No network query is performed by this function or after its close step.
+/// Callers publish the idle status only once this returns.
+async fn teardown_connection<D, R, RFut>(device: D, remove_network: R)
+where
+    D: TeardownDevice,
+    R: FnOnce() -> RFut,
+    RFut: Future<Output = ()>,
+{
+    device.stop_reader();
+    remove_network().await;
+    device.close();
 }
 
 /// Whether resolving `host` needs the temporary DNS allowance.
@@ -252,6 +330,10 @@ impl BootstrapState {
     }
 
     /// Whether the preserved table still exists and has not been replaced.
+    ///
+    /// The crash-preserved table is Unix/nftables-only; Windows keeps the
+    /// neutral state machine compiled but never queries this accessor.
+    #[cfg_attr(target_os = "windows", allow(dead_code))]
     fn active(&self) -> bool {
         self.active
     }
@@ -707,7 +789,11 @@ async fn run_connection(
                             );
                         }
                         Err(error) => {
-                            session.close(&stats_state);
+                            session.close(&stats_state).await;
+                            // The guard rolled back its own state.  Join the
+                            // Wintun reader before releasing the adapter so no
+                            // thread is inside a read while NDIS tears down.
+                            tap.stop_reader();
                             drop(tap);
                             emit_error(&events, &spec, format!("network setup: {error:#}"));
                             emit_log(&events, "error", format!("network setup: {error:#}"));
@@ -724,7 +810,10 @@ async fn run_connection(
                 emit_log(&events, "info", "session established");
 
                 let end = session_loop(&mut session, &cancel, &events, &mut connected_status).await;
-                session.close(&stats_state);
+                // Joins every peer task: no task keeps a `Tap` clone after
+                // this returns, so the final `drop(tap)` really closes the
+                // adapter.
+                session.close(&stats_state).await;
                 if cancel.is_cancelled() {
                     break;
                 }
@@ -816,23 +905,32 @@ async fn run_connection(
         }
     }
 
+    #[cfg(unix)]
     let had_guard = guard.is_some();
-    if let Some(guard) = guard {
-        guard.remove().await;
-    }
-    // An explicit disconnect/stop must restore connectivity even if the daemon
-    // only ever managed to bootstrap through a preserved crash table.  A
-    // failed setup (which returns above without cancellation) deliberately
-    // leaves the table installed (fail-closed).
-    if !had_guard && bootstrap.active() && cancel.is_cancelled() {
-        crate::firewall::remove_kill_switch(&scope).await;
-        emit_log(
-            &events,
-            "info",
-            "removed the preserved kill switch on explicit stop; connectivity restored",
-        );
-    }
-    drop(tap);
+    // Every session above was closed by an awaited `session.close()` (which
+    // joins the peer tasks), so no task holds a `Tap` clone anymore.  The
+    // reader is stopped before any route/DNS command runs, and the adapter is
+    // closed only after the guard has removed what outlives it.  On Windows
+    // the guard keeps the profile address; the adapter close removes it.
+    teardown_connection(tap, || async {
+        if let Some(guard) = guard {
+            guard.remove_connection_state().await;
+        }
+        // An explicit disconnect/stop must restore connectivity even if the
+        // daemon only ever managed to bootstrap through a preserved crash
+        // table.  A failed setup (which returns above without cancellation)
+        // deliberately leaves the table installed (fail-closed).
+        #[cfg(unix)]
+        if !had_guard && bootstrap.active() && cancel.is_cancelled() {
+            crate::firewall::remove_kill_switch(&scope).await;
+            emit_log(
+                &events,
+                "info",
+                "removed the preserved kill switch on explicit stop; connectivity restored",
+            );
+        }
+    })
+    .await;
     emit_log(&events, "info", "tunnel stopped");
 }
 
@@ -1186,6 +1284,41 @@ mod tests {
 
     #[cfg(unix)]
     use std::net::SocketAddr;
+
+    struct RecordingDevice {
+        log: Arc<std::sync::Mutex<Vec<&'static str>>>,
+    }
+
+    impl TeardownDevice for RecordingDevice {
+        fn stop_reader(&self) {
+            self.log.lock().unwrap().push("stop-reader");
+        }
+
+        fn close(self) {
+            self.log.lock().unwrap().push("close-device");
+        }
+    }
+
+    #[tokio::test]
+    async fn teardown_stops_reader_removes_state_then_closes_device() {
+        // Locks in the Windows teardown contract: no network command may run until
+        // the reader is stopped, and the device must close last (after which no
+        // network query is allowed).
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let remove_log = log.clone();
+        teardown_connection(RecordingDevice { log: log.clone() }, || {
+            let remove_log = remove_log;
+            async move {
+                remove_log.lock().unwrap().push("remove-network");
+            }
+        })
+        .await;
+
+        assert_eq!(
+            &*log.lock().unwrap(),
+            &["stop-reader", "remove-network", "close-device"]
+        );
+    }
 
     #[test]
     fn backoff_is_bounded_and_grows() {
