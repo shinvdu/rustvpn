@@ -9,6 +9,10 @@ license.workspace = true
 name = "rustvpn-client-ui"
 path = "src/main.rs"
 
+[features]
+default = []
+updater = ["dep:tauri-plugin-updater"]
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
@@ -21,5 +25,6 @@ serde_yaml_ng = { workspace = true }
 tokio = { workspace = true }
 anyhow = { workspace = true }
 tauri-plugin-single-instance = "2"
+tauri-plugin-updater = { version = "2", optional = true }
 keyring = { version = "3.6", default-features = false, features = ["sync-secret-service", "crypto-rust"] }
 zeroize = { workspace = true }

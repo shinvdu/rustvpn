@@ -10,7 +10,7 @@ User=rustvpn
 Group=rustvpn
 RuntimeDirectory=rustvpn-client
 RuntimeDirectoryMode=0750
-ExecStart=/usr/local/bin/rustvpn-clientd -socket /run/rustvpn-client/client.sock -socket-group rustvpn
+ExecStart=/usr/local/bin/rustvpn-clientd -socket /run/rustvpn-client/client.sock -socket-group rustvpn -hello-timeout 5 -idle-timeout 300
 # Backstop for a crash: the route is marked with proto 66 so it cannot be
 # confused with an administrator's own blackhole route.
 ExecStopPost=-/usr/sbin/ip -6 route del blackhole default proto 66 metric 50

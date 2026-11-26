@@ -7,7 +7,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use rustvpn_client_ipc::{Client, EngineStatus, EventStream, LogLine, ProfileSpec};
@@ -17,9 +17,53 @@ use tauri::{Emitter, Manager, WindowEvent};
 
 const KEYRING_SERVICE: &str = "rustvpn-client";
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UiLang {
+    Zh,
+    En,
+    Ru,
+}
+
+impl UiLang {
+    fn parse(tag: &str) -> Self {
+        let tag = tag.trim().to_ascii_lowercase();
+        if tag.starts_with("zh") {
+            Self::Zh
+        } else if tag.starts_with("ru") {
+            Self::Ru
+        } else {
+            Self::En
+        }
+    }
+
+    fn tray_labels(self) -> [&'static str; 3] {
+        match self {
+            Self::Zh => ["打开 RustVPN", "断开", "退出"],
+            Self::En => ["Open RustVPN", "Disconnect", "Quit"],
+            Self::Ru => ["Открыть RustVPN", "Отключить", "Выйти"],
+        }
+    }
+}
+
+fn initial_language() -> UiLang {
+    ["LC_ALL", "LC_MESSAGES", "LANG"]
+        .iter()
+        .find_map(|name| std::env::var(name).ok())
+        .map(|value| UiLang::parse(&value))
+        .unwrap_or(UiLang::En)
+}
+
+struct TrayItems {
+    show: MenuItem<tauri::Wry>,
+    disconnect: MenuItem<tauri::Wry>,
+    quit: MenuItem<tauri::Wry>,
+}
+
 struct AppState {
     socket: PathBuf,
     tray_available: Arc<AtomicBool>,
+    tray_items: Mutex<Option<TrayItems>>,
+    language: Mutex<UiLang>,
 }
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -114,6 +158,121 @@ async fn delete_password(profile_name: String) -> Result<(), String> {
     )
     .await
     .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+fn system_language(state: tauri::State<'_, AppState>) -> String {
+    match state.language.lock().map(|language| *language) {
+        Ok(UiLang::Zh) => "zh".into(),
+        Ok(UiLang::Ru) => "ru".into(),
+        _ => "en".into(),
+    }
+}
+
+#[tauri::command]
+fn set_ui_language(lang: String, state: tauri::State<'_, AppState>) -> Result<(), String> {
+    let language = UiLang::parse(&lang);
+    if let Ok(mut current) = state.language.lock() {
+        *current = language;
+    }
+    let [show, disconnect, quit] = language.tray_labels();
+    if let Ok(items) = state.tray_items.lock() {
+        if let Some(items) = items.as_ref() {
+            items
+                .show
+                .set_text(show)
+                .map_err(|error| error.to_string())?;
+            items
+                .disconnect
+                .set_text(disconnect)
+                .map_err(|error| error.to_string())?;
+            items
+                .quit
+                .set_text(quit)
+                .map_err(|error| error.to_string())?;
+        }
+    }
+    Ok(())
+}
+
+fn updater_settings_ready(value: &serde_json::Value) -> bool {
+    let endpoints_ready = value
+        .get("endpoints")
+        .and_then(|endpoints| endpoints.as_array())
+        .is_some_and(|endpoints| {
+            endpoints.iter().any(|endpoint| {
+                endpoint
+                    .as_str()
+                    .is_some_and(|text| !text.trim().is_empty())
+            })
+        });
+    let pubkey_ready = value
+        .get("pubkey")
+        .and_then(|key| key.as_str())
+        .is_some_and(|text| !text.trim().is_empty());
+    endpoints_ready && pubkey_ready
+}
+
+#[tauri::command]
+fn updater_info(app: tauri::AppHandle) -> serde_json::Value {
+    let configured = app
+        .config()
+        .plugins
+        .0
+        .get("updater")
+        .is_some_and(updater_settings_ready);
+    serde_json::json!({
+        "enabled": cfg!(feature = "updater") && configured,
+        "version": env!("CARGO_PKG_VERSION"),
+    })
+}
+
+#[cfg(feature = "updater")]
+#[tauri::command]
+async fn check_update(app: tauri::AppHandle) -> Result<serde_json::Value, String> {
+    use tauri_plugin_updater::UpdaterExt;
+    let update = app
+        .updater()
+        .map_err(|error| error.to_string())?
+        .check()
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(match update {
+        Some(update) => serde_json::json!({
+            "available": true,
+            "version": update.version,
+        }),
+        None => serde_json::json!({ "available": false }),
+    })
+}
+
+#[cfg(not(feature = "updater"))]
+#[tauri::command]
+async fn check_update() -> Result<serde_json::Value, String> {
+    Err("updater is not enabled in this build".into())
+}
+
+#[cfg(feature = "updater")]
+#[tauri::command]
+async fn install_update(app: tauri::AppHandle) -> Result<(), String> {
+    use tauri_plugin_updater::UpdaterExt;
+    let update = app
+        .updater()
+        .map_err(|error| error.to_string())?
+        .check()
+        .await
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "no update available".to_string())?;
+    update
+        .download_and_install(|_, _| {}, || {})
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[cfg(not(feature = "updater"))]
+#[tauri::command]
+async fn install_update() -> Result<(), String> {
+    Err("updater is not enabled in this build".into())
 }
 
 #[tauri::command]
@@ -397,14 +556,19 @@ fn set_dir_private(dir: &std::path::Path) {
 
 fn main() {
     let socket = rustvpn_client_ipc::default_socket_path();
-    tauri::Builder::default()
-        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+    let builder =
+        tauri::Builder::default().plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
             show_main(app);
-        }))
+        }));
+    #[cfg(feature = "updater")]
+    let builder = builder.plugin(tauri_plugin_updater::Builder::new().build());
+    builder
         .setup(move |app| {
             let state = AppState {
                 socket: socket.clone(),
                 tray_available: Arc::new(AtomicBool::new(false)),
+                tray_items: Mutex::new(None),
+                language: Mutex::new(initial_language()),
             };
             app.manage(state);
             if let Err(error) = setup_tray(app) {
@@ -439,16 +603,28 @@ fn main() {
             save_password,
             delete_password,
             autostart_enabled,
-            set_autostart
+            set_autostart,
+            system_language,
+            set_ui_language,
+            updater_info,
+            check_update,
+            install_update
         ])
         .run(tauri::generate_context!())
         .expect("error while running RustVPN client");
 }
 
 fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
-    let show = MenuItem::with_id(app, "show", "打开 RustVPN", true, None::<&str>)?;
-    let disconnect = MenuItem::with_id(app, "disconnect", "断开", true, None::<&str>)?;
-    let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
+    let language = app
+        .state::<AppState>()
+        .language
+        .lock()
+        .map(|lang| *lang)
+        .unwrap_or(UiLang::En);
+    let [show_label, disconnect_label, quit_label] = language.tray_labels();
+    let show = MenuItem::with_id(app, "show", show_label, true, None::<&str>)?;
+    let disconnect = MenuItem::with_id(app, "disconnect", disconnect_label, true, None::<&str>)?;
+    let quit = MenuItem::with_id(app, "quit", quit_label, true, None::<&str>)?;
     let menu = Menu::with_items(app, &[&show, &disconnect, &quit])?;
     let Some(icon) = app.default_window_icon().cloned() else {
         return Ok(());
@@ -474,9 +650,15 @@ fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
             }
         })
         .build(app)?;
-    app.state::<AppState>()
-        .tray_available
-        .store(true, Ordering::Relaxed);
+    let state = app.state::<AppState>();
+    state.tray_available.store(true, Ordering::Relaxed);
+    if let Ok(mut slot) = state.tray_items.lock() {
+        *slot = Some(TrayItems {
+            show,
+            disconnect,
+            quit,
+        });
+    }
     Ok(())
 }
 
@@ -516,6 +698,37 @@ fn quit_app(app: &tauri::AppHandle) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn locale_tags_map_to_supported_languages() {
+        assert_eq!(UiLang::parse("zh_CN.UTF-8"), UiLang::Zh);
+        assert_eq!(UiLang::parse("ru-RU"), UiLang::Ru);
+        assert_eq!(UiLang::parse("en_GB"), UiLang::En);
+        assert_eq!(UiLang::parse("de_DE"), UiLang::En);
+    }
+
+    #[test]
+    fn updater_requires_both_endpoint_and_pubkey() {
+        let empty = serde_json::json!({ "endpoints": [], "pubkey": "" });
+        assert!(!updater_settings_ready(&empty));
+        let endpoint_only =
+            serde_json::json!({ "endpoints": ["https://example.test/{{current_version}}"] });
+        assert!(!updater_settings_ready(&endpoint_only));
+        let ready = serde_json::json!({
+            "endpoints": ["https://example.test/{{current_version}}"],
+            "pubkey": "RW..."
+        });
+        assert!(updater_settings_ready(&ready));
+    }
+
+    #[test]
+    fn every_language_has_tray_labels() {
+        for language in [UiLang::Zh, UiLang::En, UiLang::Ru] {
+            let labels = language.tray_labels();
+            assert!(labels.iter().all(|label| !label.trim().is_empty()));
+            assert_ne!(labels[0], labels[2]);
+        }
+    }
 
     fn profile(name: &str) -> ProfileSpec {
         ProfileSpec {

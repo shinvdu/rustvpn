@@ -1,0 +1,102 @@
+# RPM spec template for the RustVPN desktop client stack.
+#
+# Rendered by build-packages.sh, which substitutes @VERSION@, @RELEASE@ and
+# @RPM_ARCH@ and passes the staged payload directory as the "staging" macro.
+
+Name:           rustvpn-client
+Version:        @VERSION@
+Release:        @RELEASE@
+Summary:        RustVPN desktop client (CLI, daemon and Tauri GUI)
+License:        GPL-3.0-or-later
+URL:            https://github.com/shinvdu/rustvpn
+BuildArch:      @RPM_ARCH@
+
+# Runtime libraries used by the Tauri/WebKitGTK GUI, the tray indicator and
+# the daemon's IPC. These names match Fedora; openSUSE names differ slightly
+# (see packaging/linux/README.md).
+Requires:       webkit2gtk4.1
+Requires:       gtk3
+Requires:       libayatana-appindicator-gtk3
+Requires:       dbus-libs
+Requires:       openssl-libs
+
+# Not defined by a bare rpm installation; systemd-rpm-macros sets it on distros.
+%{!?_unitdir:%global _unitdir /usr/lib/systemd/system}
+
+%description
+RustVPN client stack: the rustvpn-client command-line client, the privileged
+rustvpn-clientd system daemon and the rustvpn-client-ui Tauri desktop GUI.
+The daemon runs as the system user rustvpn with CAP_NET_ADMIN and CAP_NET_RAW
+and exposes a group-accessible Unix socket under /run.
+
+%install
+set -e
+install -Dm755 "%{staging}/usr/bin/rustvpn-client"    "%{buildroot}%{_bindir}/rustvpn-client"
+install -Dm755 "%{staging}/usr/bin/rustvpn-clientd"   "%{buildroot}%{_bindir}/rustvpn-clientd"
+install -Dm755 "%{staging}/usr/bin/rustvpn-client-ui" "%{buildroot}%{_bindir}/rustvpn-client-ui"
+install -Dm644 "%{staging}/lib/systemd/system/rustvpn-clientd.service" \
+    "%{buildroot}%{_unitdir}/rustvpn-clientd.service"
+install -Dm644 "%{staging}/usr/share/applications/rustvpn-client.desktop" \
+    "%{buildroot}%{_datadir}/applications/rustvpn-client.desktop"
+install -Dm644 "%{staging}/usr/share/icons/hicolor/256x256/apps/rustvpn.png" \
+    "%{buildroot}%{_datadir}/icons/hicolor/256x256/apps/rustvpn.png"
+install -Dm644 "%{staging}/usr/share/doc/rustvpn-client/README.md" \
+    "%{buildroot}%{_docdir}/rustvpn-client/README.md"
+install -Dm644 "%{staging}/usr/share/doc/rustvpn-client/COPYING" \
+    "%{buildroot}%{_docdir}/rustvpn-client/COPYING"
+
+%pre
+# Create the unprivileged system user/group that the daemon runs as.
+if ! getent group rustvpn >/dev/null 2>&1; then
+    groupadd --system rustvpn
+fi
+if ! getent passwd rustvpn >/dev/null 2>&1; then
+    useradd --system --no-create-home --shell /usr/sbin/nologin \
+        --gid rustvpn rustvpn
+fi
+exit 0
+
+%post
+if [ -d /run/systemd/system ]; then
+    systemctl daemon-reload >/dev/null 2>&1 || :
+fi
+exit 0
+
+%preun
+if [ "$1" -eq 0 ]; then
+    if [ -d /run/systemd/system ]; then
+        systemctl stop rustvpn-clientd.service >/dev/null 2>&1 || :
+        systemctl disable rustvpn-clientd.service >/dev/null 2>&1 || :
+    fi
+fi
+exit 0
+
+%postun
+if [ -d /run/systemd/system ]; then
+    systemctl daemon-reload >/dev/null 2>&1 || :
+fi
+if [ "$1" -eq 0 ]; then
+    # Final erase: drop the system user/group created by %pre.
+    if getent passwd rustvpn >/dev/null 2>&1; then
+        userdel rustvpn >/dev/null 2>&1 || :
+    fi
+    if getent group rustvpn >/dev/null 2>&1; then
+        groupdel rustvpn >/dev/null 2>&1 || :
+    fi
+fi
+exit 0
+
+%files
+%defattr(-,root,root,-)
+%{_bindir}/rustvpn-client
+%{_bindir}/rustvpn-clientd
+%{_bindir}/rustvpn-client-ui
+%{_unitdir}/rustvpn-clientd.service
+%{_datadir}/applications/rustvpn-client.desktop
+%{_datadir}/icons/hicolor/256x256/apps/rustvpn.png
+%{_docdir}/rustvpn-client/README.md
+%{_docdir}/rustvpn-client/COPYING
+
+%changelog
+* Thu Nov 26 2026 RustVPN contributors <rustvpn-maintainers@users.noreply.github.com> - @VERSION@-@RELEASE@
+- Initial package.

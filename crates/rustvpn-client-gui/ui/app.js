@@ -3,6 +3,14 @@
 const BRIDGE = window.RustVpnApi || {};
 const invoke = BRIDGE.invoke;
 const listen = BRIDGE.listen;
+const I18n = window.RustVpnI18n || {
+  apply: () => {},
+  init: () => "zh",
+  setLang: (lang) => lang,
+  t: (source) => source,
+  LANGUAGES: [],
+};
+const t = (source, values) => I18n.t(source, values);
 
 const state = {
   profiles: [],
@@ -17,6 +25,9 @@ const state = {
   daemonOnline: false,
   daemonChecked: false,
   page: "home",
+  updaterEnabled: false,
+  updateAvailable: false,
+  updateVersion: "",
 };
 
 // Any state/traffic event invalidates an in-flight status poll.  This keeps a
@@ -33,6 +44,18 @@ const pageNames = {
 document.addEventListener("DOMContentLoaded", init);
 
 async function init() {
+  let systemLanguage = "";
+  if (invoke) {
+    try {
+      systemLanguage = await invoke("system_language");
+    } catch (error) {
+      // Fall back to the WebView locale below.
+    }
+  }
+  const language = I18n.init(
+    systemLanguage || (typeof navigator === "object" ? navigator.language : "")
+  );
+  bindLanguagePicker(language);
   bindNavigation();
   bindButtons();
   bindModals();
@@ -43,7 +66,10 @@ async function init() {
     return;
   }
 
+  invoke("set_ui_language", { lang: language }).catch(() => {});
   await loadDaemonInfo();
+  await loadAutostart();
+  await loadUpdateStatus();
   await loadAutostart();
   await loadProfiles();
   await pollStatus(true);
@@ -62,6 +88,26 @@ async function init() {
   setInterval(() => pollStatus(false), 3000);
   setInterval(updateUptime, 1000);
   window.addEventListener("resize", drawChart);
+}
+
+function bindLanguagePicker(language) {
+  const select = document.getElementById("lang-select");
+  if (!select) return;
+  select.innerHTML = I18n.LANGUAGES.map(
+    (item) => `<option value="${item.id}">${item.label}</option>`
+  ).join("");
+  select.value = language;
+  select.addEventListener("change", () => setLanguage(select.value));
+}
+
+function setLanguage(lang) {
+  const applied = I18n.setLang(lang);
+  if (invoke) invoke("set_ui_language", { lang: applied }).catch(() => {});
+  showPage(state.page);
+  renderProfiles();
+  renderHome();
+  renderLogs();
+  I18n.apply(document.body);
 }
 
 function bindNavigation() {
@@ -99,6 +145,8 @@ function bindButtons() {
     const ok = await pollStatus(true);
     toast(ok ? "守护进程在线" : "守护进程不可达", !ok);
   });
+  on("check-update", checkForUpdate);
+  on("install-update", installUpdate);
 
   const autostart = document.getElementById("autostart-toggle");
   autostart.addEventListener("change", async () => {
@@ -107,7 +155,7 @@ function bindButtons() {
       toast(autostart.checked ? "已启用登录自启动" : "已关闭登录自启动");
     } catch (error) {
       autostart.checked = !autostart.checked;
-      toast(`设置自启动失败：${error}`, true);
+      toast(t("设置自启动失败：{error}", { error }), true);
     }
   });
 
@@ -184,6 +232,7 @@ function showPage(page) {
   const [title, subtitle] = pageNames[page];
   document.getElementById("page-title").textContent = title;
   document.getElementById("page-subtitle").textContent = subtitle;
+  I18n.apply(document.querySelector(".topbar"));
   if (page === "logs") refreshLogs();
   if (page === "home") drawChart();
 }
@@ -207,6 +256,76 @@ function setDaemon(online, text) {
   document.getElementById("daemon-text").textContent = online
     ? "守护进程在线"
     : text || "守护进程离线";
+  I18n.apply(document.getElementById("daemon-box"));
+}
+
+async function loadUpdateStatus() {
+  const button = document.getElementById("check-update");
+  const status = document.getElementById("update-status");
+  try {
+    const info = await invoke("updater_info");
+    state.updaterEnabled = Boolean(info.enabled);
+    state.updateVersion = info.version || "";
+    status.textContent = t("当前版本 {version}", { version: info.version || "—" });
+    if (!info.enabled) {
+      button.disabled = true;
+      button.title = t("更新源未配置：请使用启用 updater 特性并配置签名公钥的构建。");
+    }
+  } catch (error) {
+    state.updaterEnabled = false;
+    button.disabled = true;
+    status.textContent = t("检查失败：{error}", { error });
+  }
+  I18n.apply(status.parentElement);
+}
+
+async function checkForUpdate() {
+  if (!state.updaterEnabled) {
+    toast("更新源未配置：请使用启用 updater 特性并配置签名公钥的构建。", true);
+    return;
+  }
+  const button = document.getElementById("check-update");
+  const status = document.getElementById("update-status");
+  button.disabled = true;
+  try {
+    const result = await invoke("check_update");
+    state.updateAvailable = Boolean(result && result.available);
+    if (state.updateAvailable) {
+      status.textContent = t("发现新版本 {version}", {
+        version: (result && result.version) || "—",
+      });
+      document.getElementById("install-update").classList.remove("hidden");
+    } else {
+      status.textContent = t("已是最新版本");
+      document.getElementById("install-update").classList.add("hidden");
+    }
+  } catch (error) {
+    status.textContent = t("检查失败：{error}", { error });
+    toast(t("检查失败：{error}", { error }), true);
+  } finally {
+    button.disabled = false;
+  }
+  I18n.apply(status.parentElement);
+}
+
+async function installUpdate() {
+  if (!state.updateAvailable) return;
+  const button = document.getElementById("install-update");
+  const status = document.getElementById("update-status");
+  button.disabled = true;
+  status.textContent = t("正在下载更新…");
+  try {
+    await invoke("install_update");
+    status.textContent = t("更新已安装，重启后生效");
+    button.classList.add("hidden");
+    state.updateAvailable = false;
+    toast("更新已安装，重启后生效");
+  } catch (error) {
+    status.textContent = t("安装失败：{error}", { error });
+    toast(t("安装失败：{error}", { error }), true);
+    button.disabled = false;
+  }
+  I18n.apply(status.parentElement);
 }
 
 async function loadAutostart() {
@@ -222,7 +341,7 @@ async function loadProfiles() {
   try {
     state.profiles = await invoke("list_profiles");
   } catch (error) {
-    toast(`读取配置失败：${error}`, true);
+    toast(t("读取配置失败：{error}", { error }), true);
     state.profiles = [];
   }
   if (!state.profiles.some((profile) => profile.name === state.selected)) {
@@ -290,6 +409,7 @@ function renderProfiles() {
         </article>`;
     })
     .join("");
+  I18n.apply(list);
 }
 
 function renderHome() {
@@ -315,6 +435,8 @@ function renderHome() {
     document.getElementById("meta-proto").textContent = "—";
     document.getElementById("meta-iface").textContent = status.iface || profile?.iface || "—";
     document.getElementById("meta-uptime").textContent = "—";
+    I18n.apply(document.querySelector(".topbar"));
+    I18n.apply(document.getElementById("page-home"));
     return;
   }
 
@@ -344,23 +466,30 @@ function renderHome() {
   const detail = document.getElementById("state-detail");
   if (stateName === "connected") {
     title.textContent = "已连接";
-    detail.textContent = `${status.profile || profile?.name || "配置"} · ${status.remote || ""}`;
+    detail.textContent = `${status.profile || profile?.name || "—"} · ${status.remote || ""}`;
   } else if (stateName === "connecting") {
     title.textContent = "正在连接…";
-    detail.textContent = status.remote ? `握手 ${status.remote}` : "解析地址并建立握手";
+    detail.textContent = status.remote
+      ? t("握手 {remote}", { remote: status.remote })
+      : t("解析地址并建立握手");
   } else if (stateName === "reconnecting") {
     title.textContent = "正在重连";
-    const retry = status.next_retry_in != null ? `，${status.next_retry_in} 秒后重试` : "";
-    detail.textContent = `${status.last_error || "连接已结束"}${retry}`;
+    const retry =
+      status.next_retry_in != null
+        ? t("，{seconds} 秒后重试", { seconds: status.next_retry_in })
+        : "";
+    detail.textContent = `${status.last_error || t("连接已结束")}${retry}`;
   } else if (stateName === "error") {
     title.textContent = "连接失败";
-    detail.textContent = status.last_error || "查看日志获取详情";
+    detail.textContent = status.last_error || t("查看日志获取详情");
   } else if (stateName === "disconnecting") {
     title.textContent = "正在断开…";
-    detail.textContent = "恢复路由与 DNS";
+    detail.textContent = t("恢复路由与 DNS");
   } else {
     title.textContent = "空闲";
-    detail.textContent = profile ? `已选择 ${profile.name}` : "选择配置后连接。";
+    detail.textContent = profile
+      ? t("已选择 {profile}", { profile: profile.name })
+      : t("选择配置后连接。");
   }
 
   const connected = stateName === "connected";
@@ -384,12 +513,18 @@ function renderHome() {
   const traffic = status.traffic || {};
   document.getElementById("rx-rate").textContent = formatRate(traffic.rx_bps);
   document.getElementById("tx-rate").textContent = formatRate(traffic.tx_bps);
-  document.getElementById("rx-total").textContent = `累计 ${formatBytes(traffic.rx_bytes)}`;
-  document.getElementById("tx-total").textContent = `累计 ${formatBytes(traffic.tx_bytes)}`;
+  document.getElementById("rx-total").textContent = t("累计 {value}", {
+    value: formatBytes(traffic.rx_bytes),
+  });
+  document.getElementById("tx-total").textContent = t("累计 {value}", {
+    value: formatBytes(traffic.tx_bytes),
+  });
   document.getElementById("rx-payload").textContent = formatBytes(traffic.rx_payload_bytes);
   document.getElementById("tx-payload").textContent = formatBytes(traffic.tx_payload_bytes);
 
   renderProfileOptions();
+  I18n.apply(document.querySelector(".topbar"));
+  I18n.apply(document.getElementById("page-home"));
   setDaemon(state.daemonOnline);
 }
 
@@ -420,7 +555,7 @@ async function pollStatus(report) {
       setDaemon(false);
       renderHome();
     }
-    if (report) toast(`守护进程不可达：${error}`, true);
+    if (report) toast(t("守护进程不可达：{error}", { error }), true);
     return false;
   }
 }
@@ -496,7 +631,13 @@ function drawChart() {
   if (state.samples.length < 2) {
     ctx.fillStyle = "rgba(139,151,171,.7)";
     ctx.font = "12px sans-serif";
-    ctx.fillText(state.status.state === "connected" ? "等待流量采样…" : "连接后显示实时速率", 12, 18);
+    ctx.fillText(
+      state.status.state === "connected"
+        ? t("等待流量采样…")
+        : t("连接后显示实时速率"),
+      12,
+      18
+    );
     return;
   }
 
@@ -529,7 +670,7 @@ function drawChart() {
 
   ctx.fillStyle = "rgba(139,151,171,.7)";
   ctx.font = "11px ui-monospace, monospace";
-  ctx.fillText(`峰值 ${formatRate(max)}`, 10, height - 5);
+  ctx.fillText(t("峰值 {value}", { value: formatRate(max) }), 10, height - 5);
 }
 
 function validateProfileForConnect(profile) {
@@ -564,7 +705,9 @@ function openPassword(profile) {
   }
   state.pendingProfile = profile;
   state.pendingHadSavedPassword = false;
-  document.getElementById("password-title").textContent = `连接 ${profile.name}`;
+  document.getElementById("password-title").textContent = t("连接 {name}", {
+    name: profile.name,
+  });
   const input = document.getElementById("password-input");
   const save = document.getElementById("password-save");
   input.value = "";
@@ -596,7 +739,7 @@ async function submitPassword(event) {
   }
   const submit = document.getElementById("password-submit");
   submit.disabled = true;
-  submit.textContent = "提交中…";
+  submit.textContent = t("提交中…");
   const shouldSave = document.getElementById("password-save").checked;
   try {
     await invoke("connect", { profile, password });
@@ -610,7 +753,10 @@ async function submitPassword(event) {
         await invoke("delete_password", { profileName: profile.name });
       }
     } catch (keyError) {
-      toast(`连接已提交，但钥匙串操作失败：${keyError}`, true);
+      toast(
+        t("连接已提交，但钥匙串操作失败：{error}", { error: keyError }),
+        true
+      );
     }
     document.getElementById("password-input").value = "";
     hide("password-modal");
@@ -628,11 +774,11 @@ async function submitPassword(event) {
     });
     toast("已提交连接请求");
   } catch (error) {
-    toast(`连接失败：${error}`, true);
+    toast(t("连接失败：{error}", { error }), true);
     document.getElementById("password-input").value = "";
   } finally {
     submit.disabled = false;
-    submit.textContent = "连接";
+    submit.textContent = t("连接");
   }
 }
 
@@ -643,7 +789,7 @@ async function disconnect() {
     await invoke("disconnect");
     toast("正在断开");
   } catch (error) {
-    toast(`断开失败：${error}`, true);
+    toast(t("断开失败：{error}", { error }), true);
   } finally {
     button.disabled = false;
   }
@@ -651,7 +797,9 @@ async function disconnect() {
 
 function openProfileModal(profile) {
   state.editingName = profile ? profile.name : null;
-  document.getElementById("profile-title").textContent = profile ? "编辑配置" : "添加配置";
+  document.getElementById("profile-title").textContent = t(
+    profile ? "编辑配置" : "添加配置"
+  );
   const spec = profile || {
     name: "",
     remote: "",
@@ -751,12 +899,18 @@ async function submitProfile(event) {
     renderHome();
     toast("配置已保存");
   } catch (error) {
-    toast(`保存失败：${error}`, true);
+    toast(t("保存失败：{error}", { error }), true);
   }
 }
 
 async function deleteProfile(profile) {
-  if (!window.confirm(`删除配置“${profile.name}”？此操作不会影响正在运行的隧道。`)) return;
+  if (
+    !window.confirm(
+      t("删除配置“{name}”？此操作不会影响正在运行的隧道。", { name: profile.name })
+    )
+  ) {
+    return;
+  }
   try {
     await invoke("delete_profile", { name: profile.name });
     if (state.selected === profile.name) {
@@ -766,7 +920,7 @@ async function deleteProfile(profile) {
     await loadProfiles();
     toast("配置已删除");
   } catch (error) {
-    toast(`删除失败：${error}`, true);
+    toast(t("删除失败：{error}", { error }), true);
   }
 }
 
@@ -778,7 +932,7 @@ async function refreshLogs() {
     (lines || []).forEach(appendLog);
     renderLogs();
   } catch (error) {
-    if (state.page === "logs") toast(`读取日志失败：${error}`, true);
+    if (state.page === "logs") toast(t("读取日志失败：{error}", { error }), true);
   }
 }
 
@@ -809,7 +963,9 @@ function renderLogs() {
         )}] ${escapeHtml(line.line)}</span>`
     )
     .join("\n");
-  document.getElementById("log-count").textContent = `${lines.length} 行`;
+  const count = document.getElementById("log-count");
+  count.textContent = t("{count} 行", { count: lines.length });
+  I18n.apply(count);
   if (atBottom) view.scrollTop = view.scrollHeight;
 }
 
@@ -862,6 +1018,7 @@ function toast(message, isError) {
   const element = document.getElementById("toast");
   element.textContent = message;
   element.className = `toast${isError ? " error" : ""}`;
+  I18n.apply(element);
   clearTimeout(toastTimer);
   toastTimer = setTimeout(() => element.classList.add("hidden"), 3200);
 }

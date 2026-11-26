@@ -121,3 +121,20 @@ libxdo-dev libssl-dev libdbus-1-dev`. The tray uses
 `libayatana-appindicator3`; the optional keychain integration uses the desktop
 Secret Service (GNOME Keyring or KWallet). See
 [`docs/client-ui.md`](../docs/client-ui.md).
+
+## Distribution packages (deb / rpm)
+
+Formal Linux packages for the desktop stack live in [`linux/`](linux/README.md).
+Build them with:
+
+```bash
+packaging/linux/build-packages.sh            # both formats, after cargo build
+packaging/linux/build-packages.sh deb        # deb only
+packaging/linux/build-packages.sh --skip-build
+```
+
+Artifacts are written to `dist/`. The packages create the `rustvpn` system
+user/group, install the daemon unit (with `ExecStart` pointing at
+`/usr/bin/rustvpn-clientd`) and leave GUI autostart and keychain setup to each
+desktop user. See [`linux/README.md`](linux/README.md) for prerequisites,
+install/enable steps and rpm distro notes.

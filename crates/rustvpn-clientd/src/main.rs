@@ -16,6 +16,7 @@ use rustvpn_client_ipc::{
     read_frame, write_frame, EngineStatus, Event, LogLine, ProfileSpec, Request, Response,
     PROTOCOL_VERSION, SOCKET_ENV,
 };
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{broadcast, mpsc, Semaphore};
 use tokio_util::sync::CancellationToken;
@@ -23,10 +24,15 @@ use zeroize::Zeroizing;
 
 const DAEMON_VERSION: &str = env!("CARGO_PKG_VERSION");
 const MAX_LOG_LINES: usize = 2000;
+const DEFAULT_HELLO_TIMEOUT_SECS: u64 = 5;
+const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 300;
+const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 
 struct Args {
     socket: PathBuf,
     socket_group: String,
+    hello_timeout: Duration,
+    idle_timeout: Duration,
     help: bool,
     version: bool,
 }
@@ -36,9 +42,13 @@ fn usage() -> ! {
         "Usage of rustvpn-clientd:\n\
          \x20 -socket path (default {})\n\
          \x20 -socket-group group (optional; socket becomes 0660)\n\
+         \x20 -hello-timeout seconds (default {DEFAULT_HELLO_TIMEOUT_SECS}; 0 disables)\n\
+         \x20 -idle-timeout seconds (default {DEFAULT_IDLE_TIMEOUT_SECS}; 0 disables)\n\
          \x20 -version\n\
          \x20 -help\n\
          \n\
+         The idle timeout closes connections that send no request; event\n\
+         subscriptions are kept open for as long as the daemon runs.\n\
          The socket can also be chosen with {SOCKET_ENV}.",
         default_socket().display()
     );
@@ -60,6 +70,8 @@ fn parse_args() -> Args {
     let mut args = Args {
         socket: default_socket(),
         socket_group: String::new(),
+        hello_timeout: Duration::from_secs(DEFAULT_HELLO_TIMEOUT_SECS),
+        idle_timeout: Duration::from_secs(DEFAULT_IDLE_TIMEOUT_SECS),
         help: false,
         version: false,
     };
@@ -83,6 +95,14 @@ fn parse_args() -> Args {
         match name.as_str() {
             "socket" => args.socket = PathBuf::from(take("socket")),
             "socket-group" => args.socket_group = take("socket-group"),
+            "hello-timeout" => {
+                let value = take("hello-timeout");
+                args.hello_timeout = Duration::from_secs(parse_secs(&value, "hello-timeout"));
+            }
+            "idle-timeout" => {
+                let value = take("idle-timeout");
+                args.idle_timeout = Duration::from_secs(parse_secs(&value, "idle-timeout"));
+            }
             "version" => args.version = true,
             "h" | "help" => args.help = true,
             "" => usage(),
@@ -96,6 +116,13 @@ fn parse_args() -> Args {
         usage();
     }
     args
+}
+
+fn parse_secs(value: &str, flag: &str) -> u64 {
+    value.parse::<u64>().unwrap_or_else(|_| {
+        eprintln!("invalid value for -{flag}: {value:?} (expected whole seconds)");
+        usage()
+    })
 }
 
 #[derive(Clone)]
@@ -127,13 +154,18 @@ async fn main() {
         }
     };
 
-    if let Err(error) = run(args.socket, gid).await {
+    if let Err(error) = run(args.socket, gid, args.hello_timeout, args.idle_timeout).await {
         eprintln!("{error:#}");
         process::exit(1);
     }
 }
 
-async fn run(socket_path: PathBuf, gid: Option<u32>) -> Result<()> {
+async fn run(
+    socket_path: PathBuf,
+    gid: Option<u32>,
+    hello_timeout: Duration,
+    idle_timeout: Duration,
+) -> Result<()> {
     if socket_path.as_os_str().len() >= 100 {
         bail!("socket path is too long: {}", socket_path.display());
     }
@@ -170,7 +202,7 @@ async fn run(socket_path: PathBuf, gid: Option<u32>) -> Result<()> {
 
     let accept_shared = shared.clone();
     let accept = tokio::spawn(async move {
-        accept_loop(listener, accept_shared, gid).await;
+        accept_loop(listener, accept_shared, gid, hello_timeout, idle_timeout).await;
     });
 
     tokio::select! {
@@ -225,7 +257,13 @@ fn spawn_collector(
     });
 }
 
-async fn accept_loop(listener: UnixListener, shared: Shared, gid: Option<u32>) {
+async fn accept_loop(
+    listener: UnixListener,
+    shared: Shared,
+    gid: Option<u32>,
+    hello_timeout: Duration,
+    idle_timeout: Duration,
+) {
     let limit = Arc::new(Semaphore::new(16));
     loop {
         let (stream, _) = match listener.accept().await {
@@ -247,20 +285,26 @@ async fn accept_loop(listener: UnixListener, shared: Shared, gid: Option<u32>) {
         let shared = shared.clone();
         tokio::spawn(async move {
             let _permit = permit;
-            if let Err(error) = handle_connection(stream, shared).await {
+            if let Err(error) = handle_connection(stream, shared, hello_timeout, idle_timeout).await
+            {
                 eprintln!("IPC client failed: {error:#}");
             }
         });
     }
 }
 
-async fn handle_connection(mut stream: UnixStream, shared: Shared) -> Result<()> {
-    let Some(hello) = read_frame::<_, Request>(&mut stream).await? else {
+async fn handle_connection(
+    mut stream: UnixStream,
+    shared: Shared,
+    hello_timeout: Duration,
+    idle_timeout: Duration,
+) -> Result<()> {
+    let Some(hello) = read_request(&mut stream, hello_timeout, "client hello").await? else {
         return Ok(());
     };
     match hello {
         Request::Hello { version } if version == PROTOCOL_VERSION => {
-            write_frame(
+            write_value(
                 &mut stream,
                 &Response::Hello {
                     version: PROTOCOL_VERSION,
@@ -270,7 +314,7 @@ async fn handle_connection(mut stream: UnixStream, shared: Shared) -> Result<()>
             .await?;
         }
         Request::Hello { version } => {
-            write_frame(
+            write_value(
                 &mut stream,
                 &Response::Error {
                     message: format!(
@@ -282,7 +326,7 @@ async fn handle_connection(mut stream: UnixStream, shared: Shared) -> Result<()>
             return Ok(());
         }
         _ => {
-            write_frame(
+            write_value(
                 &mut stream,
                 &Response::Error {
                     message: "hello required".into(),
@@ -294,7 +338,8 @@ async fn handle_connection(mut stream: UnixStream, shared: Shared) -> Result<()>
     }
 
     loop {
-        let Some(request) = read_frame::<_, Request>(&mut stream).await? else {
+        let Some(request) = read_request(&mut stream, idle_timeout, "idle IPC client").await?
+        else {
             return Ok(());
         };
         let response = match request {
@@ -347,13 +392,37 @@ async fn handle_connection(mut stream: UnixStream, shared: Shared) -> Result<()>
                 Response::Ok
             }
             Request::Subscribe => {
-                write_frame(&mut stream, &Response::Subscribed).await?;
+                write_value(&mut stream, &Response::Subscribed).await?;
                 let (read, write) = stream.into_split();
                 subscribe_loop(read, write, &shared).await?;
                 return Ok(());
             }
         };
-        write_frame(&mut stream, &response).await?;
+        write_value(&mut stream, &response).await?;
+    }
+}
+
+async fn read_request<R>(reader: &mut R, limit: Duration, what: &str) -> Result<Option<Request>>
+where
+    R: AsyncRead + Unpin,
+{
+    if limit.is_zero() {
+        return Ok(read_frame(reader).await?);
+    }
+    match tokio::time::timeout(limit, read_frame::<_, Request>(reader)).await {
+        Ok(result) => Ok(result?),
+        Err(_) => bail!("{what} timed out after {}s", limit.as_secs()),
+    }
+}
+
+async fn write_value<W, T>(writer: &mut W, value: &T) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+    T: serde::Serialize + ?Sized,
+{
+    match tokio::time::timeout(WRITE_TIMEOUT, write_frame(writer, value)).await {
+        Ok(result) => Ok(result?),
+        Err(_) => bail!("IPC write timed out after {}s", WRITE_TIMEOUT.as_secs()),
     }
 }
 
@@ -380,12 +449,12 @@ async fn subscribe_loop(
         tokio::select! {
             event = rx.recv() => match event {
                 Ok(event) => {
-                    if write_frame(&mut write, &event).await.is_err() {
+                    if write_value(&mut write, &event).await.is_err() {
                         return Ok(());
                     }
                 }
                 Err(broadcast::error::RecvError::Lagged(missed)) => {
-                    if write_frame(&mut write, &Event::Lagged { missed }).await.is_err() {
+                    if write_value(&mut write, &Event::Lagged { missed }).await.is_err() {
                         return Ok(());
                     }
                 }
@@ -550,6 +619,31 @@ mod tests {
         let gid = unsafe { libc::getegid() };
         assert!(supplementary_has_gid(std::process::id() as i32, gid));
         assert!(!supplementary_has_gid(std::process::id() as i32, u32::MAX));
+    }
+
+    #[test]
+    fn timeout_values_are_whole_seconds() {
+        assert_eq!(parse_secs("0", "idle-timeout"), 0);
+        assert_eq!(parse_secs("300", "idle-timeout"), 300);
+    }
+
+    #[tokio::test]
+    async fn silent_client_hits_idle_timeout() {
+        let (_client, mut server) = tokio::io::duplex(64);
+        let error = read_request(&mut server, Duration::from_millis(25), "idle IPC client")
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("timed out"), "{error:#}");
+    }
+
+    #[tokio::test]
+    async fn disabled_timeout_accepts_eof() {
+        let (client, mut server) = tokio::io::duplex(64);
+        drop(client);
+        assert!(read_request(&mut server, Duration::ZERO, "idle IPC client")
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[test]

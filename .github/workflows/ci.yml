@@ -24,7 +24,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev \
-            librsvg2-dev libxdo-dev libssl-dev libsoup-3.0-dev libdbus-1-dev
+            librsvg2-dev libxdo-dev libssl-dev libsoup-3.0-dev libdbus-1-dev \
+            webkit2gtk-driver xvfb dbus-x11 rpm
 
       - name: Format
         run: cargo fmt --all -- --check
@@ -32,7 +33,26 @@ jobs:
       - name: Check UI JavaScript
         run: |
           node --check crates/rustvpn-client-gui/ui/app.js
+          node --check crates/rustvpn-client-gui/ui/i18n.js
           node --check crates/rustvpn-client-gui/ui/tauri-bridge.js
+          node --check crates/rustvpn-client-gui/ui-tests/webdriver-smoke.js
+          node --test crates/rustvpn-client-gui/ui-tests/i18n.test.js
+
+      - name: Check optional updater feature
+        run: cargo check -p rustvpn-client-gui --features updater
+
+      - name: Check packaging scripts
+        run: |
+          bash -n packaging/linux/build-packages.sh
+          bin="$(mktemp -d)"
+          for name in rustvpn-client rustvpn-clientd rustvpn-client-ui; do
+            printf '#!/bin/sh\nexit 0\n' > "$bin/$name"
+            chmod +x "$bin/$name"
+          done
+          RUSTVPN_BIN_DIR="$bin" packaging/linux/build-packages.sh --skip-build all
+          dpkg-deb --info dist/rustvpn-client_*.deb
+          dpkg-deb --contents dist/rustvpn-client_*.deb
+          rpm -qpl dist/rustvpn-client-*.rpm
 
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
@@ -42,6 +62,22 @@ jobs:
 
       - name: Release build
         run: cargo build --release --workspace
+
+      - name: UI smoke test (WebDriver + Xvfb)
+        run: |
+          cargo install tauri-driver --locked
+          xvfb-run -a -s "-screen 0 1280x900x24" dbus-run-session -- bash -c '
+            export GDK_BACKEND=x11 WEBKIT_DISABLE_COMPOSITING_MODE=1
+            tauri-driver --port 4444 >/tmp/tauri-driver.log 2>&1 &
+            driver=$!
+            trap "kill $driver 2>/dev/null" EXIT
+            for i in $(seq 1 100); do
+              if curl -sf http://127.0.0.1:4444/status >/dev/null; then break; fi
+              sleep 0.2
+            done
+            node crates/rustvpn-client-gui/ui-tests/webdriver-smoke.js \
+              target/release/rustvpn-client-ui
+          '
 
       - name: Admin daemon build
         run: cargo build --release -p rustvpn-admin --bins

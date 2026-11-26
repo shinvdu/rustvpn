@@ -133,7 +133,7 @@
           </div>
           <span class="muted" id="log-count">0 行</span>
         </div>
-        <pre class="log-view" id="log-lines"></pre>
+        <pre class="log-view" id="log-lines" data-i18n-skip></pre>
       </section>
 
       <section class="page" id="page-settings">
@@ -150,6 +150,18 @@
           <h2>启动与托盘</h2>
           <label class="check"><input type="checkbox" id="autostart-toggle"> 登录时启动 RustVPN</label>
           <p class="muted small">关闭窗口会隐藏到托盘；可从托盘菜单重新打开或退出。</p>
+        </div>
+        <div class="card settings-card">
+          <h2>界面语言</h2>
+          <label for="lang-select" class="sr-only">界面语言</label>
+          <select id="lang-select"></select>
+          <p class="muted small">语言会立即应用到界面与托盘菜单。</p>
+        </div>
+        <div class="card settings-card">
+          <h2>软件更新</h2>
+          <p class="muted small" id="update-status">当前版本</p>
+          <button class="secondary" id="check-update">检查更新</button>
+          <button class="primary hidden" id="install-update">下载并安装</button>
         </div>
         <div class="card settings-card">
           <h2>安全边界</h2>
@@ -225,6 +237,7 @@
 
   <div class="toast hidden" id="toast"></div>
   <script src="tauri-bridge.js"></script>
+  <script src="i18n.js"></script>
   <script src="app.js"></script>
 </body>
 </html>

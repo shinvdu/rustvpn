@@ -283,6 +283,18 @@ button:disabled { opacity: .45; cursor: not-allowed; }
 }
 .toast.error { border-color: rgba(255, 107, 129, .5); color: #ffb3be; }
 
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
 @media (max-width: 940px) {
   .sidebar { width: 180px; flex-basis: 180px; }
   .stats-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }

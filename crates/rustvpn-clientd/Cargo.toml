@@ -17,3 +17,4 @@ tokio-util = { workspace = true }
 anyhow = { workspace = true }
 zeroize = { workspace = true }
 libc = { workspace = true }
+serde = { workspace = true }
