@@ -7,8 +7,11 @@
 > **三语维护版：** [`docs/en/design.md`](en/design.md) ·
 > [`docs/zh/design.md`](zh/design.md) · [`docs/ru/design.md`](ru/design.md)。
 > 本文作为历史设计记录保留。
+> **2026-11-26 增补：** 服务端管理 Web UI 已作为独立进程实现
+> （`rustvpn-admind` + 本地控制 socket），架构摘要见 §15；管理面细节以
+> [`admin-web-ui.md`](admin-web-ui.md) 与三语维护版为准。
 > 目标版本：GoVPN 5.7（GPLv3+）
-> 文档状态：Draft v0.1（2026-11-25）
+> 文档状态：Draft v0.1（2026-11-25）；2026-11-26 增补管理面（§15）
 > 适用范围：Linux 数据面重写；FreeBSD 作为第二阶段
 > 评审重点：协议兼容边界、encless 性能方案、数据面架构、"待确认决策"
 
@@ -288,7 +291,11 @@ CPU profile 变化：`SliceZero` 从 11.5% 降到 ~1.4%（只剩少量 `memclr`�
 
 - 不引入协议 v2 / 新握手（可在 M6 之后独立提案）。
 - 不做 Windows/macOS；FreeBSD 放到 M5。
-- 不做 GUI、不做多路复用/负载均衡控制面、不做 IPv6 之外的地址族扩展。
+- 首版不做**跨平台客户端** GUI；Linux MVP 已作为独立程序实现
+  （[`client-ui.md`](client-ui.md)），跨平台方案见
+  [`client-ui-plan.md`](client-ui-plan.md)。服务端管理 Web UI 已作为可选独立
+  进程实现，见 §15。
+- 不做多路复用/负载均衡控制面、不做 IPv6 之外的地址族扩展。
 - 不改变密码学算法（Salsa20/Poly1305/XTEA/Ed25519/X25519/BLAKE2b/Argon2d），否则失去互通。
 
 ---
@@ -464,6 +471,10 @@ govpn/                          # cargo workspace
 └── crates/govpn-oracle/        # 测试辅助：调用 Go 版生成/校验向量（dev-dependency）
 ```
 
+> 上述为原始提案。实际 workspace 使用 `rustvpn-*` 命名，并新增
+> `rustvpn-control`（管理端↔服务端控制协议）与 `rustvpn-admin`
+> （`rustvpn-admind`、`rustvpn-admin-passwd`）。数据面 crate 不依赖管理端。
+
 | 功能 | 候选 crate | 备注 |
 |---|---|---|
 | 异步/控制面 | `tokio` | TCP 会话、配置、stats |
@@ -623,6 +634,117 @@ govpn/                          # cargo workspace
 5. **性能目标**：§11.1 是否作为硬门禁；批处理延迟预算 200 µs 是否可接受。
 6. **运行时**：数据面自研 epoll/uring 循环 vs `monoio`/`compio`（推荐前者，控制审计面）。
 7. **分发**：静态 musl 单文件 + vendor 源码包，是否满足发布流程。
+
+---
+
+## 15. 管理端 Web UI（2026-11-26 增补）
+
+> 本节记录已实现的管理面架构。完整调研、取舍与实现状态见
+> [`admin-web-ui-plan.md`](admin-web-ui-plan.md)，使用与部署见
+> [`admin-web-ui.md`](admin-web-ui.md)。原始数据面设计（§1–§14）保持历史原貌。
+
+### 15.1 进程拆分
+
+管理 UI 不是内嵌服务，而是与数据面**独立进程**，只共享库：
+
+```text
+Browser ──TLS──▶ Caddy/Nginx ──▶ rustvpn-admind
+                                  ├─ HTTP API + 内嵌静态 UI（原生 JS + Canvas）
+                                  ├─ Argon2id 登录 / Cookie / CSRF / admin|viewer
+                                  ├─ SQLite 历史、审计、配置备份
+                                  └─ 配置校验与原子写入
+                                           │
+                                           │ /run/rustvpn/control.sock
+                                           │ 4B BE 长度 + JSON，协议 v1
+                                  rustvpn-server
+                                  ├─ UDP/TCP/TAP 数据面
+                                  └─ status/sessions/kick/reload/
+                                     recent_sessions/validate_config/subscribe
+```
+
+- `rustvpn-server` 不链接 axum、SQLite、静态资源，不因管理端故障退出；
+  未启用 `-control` 时行为与旧版一致。
+- `rustvpn-admind` 以独立用户运行，**不需要 `CAP_NET_ADMIN`**；只通过控制
+  命令踢线/立即重载，通过文件系统读写配置。
+- 共享库：`rustvpn-crypto`、`rustvpn-proto`、`rustvpn-net`，新增
+  `rustvpn-control`（协议 DTO + 帧编解码）与 `rustvpn-admin`（管理端库与两个
+  二进制）。
+
+### 15.2 控制协议
+
+- 仅 Unix domain socket，不监听 TCP；`-control PATH` 启用，默认关闭。
+- 帧为 4 字节大端长度 + JSON，单帧上限 4 MiB；`hello` 校验协议版本，
+  不兼容直接拒绝，不做静默降级。
+- 请求：`hello`、`status`、`sessions`、`kick`、`reload`、`recent_sessions`、
+  `validate_config`、`subscribe`。
+- 事件：`session_started`、`session_ended`（含最终计数与结束原因）、
+  `config_reloaded`、`lagged`、`server_shutdown`；server 保留最近 1024 条
+  结束事件供管理端重连对账。
+- 认证：`SO_PEERCRED` 只允许 root 或 socket 属组（`-control-group`，未设置
+  时仅 server 用户）；socket 模式 `0660`/`0600`；并发控制连接上限 8。
+- **不提供** `write_config`/`shutdown`：配置由管理端校验后写文件，启停交给
+  systemd。
+
+### 15.3 权限边界
+
+| 进程 | 用户/组 | 能力 |
+|---|---|---|
+| `rustvpn-server` | `rustvpn`，组 `rustvpn-adm` | `CAP_NET_ADMIN`/`CAP_NET_RAW`；可执行脚本 |
+| `rustvpn-admind` | `rustvpn-admin`，主组 `rustvpn-adm` | **无 capability**；可写配置目录与 SQLite |
+| 控制 socket | `rustvpn:rustvpn-adm` `0660` | 只允许管理组连接 |
+| 配置目录 | `root:rustvpn-adm` `2770` | server 读；admind 原子 rename 写 |
+| 脚本目录 | `root:root` `0755` | 管理组不可写 |
+
+启用 `-control` 时 server **必须**至少有一个 `-script-dir`，否则拒绝启动。
+up/down 脚本必须在白名单内、文件存在，且从白名单根到脚本父目录的每一级
+都属 root/server 所有、组和其他不可写；server 在加载配置和每次执行脚本前
+都重新校验。管理端只能填写脚本路径，不能编辑/上传脚本内容。
+
+### 15.4 配置写入
+
+1. 渲染 YAML 并用同一套 `ConfigSet` 校验；
+2. 调用 server `validate_config` 做脚本/路径预检；
+3. 备份 → 同目录临时文件 → fsync → `rename`；
+4. 调用 `reload`，server 立即重载。
+
+写入使用 ETag 乐观锁。server 离线时预检失败，管理端拒绝写盘，只保留配置、
+备份、历史与审计的只读查看——避免留下 server 下次启动会拒绝的半套配置。
+
+### 15.5 会话统计口径
+
+- 管理端每 10 秒拉取活动会话计算速率；`session_started`/`session_ended`
+  事件负责会话边界。
+- `session_started` 携带的计数作为首采样基线，立即触发的首个 tick 被跳过；
+  未知会话按 0 基线处理，避免把会话前流量算进第一段。
+- server 在 `end_session()` 抓取最终计数并通过 `session_ended` 发出，
+  管理端以此收尾，避免丢失最后一次采样。
+- server 每次启动生成随机 52 位 `server_instance` 作为会话号基数，避免重启
+  后 SQLite 主键撞号，同时不超过 JavaScript Number 的安全整数范围。
+- 管理端重启时先拉 `sessions` + `recent_sessions` 对账，只把 server 已不
+  认识的开放记录标记为 `server_restart`。
+
+### 15.6 管理端与客户端 UI
+
+- 管理端认证为 Argon2id 口令、HttpOnly + SameSite=Strict 会话 Cookie、
+  写操作 CSRF、登录限速；角色 `admin`/`viewer`。
+- 页面覆盖总览、客户端列表/详情、1h/24h/7d/30d 流量图、会话历史、配置
+  预览/应用/备份/恢复、审计、SSE 实时刷新、Prometheus `/metrics` 与健康检查。
+- 默认只监听 `127.0.0.1:8080`，经 SSH 隧道或 TLS 反代访问；控制 socket
+  不出本机。
+- **客户端 GUI 的 Linux MVP 已实现**（[`client-ui.md`](client-ui.md)）：
+  Tauri 2 静态 UI + 无特权 GUI + `rustvpn-clientd` 最小权限守护进程 +
+  共享 `rustvpn-client-core`。Windows/macOS/移动端尚未实现，跨平台的主要
+  工作量是 L3 平台上的用户态以太网垫片，而不是 UI 框架
+  （[`client-ui-plan.md`](client-ui-plan.md)）。CLI 与 GUI 保持独立程序、
+  只共享库。
+
+### 15.7 已知限制
+
+- 控制面仅本地 Unix socket，不支持跨机管理 server；单 admind 实例，
+  无进程锁，双实例会重复采样。
+- admind 停机超过 1024 条结束事件窗口会丢失该段历史。
+- 配额只展示，不自动禁用/限速；TOTP 未实现。
+- 未启用 TLS 反代时不应把管理端口暴露到公网。
 
 ---
 

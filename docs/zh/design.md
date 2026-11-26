@@ -11,7 +11,7 @@
 3. **可预测的数据路径。** 稳态下无逐包堆分配、有界队列、显式缓冲区所有权以及批量 I/O。
 4. **运维对等。** 与 Go 守护进程相同的部署模型、权限和诊断能力。
 
-本版本的非目标：协议 v2、Windows/macOS、GUI、路由/NAT 管理、负载均衡控制面，或改动任何密码学算法（那会破坏互操作性）。
+本版本的非目标：协议 v2、Windows/macOS 客户端、跨平台客户端 GUI（Linux MVP 已实现，见 [`client-ui.md`](../client-ui.md)；跨平台方案见 [`client-ui-plan.md`](../client-ui-plan.md)）、路由/NAT 管理、负载均衡控制面，或改动任何密码学算法（那会破坏互操作性）。服务端管理 Web UI 已作为独立进程实现，见下文「管理面」。
 
 ## 工作区布局
 
@@ -21,6 +21,8 @@
 ├── crates/rustvpn-proto/    # packet layout, codec, handshake state machines
 ├── crates/rustvpn-net/      # TAP, config, scripts, stats, peer lifecycle,
 │                            # UDP batching, io_uring TAP
+├── crates/rustvpn-control/  # admin↔server control protocol (Unix socket, JSON)
+├── crates/rustvpn-admin/    # rustvpn-admind + rustvpn-admin-passwd (HTTP UI, SQLite)
 ├── crates/rustvpn-client/   # client binary
 ├── crates/rustvpn-server/   # server binary
 ├── crates/rustvpn-verifier/ # verifier binary
@@ -28,7 +30,7 @@
 └── docs/                    # this manual (en/zh/ru) + upstream design notes
 ```
 
-`rustvpn-crypto` 和 `rustvpn-proto` 是不含异步与 I/O 的纯逻辑，因此可以独立进行单元测试与模糊测试。`rustvpn-net` 拥有面向操作系统的部分。可执行文件则是轻量的组合层。
+`rustvpn-crypto` 和 `rustvpn-proto` 是不含异步与 I/O 的纯逻辑，因此可以独立进行单元测试与模糊测试。`rustvpn-net` 拥有面向操作系统的部分。可执行文件则是轻量的组合层。`rustvpn-control` 只包含两侧共享的 DTO 与帧编解码；数据面 crate 不依赖管理端依赖（axum、SQLite、静态资源）。
 
 ## 控制面
 
@@ -40,6 +42,71 @@
 - 配置存放在 `RwLock<ConfigSet>` 中，每 60 秒刷新一次；解析失败则保留上一份配置。
 
 每个 UDP peer 有一个解码任务，由 mpsc 通道喂入；TCP 则为每个连接设一个读取任务。这比原提案中的"每核一个 worker"刻意更简单：它保持了正确性和有界队列，而昂贵部分（批量、SIMD、缓冲区复用）在各任务内部处理。
+
+## 管理面（管理端 Web UI）
+
+服务端管理 UI 是**另一个独立程序**，与数据面只共享库；`rustvpn-server` 不链接 axum、SQLite 或静态资源，也不因管理端故障而退出。
+
+```text
+Browser ──TLS──▶ Caddy/Nginx ──▶ rustvpn-admind
+                                  ├─ HTTP API + 内嵌静态 UI（原生 JS + Canvas）
+                                  ├─ Argon2id 登录 / 会话 Cookie / CSRF / admin|viewer
+                                  ├─ SQLite 历史、审计、配置备份
+                                  └─ 配置校验与原子写入
+                                           │
+                                           │ /run/rustvpn/control.sock
+                                           │ 4B BE 长度 + JSON，协议 v1
+                                  rustvpn-server
+                                  ├─ UDP/TCP/TAP 数据面
+                                  └─ status/sessions/kick/reload/
+                                     recent_sessions/validate_config/subscribe
+```
+
+### 控制协议
+
+- 仅 Unix domain socket，不监听 TCP；`-control PATH` 启用，默认关闭。
+- 帧为 4 字节大端长度 + JSON，单帧上限 4 MiB；`hello` 校验协议版本，不兼容直接拒绝，不做静默降级。
+- 请求：`hello`、`status`、`sessions`、`kick`、`reload`、`recent_sessions`、`validate_config`、`subscribe`。
+- 事件：`session_started`、`session_ended`（含最终计数与结束原因）、`config_reloaded`、`lagged`、`server_shutdown`；server 保留最近 1024 条结束事件供管理端重连对账。
+- 认证：`SO_PEERCRED` 只允许 root 或 socket 属组（`-control-group`，未设置时仅 server 用户）；socket 模式 `0660`/`0600`；并发控制连接上限 8。
+- **不提供** `write_config`/`shutdown`：配置由管理端校验后写文件，启停交给 systemd。
+
+### 权限边界
+
+| 进程 | 用户/组 | 能力 |
+|---|---|---|
+| `rustvpn-server` | `rustvpn`，组 `rustvpn-adm` | `CAP_NET_ADMIN`/`CAP_NET_RAW`；可执行脚本 |
+| `rustvpn-admind` | `rustvpn-admin`，主组 `rustvpn-adm` | **无 capability**；可写配置目录与 SQLite |
+| 控制 socket | `rustvpn:rustvpn-adm` `0660` | 只允许管理组连接 |
+| 配置目录 | `root:rustvpn-adm` `2770` | server 读；admind 原子 rename 写 |
+| 脚本目录 | `root:root` `0755` | 管理组不可写 |
+
+启用 `-control` 时 server **必须**至少有一个 `-script-dir`，否则拒绝启动。up/down 脚本必须在白名单内、文件存在，且从白名单根到脚本父目录的每一级都属 root/server 所有、组和其他不可写；server 在加载配置和每次执行脚本前都重新校验。管理端只能填写脚本路径，不能编辑或上传脚本内容。
+
+### 配置写入
+
+1. 渲染 YAML 并用同一套 `ConfigSet` 校验；
+2. 调用 server `validate_config` 做脚本/路径预检；
+3. 备份 → 同目录临时文件 → fsync → `rename`；
+4. 调用 `reload`，server 立即重载。
+
+写入使用 ETag 乐观锁。server 离线时预检失败，管理端拒绝写盘，只保留配置、备份、历史与审计的只读查看——避免留下 server 下次启动会拒绝的半套配置。
+
+### 会话统计口径
+
+- 管理端每 10 秒拉取活动会话计算速率；`session_started`/`session_ended` 事件负责会话边界。
+- `session_started` 携带的计数作为首采样基线，立即触发的首个 tick 被跳过；未知会话按 0 基线处理，避免把会话前流量算进第一段。
+- server 在 `end_session()` 抓取最终计数并通过 `session_ended` 发出，管理端以此收尾，避免丢失最后一次采样。
+- server 每次启动生成随机 52 位 `server_instance` 作为会话号基数，避免重启后 SQLite 主键撞号，同时不超过 JavaScript Number 的安全整数范围。
+- 管理端重启时先拉 `sessions` + `recent_sessions` 对账，只把 server 已不认识的开放记录标记为 `server_restart`。
+
+### 管理端与客户端 UI
+
+- 认证：Argon2id 口令、HttpOnly + SameSite=Strict 会话 Cookie、写操作 CSRF、登录限速；角色 `admin`/`viewer`。
+- 页面：总览、客户端列表/详情、1h/24h/7d/30d 流量图、会话历史、配置预览/应用/备份/恢复、审计、SSE 实时刷新、Prometheus `/metrics` 与健康检查。
+- 默认只监听 `127.0.0.1:8080`，经 SSH 隧道或 TLS 反代访问；控制 socket 不出本机。
+- 存储：`/var/lib/rustvpn/admin.db`（SQLite WAL）保存账号、历史与审计；配置仍以 `peers.yaml` 为唯一真源。
+- **客户端 GUI 的 Linux MVP 已实现**（[`client-ui.md`](../client-ui.md)）：Tauri 2 静态 UI + 无特权 GUI + `rustvpn-clientd` 最小权限守护进程 + 共享 `rustvpn-client-core`；CLI 与 GUI 仍是独立程序、只共享库。Windows/macOS 与移动端尚未实现，跨平台的主要工作量是 L3 平台上的用户态以太网垫片，而不是 UI 框架（[`client-ui-plan.md`](../client-ui-plan.md)）。
 
 ## 数据路径
 
@@ -106,6 +173,7 @@ Poly1305 固定软件后端是经过测量的选择：在 Zen3 上，该 crate �
 
 - **差分向量。** `testdata/go_vectors.json` 包含来自 Go 实现的字节精确输出，覆盖每个原语、传输模式、握手消息与验证器形式。测试对两个方向都进行比较。
 - **单元/等价测试。** AVX2 对标量密钥流、CnW/AONT 往返、重放窗口性质、`encode_into` 与便捷 API 的等价性、回环 `sendmmsg`/`recvmmsg`，以及通过 io_uring 循环的 socketpair 往返。
+- **管理面。** 控制协议编解码与版本协商、socket 权限与 `SO_PEERCRED`、脚本白名单及执行前复验、配置预检、采样基线与孤儿对账；管理端用假控制 socket 做单测，端到端用 netns + TAP 验证踢线、最终计数与重连对账。
 - **互操作性矩阵。** `{Go,Rust} × {client,server} × {UDP,TCP,proxy} × {plain,noise,encless}`，配合 TAP 与 network namespace，包括经隧道的 ICMP。该矩阵记录在根 README 中。
 - **模糊测试**（尚未接入 CI）是下一步的自然方向，覆盖包解析、握手状态、TCP 分帧、YAML/验证器解析以及 AONT/CnW 解码；纯逻辑 crate 使这变得直接明了。
 
@@ -115,5 +183,8 @@ Poly1305 固定软件后端是经过测量的选择：在 Zen3 上，该 crate �
 - 没有自动的有效 MTU 配置。
 - FreeBSD/macOS 构建未测试。
 - encless 路径仍会分配；一个基于缓冲池的 AONT/CnW 编码器是可行的。
+- 管理端只支持单实例（无进程锁，双实例会重复采样）；控制面仅本地 Unix socket，不支持跨机管理。
+- 管理端未实现 TOTP、配额自动限速/禁用；server 离线时不能写配置。
+- 客户端 GUI 仅有 Linux MVP；托盘、keychain、自动更新、IPv6 与跨平台尚未实现（[`client-ui-plan.md`](../client-ui-plan.md)）。
 
 下一步：[性能](performance.md)。

@@ -5,6 +5,20 @@
 > 目标：为**客户端**增加跨平台图形界面，支持连接管理、配置、状态与流量展示
 > 方式：只读分析现有代码 + 方案调研；本文不修改代码
 > 依赖版本：2026-11-26 通过 crates.io / GitHub 查询（tauri 2.12.7、wry 0.58.1、tray-icon 0.27.0、slint 1.19.1、eframe/egui 0.37.0、iced 0.14.0、dioxus 0.7.10、freya 0.5.4、floem 0.2.0、tun 0.8.15）
+>
+> **实现状态（2026-11-26，Linux MVP，分支 `feature/client-ui`）**：
+> `rustvpn-client-core`（Profile/Engine/会话/Linux 路由）、`rustvpn-client-ipc`
+> （UDS JSON + SO_PEERCRED）、`rustvpn-clientd`、Tauri 2 `rustvpn-client-ui`
+> 已落地；CLI 改为复用 core 的会话代码，行为与参数不变。使用说明见
+> [`client-ui.md`](client-ui.md)。本阶段偏差：仅 Linux；未做 Windows/macOS、
+> 以太网垫片、托盘、keychain、自动更新；GUI 为无构建静态页面并启用
+> `withGlobalTauri`。已补齐首轮 review 的 P1：首次握手成功后才安装路由/DNS、
+> 远程地址只解析一次、全隧道 IPv6 blackhole、全隧道 DNS 必填且 `resolvectl`
+> 失败即拒绝连接、daemon/CLI `flock` 隧道锁、GUI 默认接口改为 `rsvpn-gui`
+> 并强化 profile 校验、修复重命名 profile 误删文件。已用本机 netns + 本地
+> server 验证失败握手不断网、成功后的 default/防环/IPv6 路由、断开恢复、
+> 双向流量与最终统计；GUI 连接/断开/错误状态与事件订阅正常；锁冲突与单测
+> 通过。
 
 ---
 
@@ -374,7 +388,7 @@ pub enum Command {
 
 ### 4.4 本地 IPC
 
-- Linux/macOS：Unix domain socket，`/run/rustvpn/control.sock`（`RuntimeDirectory=rustvpn`，模式 0660，组 `rustvpn`）。
+- Linux/macOS：Unix domain socket，`/run/rustvpn-client/client.sock`（`RuntimeDirectory=rustvpn-client`，模式 0660，组 `rustvpn`）。
 - Windows：命名管道 `\\.\pipe\rustvpn-control`，DACL 只允许 `Administrators` + 交互用户/特定组；服务端用 `GetNamedPipeClientProcessId` 校验客户端身份（可选签名校验）。
 - 帧格式：4 字节大端长度 + UTF-8 JSON（单条 ≤ 1 MiB），JSON-RPC 2.0 子集。
 - 认证：Unix 用 `SO_PEERCRED`（Linux）/`LOCAL_PEERCRED`（macOS）检查 uid/gid；Windows 用管道 ACL + 客户端 PID。**不要监听 TCP**。
@@ -521,7 +535,7 @@ cargo build --release -p rustvpn-client-gui    # GUI；运行时才需要 daemon
 同一台机器同时只有一个活动隧道（OS 路由是全局的）。在两个程序都装好的情况下：
 
 1. 连接前先获取**全局锁**（在打开适配器、安装路由之前）：
-   - Linux/macOS：`flock(LOCK_EX|LOCK_NB)`，路径 `/run/rustvpn/tunnel.lock`（安装器创建目录，`0770`，组 `rustvpn`；root 的 CLI 可直接写）。
+   - Linux/macOS：`flock(LOCK_EX|LOCK_NB)`，路径 `/run/rustvpn-client/tunnel.lock`（安装器创建目录，`0770`，组 `rustvpn`；root 的 CLI 可直接写）。
    - Windows：命名互斥量 `Global\RustVPNTunnel`（SYSTEM 服务与管理员 CLI 均可创建）。
 2. 锁文件写入元数据（JSON）：
 
@@ -572,10 +586,10 @@ Wants=network-online.target
 [Service]
 User=rustvpn
 Group=rustvpn
-RuntimeDirectory=rustvpn
+RuntimeDirectory=rustvpn-client
 RuntimeDirectoryMode=0750
 StateDirectory=rustvpn
-ExecStart=/usr/libexec/rustvpnd --socket /run/rustvpn/control.sock
+ExecStart=/usr/libexec/rustvpnd --socket /run/rustvpn-client/client.sock
 AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW
 NoNewPrivileges=yes
