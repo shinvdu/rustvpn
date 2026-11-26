@@ -73,6 +73,9 @@ VERSION="$(awk '
     }
 ' "$REPO_ROOT/Cargo.toml")"
 [ -n "$VERSION" ] || die "could not read version from [workspace.package] in Cargo.toml"
+# Debian/RPM compare a tilde before anything else, so 0.2.0~beta.1 sorts below
+# 0.2.0; the raw Cargo version keeps the semver hyphen for the build.
+PKG_VERSION="${VERSION/-/\~}"
 
 if [ "$skip_build" -eq 0 ]; then
     log "building release binaries"
@@ -164,7 +167,7 @@ build_deb() {
 
     cat > "$root/DEBIAN/control" <<EOF
 Package: $PKG_NAME
-Version: $VERSION
+Version: $PKG_VERSION
 Section: net
 Priority: optional
 Architecture: $arch
@@ -246,7 +249,7 @@ EOF
     chmod 0644 "$root/DEBIAN/md5sums"
 
     mkdir -p "$DIST_DIR"
-    out="$DIST_DIR/${PKG_NAME}_${VERSION}_${arch}.deb"
+    out="$DIST_DIR/${PKG_NAME}_${PKG_VERSION}_${arch}.deb"
     if dpkg-deb --help 2>&1 | grep -q -- '--root-owner-group'; then
         dpkg-deb --root-owner-group --build "$root" "$out"
     else
@@ -266,7 +269,7 @@ build_rpm() {
         "$topdir"/SOURCES "$topdir"/SPECS "$topdir"/SRPMS
 
     rendered="$topdir/SPECS/${PKG_NAME}.spec"
-    sed -e "s|@VERSION@|${VERSION}|g" \
+    sed -e "s|@VERSION@|${PKG_VERSION}|g" \
         -e "s|@RELEASE@|${RPM_RELEASE}|g" \
         -e "s|@RPM_ARCH@|${arch}|g" \
         "$SCRIPT_DIR/${PKG_NAME}.spec.in" > "$rendered"
