@@ -3,7 +3,7 @@
 > 最后更新：2026-11-27
 > 分支：`feature/client-ui`
 > 状态：M1（核心接入）、M2（服务 + 本地 IPC）、M3（网络配置）已完成并提交；
-> M4（GUI 平台适配）已实现并在 Windows RDP 实机通过单元与交互验证，**尚未提交**；
+> M4（GUI 平台适配）已实现、提交，并在 Windows RDP 实机通过单元与交互验证；
 > M3 的真实路由/DNS/NRPT 冒烟与真实服务端 E2E 留待 M6
 > 相关文档：
 > - [Windows 客户端调研与方案](windows-client-research.md)
@@ -15,7 +15,7 @@
 
 ## 0. 一句话状态
 
-Windows 端已经完成 **开发环境 + Wintun/以太网垫片原型**，并完成了 **M1 核心接入**（`9bc1466`）、**M2 服务 + 本地 IPC**（`8cef993`）、**M3 网络配置**（`cac143a`，测试修正 `2fdd705`）和 **M4 GUI 平台适配**（未提交）：Windows 路径/ACL、Credential Manager、HKCU 自启动、Windows 语言、管道信息、发送口令前的服务端镜像/签名校验，以及 Windows 状态与错误提示。
+Windows 端已经完成 **开发环境 + Wintun/以太网垫片原型**，并完成了 **M1 核心接入**（`9bc1466`）、**M2 服务 + 本地 IPC**（`8cef993`）、**M3 网络配置**（`cac143a`，测试修正 `2fdd705`）和 **M4 GUI 平台适配**（`7b73a82`）：Windows 路径/ACL、Credential Manager、HKCU 自启动、Windows 语言、管道信息、发送口令前的服务端镜像/签名校验，以及 Windows 状态与错误提示。
 > 说明：M3 的 Linux 测试、Windows 目标测试（72 + 99）与 clippy 通过；M4 的 Linux 测试、Windows 目标 check/clippy、Windows 实机单元测试（31 passed + 2 ignored）通过，并在 Windows RDP 桌面会话验证了 GUI 启动、中文 locale、命名管道在线、Credential Manager roundtrip、HKCU 自启动开关、单实例、托盘图标与关闭到托盘。真实 Windows 路由/DNS/NRPT 冒烟、休眠/切网与崩溃验收留待 M6；真实服务端连接受 Wintun DLL（M5 安装）缺失阻塞。MSI/服务注册（M5）仍未开始。
 
 ---
@@ -25,13 +25,13 @@ Windows 端已经完成 **开发环境 + Wintun/以太网垫片原型**，并完
 | 项 | 状态 |
 |---|---|
 | 代码分支 | `feature/client-ui` |
-| 最近提交 | `1191ee2 docs(windows): record M3 verification` |
-| M4 代码 | **已实现，未提交**（GUI 平台适配） |
+| 最近提交 | `7b73a82 feat(windows): adapt GUI paths, keyring, autostart and identity checks`（M4） |
+| M4 代码 | 已提交（GUI 平台适配） |
 | M3 代码 | `cac143a feat(windows): add network guard and crash recovery` |
 | M2 代码 | `8cef993 feat(windows): add service, named-pipe IPC and tunnel lock` |
 | M1 代码 | `9bc1466 feat(windows): integrate Wintun shim into client core` |
 | 远端 | 领先 `origin/feature/client-ui`，**未推送** |
-| 主仓库剩余改动 | M4 未提交；M3 真实路由/DNS/NRPT 与真实服务端 E2E 留待 M6 |
+| 主仓库剩余改动 | M4 已提交；M3 真实路由/DNS/NRPT 与真实服务端 E2E 留待 M6 |
 | Windows 原型位置 | `prototypes/windows-shim/`，独立 crate，不加入 workspace |
 | Windows CI | `.github/workflows/windows-shim.yml`，只测原型 |
 | 原型状态 | Phase 0 参考实现，不是生产代码 |
@@ -208,7 +208,7 @@ Windows 端已经完成 **开发环境 + Wintun/以太网垫片原型**，并完
   （`#[ignore]`）供后续在 Windows 上校验 PowerShell 脚本/JSON 契约且不改网络状态。
   未触碰宿主机 VPN/NAT/防火墙，未重启。
 
-### 2.9 M4 GUI 平台适配（已实现，未提交）
+### 2.9 M4 GUI 平台适配（已提交 `7b73a82`）
 
 - **Profiles / ACL**：Windows 使用 `%LOCALAPPDATA%\RustVPN\profiles`
   （`LOCALAPPDATA` 缺失时回退 `%USERPROFILE%\AppData\Local`）；目录和文件用
@@ -323,7 +323,7 @@ Windows 端已经完成 **开发环境 + Wintun/以太网垫片原型**，并完
 | kill-switch | ⛔ Windows 明确拒绝（未做到 fail-closed 可恢复） |
 | MSS clamp | ⚠️ 推迟；告警且 `mss_applied=false` |
 
-### 3.4 GUI 平台适配（M4 已实现）
+### 3.4 GUI 平台适配（M4 已实现并提交）
 
 | 项 | 状态 |
 |---|---|
@@ -431,11 +431,11 @@ Windows 端已经完成 **开发环境 + Wintun/以太网垫片原型**，并完
 | M1 核心接入 | `TapConfig`、shim 接入、async 桥接、Engine | ✅ 已提交 `9bc1466` | Windows 能连接 Linux 服务端并 ping |
 | M2 服务/IPC | Windows 服务 + 命名管道 + DACL + 锁 | ✅ 已提交 `8cef993`/`8132f24` | GUI 可连接/断开，无权限越界 |
 | M3 网络 | 路由/DNS/NRPT、防环、IPv6 阻断、清理 | 🟡 已提交；Windows 实机路由/DNS 验收待 M6 | 全隧道无泄漏，断开恢复 |
-| M4 GUI | 路径/钥匙串/自启/语言/状态/服务端身份 | ✅ 已实现并在 Windows RDP 实机验证，未提交 | 普通用户基础操作（真实服务端 E2E 归 M6） |
+| M4 GUI | 路径/钥匙串/自启/语言/状态/服务端身份 | ✅ 已提交 `7b73a82`，Windows RDP 实机验证 | 普通用户基础操作（真实服务端 E2E 归 M6） |
 | M5 安装 | MSI、服务安装、签名、Wintun DLL | ⬜ 未开始 | 干净 Win10/11 安装/升级/卸载 |
 | M6 硬化 | E2E、休眠/切网、fuzz、CI、性能 | ⬜ 未开始 | 验收矩阵通过 |
 
-**当前状态：** M3 代码已提交、M4 代码已实现但未提交。M4 的 Linux
+**当前状态：** M3、M4 代码已提交。M4 的 Linux
 fmt/clippy/test、Windows 目标 check/clippy、Windows 实机
 `cargo test -p rustvpn-client-gui`（31 passed + 2 ignored），以及 RDP
 桌面会话中的 GUI 启动/中文 locale/命名管道/身份校验/HKCU 自启动/单实例/
