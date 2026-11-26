@@ -26,5 +26,25 @@ tokio = { workspace = true }
 anyhow = { workspace = true }
 tauri-plugin-single-instance = "2"
 tauri-plugin-updater = { version = "2", optional = true }
-keyring = { version = "3.6", default-features = false, features = ["sync-secret-service", "crypto-rust"] }
 zeroize = { workspace = true }
+
+# Keep the Linux Secret Service backend unchanged; Windows uses the Credential
+# Manager.  The features must be target-scoped: enabling both would make the
+# feature union pull the Secret Service stack into Windows builds.
+[target.'cfg(unix)'.dependencies]
+keyring = { version = "3.6", default-features = false, features = ["sync-secret-service", "crypto-rust"] }
+
+[target.'cfg(windows)'.dependencies]
+keyring = { version = "3.6", default-features = false, features = ["windows-native"] }
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Globalization",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Security_Cryptography",
+    "Win32_Security_Cryptography_Catalog",
+    "Win32_Security_Cryptography_Sip",
+    "Win32_Security_WinTrust",
+    "Win32_System_Registry",
+    "Win32_System_Threading",
+] }

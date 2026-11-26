@@ -30,6 +30,13 @@ const state = {
   updaterEnabled: false,
   updateAvailable: false,
   updateVersion: "",
+  platform: "unix",
+  endpointKind: "unix-socket",
+  endpoint: "rustvpn-clientd",
+  daemonVersion: "",
+  profilesPath: "",
+  minInnerMtu: 68,
+  profileErrors: [],
 };
 
 // Any state/traffic event invalidates an in-flight status poll.  This keeps a
@@ -107,9 +114,11 @@ function setLanguage(lang) {
   if (invoke) invoke("set_ui_language", { lang: applied }).catch(() => {});
   showPage(state.page);
   renderProfiles();
+  renderProfileErrors(state.profileErrors);
   renderHome();
   renderLogs();
   I18n.apply(document.body);
+  applyPlatformLabels();
 }
 
 function bindNavigation() {
@@ -242,12 +251,46 @@ function showPage(page) {
 async function loadDaemonInfo() {
   try {
     const info = await invoke("daemon_info");
-    document.getElementById("daemon-socket").textContent = info.socket || "rustvpn-clientd";
-    document.getElementById("set-socket").textContent = info.socket || "—";
-    document.getElementById("set-version").textContent = info.version || "—";
+    state.platform = info.platform || (info.endpoint_kind === "named-pipe" ? "windows" : "unix");
+    state.endpointKind = info.endpoint_kind || "unix-socket";
+    state.endpoint = info.endpoint || info.socket || "rustvpn-clientd";
+    state.daemonVersion = info.version || "";
+    state.profilesPath = info.profiles_dir || "";
+    state.minInnerMtu = Number(info.min_inner_mtu) || 68;
+    applyPlatformLabels();
   } catch (error) {
     document.getElementById("set-version").textContent = "—";
   }
+}
+
+function applyPlatformLabels() {
+  document.getElementById("daemon-socket").textContent = state.endpoint;
+  document.getElementById("set-socket").textContent = state.endpoint;
+  document.getElementById("set-endpoint-kind").textContent =
+    state.endpointKind === "named-pipe" ? t("命名管道") : "Unix socket";
+  document.getElementById("set-version").textContent = state.daemonVersion || "—";
+  document.getElementById("set-auth").textContent =
+    state.platform === "windows"
+      ? t("命名管道 DACL；发送口令前校验服务端 PID、镜像路径与 Authenticode 签名")
+      : t("本地 Unix socket，SO_PEERCRED / 组权限");
+  document.getElementById("daemon-hint").textContent =
+    state.platform === "windows"
+      ? t("Windows 服务未安装或未启动时，开发模式可运行 rustvpn-clientd.exe --console；M5 安装器负责注册服务。")
+      : "";
+  document.getElementById("autostart-platform").textContent =
+    state.platform === "windows"
+      ? t("Windows 使用当前用户的 Run 注册表项；登录时最小化到托盘，不会自动连接。")
+      : t("关闭窗口会隐藏到托盘；可从托盘菜单重新打开或退出。");
+  document.getElementById("about-runtime").textContent =
+    state.platform === "windows"
+      ? t("RustVPN 客户端 · GPL-3.0-or-later · Tauri 2 + WebView2")
+      : t("RustVPN 客户端 · GPL-3.0-or-later · Tauri 2 + GTK WebView");
+  if (state.profilesPath) {
+    document.getElementById("profiles-path").textContent = state.profilesPath;
+  }
+  document
+    .getElementById("windows-help")
+    .classList.toggle("hidden", state.platform !== "windows");
 }
 
 function setDaemon(online, text) {
@@ -269,7 +312,10 @@ async function loadUpdateStatus() {
     state.updaterEnabled = Boolean(info.enabled);
     state.updateVersion = info.version || "";
     status.textContent = t("当前版本 {version}", { version: info.version || "—" });
-    if (!info.enabled) {
+    if (info.managed_by_msi) {
+      status.textContent = t("Windows 版不启用应用内更新；请使用签名 MSI 升级。");
+      button.disabled = true;
+    } else if (!info.enabled) {
       button.disabled = true;
       button.title = t("更新源未配置：请使用启用 updater 特性并配置签名公钥的构建。");
     }
@@ -344,11 +390,13 @@ async function loadProfiles() {
     state.profiles = await invoke("list_profiles");
     try {
       const errors = await invoke("profile_errors");
-      if (errors && errors.length) {
+      state.profileErrors = Array.isArray(errors) ? errors : [];
+      renderProfileErrors(state.profileErrors);
+      if (state.profileErrors.length) {
         toast(
           t("{count} 个配置无法加载：{first}", {
-            count: errors.length,
-            first: errors[0].message,
+            count: state.profileErrors.length,
+            first: state.profileErrors[0].message,
           }),
           true
         );
@@ -359,6 +407,8 @@ async function loadProfiles() {
   } catch (error) {
     toast(t("读取配置失败：{error}", { error }), true);
     state.profiles = [];
+    state.profileErrors = [];
+    renderProfileErrors([]);
   }
   if (!state.profiles.some((profile) => profile.name === state.selected)) {
     state.selected = state.profiles[0] ? state.profiles[0].name : "";
@@ -392,6 +442,25 @@ function renderProfileOptions() {
     select.appendChild(option);
   });
   select.value = state.selected;
+}
+
+function renderProfileErrors(errors) {
+  const card = document.getElementById("profile-errors");
+  const list = document.getElementById("profile-error-list");
+  if (!card || !list) return;
+  if (!errors || !errors.length) {
+    card.classList.add("hidden");
+    list.innerHTML = "";
+    return;
+  }
+  list.innerHTML = errors
+    .map(
+      (error) =>
+        `<li><code>${escapeHtml(error.path)}</code>: ${escapeHtml(error.message)}</li>`
+    )
+    .join("");
+  card.classList.remove("hidden");
+  I18n.apply(card);
 }
 
 function renderProfiles() {
@@ -441,7 +510,9 @@ function renderHome() {
     document.getElementById("state-dot").className = "dot err";
     document.getElementById("state-title").textContent = "守护进程离线";
     document.getElementById("state-detail").textContent =
-      "无法连接 rustvpn-clientd；检查服务、socket 和用户组权限。";
+      state.platform === "windows"
+        ? t("无法连接 rustvpn-clientd 命名管道；服务可能未安装或未启动（M5 安装器），或当前账户没有管道权限。")
+        : t("无法连接 rustvpn-clientd；检查服务、socket 和用户组权限。");
     document.getElementById("connect-btn").classList.remove("hidden");
     document.getElementById("connect-btn").disabled = true;
     document.getElementById("disconnect-btn").classList.add("hidden");
@@ -499,7 +570,11 @@ function renderHome() {
     detail.textContent = `${status.last_error || t("连接已结束")}${retry}`;
   } else if (stateName === "error") {
     title.textContent = "连接失败";
-    detail.textContent = status.last_error || t("查看日志获取详情");
+    const base = status.last_error || t("查看日志获取详情");
+    detail.textContent =
+      state.platform === "windows"
+        ? `${base} · ${t("Windows：排查 Wintun DLL/驱动、路由冲突和服务状态。")}`
+        : base;
   } else if (stateName === "disconnecting") {
     title.textContent = "正在断开…";
     detail.textContent = t("恢复路由与 DNS");
@@ -715,12 +790,22 @@ function validateProfileForConnect(profile) {
   if (mtu < 68 || mtu > 9015) {
     return "MTU 必须在 68 到 9015 之间";
   }
-  // The TAP interface IP MTU is derived from the wire MTU; the kernel rejects
-  // `ip link set mtu` below 68. Keep this in sync with the Rust validators.
+  // The interface IP MTU is derived from the wire MTU; Linux rejects values
+  // below 68 and Wintun requires at least 576. Keep both floors in sync with
+  // the Rust validators (`daemon_info.min_inner_mtu`).
   const overhead = profile.encless ? 8 + 1 + 14 : profile.noise ? 16 + 8 + 1 + 14 : 1 + 14;
   const derived = mtu - overhead;
-  if (derived < 68) {
-    return `MTU ${mtu} 推导出的 TAP IP MTU ${derived} 小于 68；至少使用 ${overhead + 68}`;
+  const minDerived = Number(state.minInnerMtu) || 68;
+  if (derived < minDerived) {
+    return t(
+      "MTU {mtu} 推导出的接口 IP MTU {derived} 小于最小值 {min}；至少使用 {minimum}",
+      {
+        mtu,
+        derived,
+        min: minDerived,
+        minimum: overhead + minDerived,
+      }
+    );
   }
   const routes = (profile.routes || []).map((route) => String(route).trim().toLowerCase());
   const fullTunnel = routes.includes("default") || routes.includes("0.0.0.0/0");
@@ -735,6 +820,9 @@ function validateProfileForConnect(profile) {
   }
   if (profile.kill_switch && !fullTunnel) {
     return "kill switch 仅支持全隧道配置";
+  }
+  if (profile.kill_switch && state.platform === "windows") {
+    return t("Windows 版不支持 kill-switch；请在配置中关闭后再连接。");
   }
   return null;
 }
@@ -1038,8 +1126,13 @@ function formatLogTime(ms) {
 }
 
 function securitySummary(status, profile) {
+  const windows = state.platform === "windows";
   let killSwitch = "off";
-  if (status.kill_switch != null) {
+  if (windows) {
+    if (status.kill_switch || (profile && profile.kill_switch)) {
+      killSwitch = t("Windows 不支持");
+    }
+  } else if (status.kill_switch != null) {
     killSwitch = status.kill_switch
       ? status.kill_switch_applied === false
         ? "on (not applied)"
@@ -1049,7 +1142,11 @@ function securitySummary(status, profile) {
     killSwitch = "on (configured)";
   }
   let mss = "off";
-  if (status.mss != null) {
+  if (windows) {
+    if (status.mss != null || (profile && profile.mss_clamp)) {
+      mss = t("Windows 暂不支持");
+    }
+  } else if (status.mss != null) {
     if (status.mss_applied === false) {
       mss = "skipped (nft unavailable)";
     } else {

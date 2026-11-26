@@ -1,7 +1,8 @@
 //! Tauri 2 shell for the RustVPN desktop client.
 //!
 //! The tunnel lives in `rustvpn-clientd`; this process is unprivileged and
-//! only talks to it over the local Unix socket.
+//! only talks to it over the local Unix socket (Linux) or the local named pipe
+//! (Windows).
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
@@ -14,6 +15,10 @@ use rustvpn_client_ipc::{Client, EngineStatus, EventStream, LogLine, ProfileSpec
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{Emitter, Manager, WindowEvent};
+
+mod daemon_identity;
+#[cfg(windows)]
+mod windows_platform;
 
 const KEYRING_SERVICE: &str = "rustvpn-client";
 
@@ -43,8 +48,27 @@ impl UiLang {
             Self::Ru => ["Открыть RustVPN", "Отключить", "Выйти"],
         }
     }
+
+    /// Map the low 10 bits of a Windows `LANGID` (the primary language id) to
+    /// the supported UI languages.  Chinese and Russian are the only
+    /// non-English languages we ship; everything else falls back to English.
+    #[cfg_attr(not(windows), allow(dead_code))] // used by Windows + unit tests
+    fn from_windows_primary_language(primary: u16) -> Self {
+        match primary {
+            0x04 => Self::Zh,
+            0x19 => Self::Ru,
+            _ => Self::En,
+        }
+    }
 }
 
+#[cfg(windows)]
+fn initial_language() -> UiLang {
+    let langid = windows_platform::user_ui_language();
+    UiLang::from_windows_primary_language(langid & 0x03ff)
+}
+
+#[cfg(not(windows))]
 fn initial_language() -> UiLang {
     ["LC_ALL", "LC_MESSAGES", "LANG"]
         .iter()
@@ -60,7 +84,6 @@ struct TrayItems {
 }
 
 struct AppState {
-    socket: PathBuf,
     tray_available: Arc<AtomicBool>,
     tray_items: Mutex<Option<TrayItems>>,
     language: Mutex<UiLang>,
@@ -78,15 +101,55 @@ struct ProfileLoadError {
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[tauri::command]
-async fn daemon_info(state: tauri::State<'_, AppState>) -> Result<serde_json::Value, String> {
-    let socket = rustvpn_client_ipc::candidate_socket_paths()
-        .into_iter()
-        .find(|path| path.exists())
-        .unwrap_or_else(|| state.socket.clone());
+async fn daemon_info() -> Result<serde_json::Value, String> {
+    let endpoint = daemon_endpoint();
     Ok(serde_json::json!({
-        "socket": socket.to_string_lossy(),
+        // `socket` is kept for older UI builds; it is the pipe path on Windows.
+        "socket": endpoint.to_string_lossy(),
+        "endpoint": endpoint.to_string_lossy(),
+        "endpoint_kind": if cfg!(windows) { "named-pipe" } else { "unix-socket" },
+        "platform": if cfg!(windows) { "windows" } else { "unix" },
+        "profiles_dir": profiles_dir().to_string_lossy(),
+        "min_inner_mtu": min_inner_mtu(),
+        "autostart_kind": if cfg!(windows) { "registry" } else { "xdg" },
         "version": env!("CARGO_PKG_VERSION"),
     }))
+}
+
+fn daemon_endpoint() -> PathBuf {
+    #[cfg(unix)]
+    {
+        rustvpn_client_ipc::candidate_socket_paths()
+            .into_iter()
+            .find(|path| path.exists())
+            .unwrap_or_else(rustvpn_client_ipc::default_socket_path)
+    }
+    #[cfg(windows)]
+    {
+        // `Path::exists` is unreliable for a named pipe: the object exists
+        // only while a server instance is listening.  Always show the pipe.
+        rustvpn_client_ipc::default_socket_path()
+    }
+}
+
+#[cfg(windows)]
+fn min_inner_mtu() -> usize {
+    windows_platform::MIN_INNER_MTU
+}
+
+#[cfg(not(windows))]
+fn min_inner_mtu() -> usize {
+    rustvpn_client_ipc::MIN_TAP_IP_MTU
+}
+
+fn describe_endpoint_error(path: &Path, error: &rustvpn_client_ipc::client::ClientError) -> String {
+    #[cfg(windows)]
+    {
+        if let rustvpn_client_ipc::client::ClientError::Io(io_error) = error {
+            return windows_platform::describe_connect_error(path, io_error);
+        }
+    }
+    format!("{}: {error}", path.display())
 }
 
 #[tauri::command]
@@ -98,12 +161,40 @@ async fn get_status() -> Result<EngineStatus, String> {
         .map_err(|error| error.to_string())
 }
 
+/// Verify the local IPC peer before a passphrase crosses the boundary.
+///
+/// On Unix `SO_PEERCRED` plus the socket path are the existing trust model.
+/// On Windows the pipe DACL only identifies the same user, so the server image
+/// and Authenticode publisher are checked as well.
+#[cfg(windows)]
+fn verify_daemon_before_password(client: &Client) -> Result<(), String> {
+    let pid = client
+        .server_pid()
+        .map_err(|error| format!("read named-pipe server PID: {error}"))?;
+    let info = windows_platform::verify_pipe_server(pid)
+        .map_err(|error| format!("refusing to send the passphrase: {error}"))?;
+    eprintln!(
+        "named-pipe server verified: pid={} image={} publisher={:?} trust={}",
+        info.pid,
+        info.image,
+        info.publisher,
+        info.trust.as_str()
+    );
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn verify_daemon_before_password(_client: &Client) -> Result<(), String> {
+    Ok(())
+}
+
 #[tauri::command]
 async fn connect(profile: ProfileSpec, password: String) -> Result<(), String> {
     if password.is_empty() {
         return Err("passphrase is empty".into());
     }
     let mut client = ipc_client(Duration::from_secs(3)).await?;
+    verify_daemon_before_password(&client)?;
     tokio::time::timeout(
         Duration::from_secs(5),
         client.connect_profile(profile, password),
@@ -133,40 +224,48 @@ async fn get_logs(limit: u32) -> Result<Vec<LogLine>, String> {
 
 #[tauri::command]
 async fn get_password(profile_name: String) -> Result<Option<String>, String> {
-    tokio::task::spawn_blocking(move || {
-        let entry = keyring_entry(&profile_name)?;
-        match entry.get_password() {
-            Ok(password) => Ok(Some(password)),
-            Err(keyring::Error::NoEntry) => Ok(None),
-            Err(error) => Err(error.to_string()),
-        }
-    })
-    .await
-    .map_err(|error| error.to_string())?
+    tokio::task::spawn_blocking(move || keyring_get(&profile_name))
+        .await
+        .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
 async fn save_password(profile_name: String, password: String) -> Result<(), String> {
     let password = zeroize::Zeroizing::new(password);
-    tokio::task::spawn_blocking(move || {
-        keyring_entry(&profile_name)?
-            .set_password(password.as_str())
-            .map_err(|error| error.to_string())
-    })
-    .await
-    .map_err(|error| error.to_string())?
+    tokio::task::spawn_blocking(move || keyring_save(&profile_name, password.as_str()))
+        .await
+        .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
 async fn delete_password(profile_name: String) -> Result<(), String> {
-    tokio::task::spawn_blocking(
-        move || match keyring_entry(&profile_name)?.delete_credential() {
-            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-            Err(error) => Err(error.to_string()),
-        },
-    )
-    .await
-    .map_err(|error| error.to_string())?
+    tokio::task::spawn_blocking(move || keyring_delete(&profile_name))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+// No plaintext fallback: if the platform store fails the command returns an
+// error and the UI keeps prompting for the passphrase.  Windows uses the
+// Credential Manager (`windows-native`), Linux keeps Secret Service.
+fn keyring_get(profile_name: &str) -> Result<Option<String>, String> {
+    match keyring_entry(profile_name)?.get_password() {
+        Ok(password) => Ok(Some(password)),
+        Err(keyring::Error::NoEntry) => Ok(None),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+fn keyring_save(profile_name: &str, password: &str) -> Result<(), String> {
+    keyring_entry(profile_name)?
+        .set_password(password)
+        .map_err(|error| error.to_string())
+}
+
+fn keyring_delete(profile_name: &str) -> Result<(), String> {
+    match keyring_entry(profile_name)?.delete_credential() {
+        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+        Err(error) => Err(error.to_string()),
+    }
 }
 
 #[tauri::command]
@@ -230,8 +329,12 @@ fn updater_info(app: tauri::AppHandle) -> serde_json::Value {
         .0
         .get("updater")
         .is_some_and(updater_settings_ready);
+    // Windows installs ship as a signed MSI with a LocalSystem service;
+    // in-app replacement of service binaries is disabled by design (M5).
+    let managed_by_msi = cfg!(windows);
     serde_json::json!({
-        "enabled": cfg!(feature = "updater") && configured,
+        "enabled": !managed_by_msi && cfg!(feature = "updater") && configured,
+        "managed_by_msi": managed_by_msi,
         "version": env!("CARGO_PKG_VERSION"),
     })
 }
@@ -240,6 +343,9 @@ fn updater_info(app: tauri::AppHandle) -> serde_json::Value {
 #[tauri::command]
 async fn check_update(app: tauri::AppHandle) -> Result<serde_json::Value, String> {
     use tauri_plugin_updater::UpdaterExt;
+    if cfg!(windows) {
+        return Err("in-app updates are disabled on Windows; use a signed MSI".into());
+    }
     let update = app
         .updater()
         .map_err(|error| error.to_string())?
@@ -265,6 +371,9 @@ async fn check_update() -> Result<serde_json::Value, String> {
 #[tauri::command]
 async fn install_update(app: tauri::AppHandle) -> Result<(), String> {
     use tauri_plugin_updater::UpdaterExt;
+    if cfg!(windows) {
+        return Err("in-app updates are disabled on Windows; use a signed MSI".into());
+    }
     let update = app
         .updater()
         .map_err(|error| error.to_string())?
@@ -284,11 +393,25 @@ async fn install_update() -> Result<(), String> {
     Err("updater is not enabled in this build".into())
 }
 
+#[cfg(windows)]
+#[tauri::command]
+fn autostart_enabled() -> Result<bool, String> {
+    windows_platform::autostart_enabled()
+}
+
+#[cfg(windows)]
+#[tauri::command]
+fn set_autostart(enabled: bool) -> Result<(), String> {
+    windows_platform::set_autostart(enabled)
+}
+
+#[cfg(not(windows))]
 #[tauri::command]
 fn autostart_enabled() -> bool {
     autostart_path().is_some_and(|path| path.exists())
 }
 
+#[cfg(not(windows))]
 #[tauri::command]
 fn set_autostart(enabled: bool) -> Result<(), String> {
     let path =
@@ -315,6 +438,7 @@ fn keyring_entry(profile_name: &str) -> Result<keyring::Entry, String> {
     keyring::Entry::new(KEYRING_SERVICE, profile_name).map_err(|error| error.to_string())
 }
 
+#[cfg(not(windows))]
 fn autostart_path() -> Option<PathBuf> {
     let base = if let Some(dir) = std::env::var_os("XDG_CONFIG_HOME") {
         PathBuf::from(dir)
@@ -347,6 +471,8 @@ fn collect_profiles(dir: &Path) -> Result<(Vec<ProfileSpec>, Vec<ProfileLoadErro
     if !dir.exists() {
         return Ok((Vec::new(), Vec::new()));
     }
+    // Tighten a directory written by an older build before listing it.
+    let _ = set_dir_private(dir);
     let entries = std::fs::read_dir(dir).map_err(|error| error.to_string())?;
     let mut profiles = Vec::new();
     let mut errors = Vec::new();
@@ -358,6 +484,7 @@ fn collect_profiles(dir: &Path) -> Result<(Vec<ProfileSpec>, Vec<ProfileLoadErro
         ) {
             continue;
         }
+        let _ = set_file_private(&path);
         match read_profile(&path) {
             Ok(profile) => profiles.push(profile),
             Err(error) => {
@@ -396,10 +523,7 @@ async fn save_profile(profile: ProfileSpec, previous_name: Option<String>) -> Re
         save_profile_at(&dir, &profile, previous_name.as_deref())?;
         if let Some(previous) = previous_name.as_deref() {
             if previous != profile.name {
-                let _ = keyring_entry(previous).and_then(|entry| match entry.delete_credential() {
-                    Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-                    Err(error) => Err(error.to_string()),
-                });
+                let _ = keyring_delete(previous);
             }
         }
         Ok(())
@@ -427,7 +551,7 @@ fn save_profile_at(
     // non-numeric or out-of-range MTU (and serialization itself rejects 0).
     profile.validate_mtu()?;
     std::fs::create_dir_all(dir).map_err(|error| error.to_string())?;
-    set_dir_private(dir);
+    set_dir_private(dir)?;
 
     let stem = file_stem(&profile.name)?;
     let file = dir.join(format!("{stem}.yaml"));
@@ -449,7 +573,10 @@ fn save_profile_at(
         TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
     ));
     std::fs::write(&tmp, yaml).map_err(|error| error.to_string())?;
-    set_file_private(&tmp);
+    if let Err(error) = set_file_private(&tmp) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(error);
+    }
     if let Err(error) = std::fs::rename(&tmp, &file) {
         let _ = std::fs::remove_file(&tmp);
         return Err(error.to_string());
@@ -475,10 +602,7 @@ async fn delete_profile(name: String) -> Result<(), String> {
         if file.exists() {
             std::fs::remove_file(file).map_err(|error| error.to_string())?;
         }
-        let _ = keyring_entry(&name).and_then(|entry| match entry.delete_credential() {
-            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-            Err(error) => Err(error.to_string()),
-        });
+        let _ = keyring_delete(&name);
         Ok(())
     })
     .await
@@ -491,7 +615,11 @@ fn profile_path(dir: &Path, name: &str) -> Result<PathBuf, String> {
 
 fn read_profile(path: &Path) -> Result<ProfileSpec, String> {
     let text = std::fs::read_to_string(path).map_err(|error| error.to_string())?;
-    serde_yaml_ng::from_str(&text).map_err(|error| error.to_string())
+    // Windows editors (including Notepad) may prepend a UTF-8 BOM.  The YAML
+    // parser would report "more than one document" and silently hide the
+    // profile, so strip it before parsing.
+    let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
+    serde_yaml_ng::from_str(text).map_err(|error| error.to_string())
 }
 
 async fn ipc_client(timeout: Duration) -> Result<Client, String> {
@@ -499,7 +627,7 @@ async fn ipc_client(timeout: Duration) -> Result<Client, String> {
     for path in rustvpn_client_ipc::candidate_socket_paths() {
         match tokio::time::timeout(timeout, Client::connect(&path)).await {
             Ok(Ok(client)) => return Ok(client),
-            Ok(Err(error)) => last_error = format!("{}: {error}", path.display()),
+            Ok(Err(error)) => last_error = describe_endpoint_error(&path, &error),
             Err(_) => last_error = format!("{}: timed out", path.display()),
         }
     }
@@ -540,7 +668,7 @@ fn spawn_event_listener(app: tauri::AppHandle) {
                 break;
             }
             if !connected {
-                eprintln!("daemon event subscription failed for all socket candidates");
+                eprintln!("daemon event subscription failed for all endpoint candidates");
             }
             let _ = app.emit("daemon-offline", ());
             tokio::time::sleep(Duration::from_secs(2)).await;
@@ -548,6 +676,12 @@ fn spawn_event_listener(app: tauri::AppHandle) {
     });
 }
 
+#[cfg(windows)]
+fn profiles_dir() -> PathBuf {
+    windows_platform::profiles_dir()
+}
+
+#[cfg(not(windows))]
 fn profiles_dir() -> PathBuf {
     if let Some(dir) = std::env::var_os("XDG_CONFIG_HOME") {
         if !dir.is_empty() {
@@ -579,7 +713,7 @@ fn file_stem(name: &str) -> Result<String, String> {
     Ok(stem)
 }
 
-fn set_file_private(path: &std::path::Path) {
+fn set_file_private(path: &Path) -> Result<(), String> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -588,10 +722,20 @@ fn set_file_private(path: &std::path::Path) {
             perms.set_mode(0o600);
             let _ = std::fs::set_permissions(path, perms);
         }
+        Ok(())
+    }
+    #[cfg(windows)]
+    {
+        windows_platform::harden_file(path)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = path;
+        Ok(())
     }
 }
 
-fn set_dir_private(dir: &std::path::Path) {
+fn set_dir_private(dir: &Path) -> Result<(), String> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -600,11 +744,20 @@ fn set_dir_private(dir: &std::path::Path) {
             perms.set_mode(0o700);
             let _ = std::fs::set_permissions(dir, perms);
         }
+        Ok(())
+    }
+    #[cfg(windows)]
+    {
+        windows_platform::harden_dir(dir)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = dir;
+        Ok(())
     }
 }
 
 fn main() {
-    let socket = rustvpn_client_ipc::default_socket_path();
     let builder =
         tauri::Builder::default().plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
             show_main(app);
@@ -614,7 +767,6 @@ fn main() {
     builder
         .setup(move |app| {
             let state = AppState {
-                socket: socket.clone(),
                 tray_available: Arc::new(AtomicBool::new(false)),
                 tray_items: Mutex::new(None),
                 language: Mutex::new(initial_language()),
@@ -623,6 +775,20 @@ fn main() {
             app.manage(state);
             if let Err(error) = setup_tray(app) {
                 eprintln!("tray unavailable: {error}");
+            }
+            // The HKCU Run entry passes `--minimized`; hide the window only
+            // when a tray icon exists so the app stays reachable.
+            #[cfg(windows)]
+            if windows_platform::start_minimized() {
+                let tray = app
+                    .state::<AppState>()
+                    .tray_available
+                    .load(Ordering::Relaxed);
+                if tray {
+                    if let Some(window) = app.get_webview_window("main") {
+                        let _ = window.hide();
+                    }
+                }
             }
             spawn_event_listener(app.handle().clone());
             Ok(())
@@ -759,6 +925,51 @@ mod tests {
     }
 
     #[test]
+    fn windows_primary_language_ids_map_to_ui_languages() {
+        // Chinese Simplified/Traditional, Russian, English, German.
+        assert_eq!(UiLang::from_windows_primary_language(0x04), UiLang::Zh);
+        assert_eq!(UiLang::from_windows_primary_language(0x19), UiLang::Ru);
+        assert_eq!(UiLang::from_windows_primary_language(0x09), UiLang::En);
+        assert_eq!(UiLang::from_windows_primary_language(0x07), UiLang::En);
+        // Full LANGIDs only differ in the sublanguage bits.
+        assert_eq!(
+            UiLang::from_windows_primary_language(0x0804 & 0x03ff),
+            UiLang::Zh
+        );
+        assert_eq!(
+            UiLang::from_windows_primary_language(0x0419 & 0x03ff),
+            UiLang::Ru
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "writes a throwaway credential to this user's Windows Credential Manager"]
+    fn windows_credential_manager_save_get_delete_roundtrip() {
+        let profile = format!("rustvpn-m4-test-{}", std::process::id());
+        let secret = format!("throwaway-{}", TEMP_COUNTER.fetch_add(1, Ordering::Relaxed));
+        if let Err(error) = keyring_save(&profile, &secret) {
+            // A non-interactive SSH/CI logon has no Credential Manager session
+            // (ERROR_NO_SUCH_LOGON_SESSION); the GUI still prompts when the
+            // backend is unavailable.  Do not leave a partial entry behind.
+            if error.contains("NO_SUCH_LOGON_SESSION") || error.contains("platform secure storage")
+            {
+                eprintln!("skipping Credential Manager roundtrip: {error}");
+                return;
+            }
+            panic!("save to Windows Credential Manager failed: {error}");
+        }
+        assert_eq!(
+            keyring_get(&profile).unwrap().as_deref(),
+            Some(secret.as_str())
+        );
+        keyring_delete(&profile).unwrap();
+        assert_eq!(keyring_get(&profile).unwrap(), None);
+        // Deleting a missing entry is idempotent.
+        keyring_delete(&profile).unwrap();
+    }
+
+    #[test]
     fn updater_requires_both_endpoint_and_pubkey() {
         let empty = serde_json::json!({ "endpoints": [], "pubkey": "" });
         assert!(!updater_settings_ready(&empty));
@@ -867,6 +1078,19 @@ mod tests {
             assert!(error.contains("noise"), "unexpected error: {error}");
             assert!(!profile_path(&dir, "padded").unwrap().exists());
         }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn profiles_saved_by_windows_editors_with_a_bom_still_load() {
+        let dir = temp_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let yaml = serde_yaml_ng::to_string(&profile("bom")).unwrap();
+        std::fs::write(dir.join("bom.yaml"), format!("\u{feff}{yaml}")).unwrap();
+        let (profiles, errors) = collect_profiles(&dir).unwrap();
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(profiles.len(), 1);
+        assert_eq!(profiles[0].name, "bom");
         let _ = std::fs::remove_dir_all(dir);
     }
 

@@ -15,10 +15,10 @@
         <div><strong>RustVPN</strong><span>客户端</span></div>
       </div>
       <nav class="nav">
-        <button class="nav-item active" data-page="home">连接</button>
-        <button class="nav-item" data-page="profiles">配置</button>
-        <button class="nav-item" data-page="logs">日志</button>
-        <button class="nav-item" data-page="settings">设置</button>
+        <button class="nav-item active" data-page="home" id="nav-home">连接</button>
+        <button class="nav-item" data-page="profiles" id="nav-profiles">配置</button>
+        <button class="nav-item" data-page="logs" id="nav-logs">日志</button>
+        <button class="nav-item" data-page="settings" id="nav-settings">设置</button>
       </nav>
       <div class="daemon" id="daemon-box">
         <span class="dot" id="daemon-dot"></span>
@@ -110,8 +110,12 @@
 
       <section class="page" id="page-profiles">
         <div class="toolbar">
-          <p class="muted">配置保存在 <code>~/.config/rustvpn/profiles/</code>，口令不会写入磁盘。</p>
+          <p class="muted">配置保存在 <code id="profiles-path">~/.config/rustvpn/profiles/</code>，口令不会写入磁盘。</p>
           <button class="primary" id="add-profile">添加配置</button>
+        </div>
+        <div class="card hint-card hidden" id="profile-errors">
+          <strong>部分配置无法加载</strong>
+          <ul class="plain-list" id="profile-error-list"></ul>
         </div>
         <div id="profile-list" class="profile-list"></div>
         <div class="empty hidden" id="profiles-empty">
@@ -142,16 +146,18 @@
         <div class="card settings-card">
           <h2>守护进程</h2>
           <dl>
-            <dt>Socket</dt><dd id="set-socket">—</dd>
+            <dt>端点</dt><dd id="set-socket">—</dd>
+            <dt>类型</dt><dd id="set-endpoint-kind">—</dd>
             <dt>UI 版本</dt><dd id="set-version">—</dd>
-            <dt>认证</dt><dd>本地 Unix socket，SO_PEERCRED / 组权限</dd>
+            <dt>认证</dt><dd id="set-auth">—</dd>
           </dl>
+          <p class="muted small" id="daemon-hint"></p>
           <button class="secondary" id="check-daemon">重新检测</button>
         </div>
         <div class="card settings-card">
           <h2>启动与托盘</h2>
           <label class="check"><input type="checkbox" id="autostart-toggle"> 登录时启动 RustVPN</label>
-          <p class="muted small">关闭窗口会隐藏到托盘；可从托盘菜单重新打开或退出。</p>
+          <p class="muted small" id="autostart-platform">关闭窗口会隐藏到托盘；可从托盘菜单重新打开或退出。</p>
         </div>
         <div class="card settings-card">
           <h2>界面语言</h2>
@@ -174,9 +180,19 @@
             <li>GUI 不执行用户提供的 up/down 脚本。</li>
           </ul>
         </div>
+        <div class="card settings-card hidden" id="windows-help">
+          <h2>Windows 故障排查</h2>
+          <ul class="plain-list">
+            <li>Wintun DLL 或驱动缺失：确认安装包包含 wintun.dll，开发时检查 RUSTVPN_WINTUN_DLL 绝对路径。</li>
+            <li>路由冲突：关闭其他 VPN 或默认路由程序，并移除与配置冲突的静态路由。</li>
+            <li>服务未安装或未启动：M5 安装器会注册服务；开发时可运行 rustvpn-clientd.exe --console。</li>
+            <li>管道权限被拒绝：把账户加入本地组 RustVPN（M5 安装器创建），或以守护进程用户身份运行。</li>
+            <li>kill-switch 与 MSS clamp 在 Windows 版不可用；界面只显示真实应用状态。</li>
+          </ul>
+        </div>
         <div class="card settings-card">
           <h2>关于</h2>
-          <p class="muted">RustVPN 客户端 · GPL-3.0-or-later · Tauri 2 + GTK WebView</p>
+          <p class="muted" id="about-runtime">RustVPN 客户端 · GPL-3.0-or-later · Tauri 2 + GTK WebView</p>
         </div>
       </section>
     </main>

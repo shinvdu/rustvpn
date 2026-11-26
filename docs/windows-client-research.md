@@ -302,9 +302,12 @@ Wintun 适配器 MTU 设置为 `ip_mtu`。Windows 应在 `ip_mtu < 576` 时拒�
   （同一个 0x4 位），所以被允许的同用户进程仍能创建额外实例；首次实例
   标志只能挡住 daemon 启动前已存在的抢占，启动后的竞态要等 M4 的服务端
   镜像/签名校验。
-- 服务端身份校验（GUI 发送口令前）留到 M4：IPC 已提供
-  `Client::server_pid()`（Windows），后续还需读镜像路径 + Authenticode
-  校验。管道抢占由首次实例标志和 DACL 先挡住一部分。
+- 服务端身份校验（GUI 发送口令前）已在 M4 实现：IPC 提供
+  `Client::server_pid()`，GUI 用 `QueryFullProcessImageNameW` 读镜像路径、
+  `WinVerifyTrust` 校验 Authenticode 并取 signer publisher；只接受安装目录
+  内、签名 subject 含 RustVPN、或 debug 同目录未签名 daemon，其余拒绝发送
+  口令（详见 `windows-client-status.md` 2.9）。管道抢占仍由首次实例标志和
+  DACL 先挡住一部分。
 - 控制台管道的 `Local\`/`Global\` 与多用户策略：请勿在共享机上以普通
   用户长期运行；生产以服务 + 专用组为准。
 
@@ -424,20 +427,24 @@ Wintun 适配器 MTU 设置为 `ip_mtu`。Windows 应在 `ip_mtu < 576` 时拒�
 
 ## 7. GUI 适配
 
-| 位置 | 现状 | Windows 改动 |
-|---|---|---|
-| `gui/src/main.rs:305` | Secret Service keyring | 增加 `windows-native` 后端（Credential Manager） |
-| `gui/src/main.rs:309` | XDG autostart 文件 | HKCU Run 或 `tauri-plugin-autostart` |
-| `gui/src/main.rs:448` | Unix socket 客户端 | 命名管道传输 |
-| `gui/src/main.rs:460` | 事件订阅 Unix socket | 命名管道事件流 |
-| `gui/src/main.rs:502` | XDG/HOME profile 目录 | `%LOCALAPPDATA%\RustVPN\profiles` + 用户 ACL |
-| `initial_language()` | 只读环境变量 | `GetUserDefaultUILanguage`，中文/俄语/其他 |
-| `set_file_private` | Unix `chmod` | Windows ACL |
-| `daemon_info` | 显示 socket 路径 | 显示管道名 |
-| `tauri.conf.json` | `bundle.active=false` | 启用 MSI/NSIS、资源、WebView2 检查 |
+> 下表已在 M4 实现并在 Windows RDP 实机验证；`bundle.active` 仍为 false，
+> MSI/服务安装属 M5。详见 `windows-client-status.md` 2.9 / 3.4。
 
-托盘、单实例、关闭到托盘可以直接复用 Tauri 插件；需要测试“服务未安装/
-未启动/版本不匹配”时的提示。
+| 位置 | M4 实现 |
+|---|---|
+| Keyring | 目标平台特性：Linux Secret Service；Windows `windows-native`（Credential Manager） |
+| 自启动 | Windows HKCU Run + `--minimized`；Linux XDG desktop 不变 |
+| IPC | Unix socket / Windows 命名管道传输与事件流 |
+| profile 目录 | `%LOCALAPPDATA%\RustVPN\profiles` + 受保护用户 ACL |
+| 语言 | Windows `GetUserDefaultUILanguage`；Linux 环境变量；用户选择优先 |
+| 文件权限 | Unix `0600/0700`；Windows 受保护 DACL |
+| `daemon_info` | 显示 `\\.\pipe\rustvpn-clientd`、平台、profile 目录 |
+| `tauri.conf.json` | Windows icon、WebView2 `downloadBootstrapper`、MSI/NSIS/resources 脚手架 |
+| 服务端身份 | PID + 镜像路径 + Authenticode publisher，发口令前校验 |
+| 托盘/单实例 | Tauri 插件；关闭到托盘/单实例已实机验证 |
+
+“服务未安装/未启动/管道 ACL 拒绝”的提示已在 M4 的 IPC 错误映射和设置页
+实现；M5 仍需验证标准用户对 LocalSystem 服务进程的查询权限。
 
 ---
 

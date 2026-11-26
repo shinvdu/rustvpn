@@ -192,6 +192,41 @@
     "恢复路由与 DNS": "Restoring routes and DNS",
     "已选择 {profile}": "Selected {profile}",
     "累计 {value}": "Total {value}",
+    "部分配置无法加载": "Some profiles could not be loaded",
+    "端点": "Endpoint",
+    "类型": "Type",
+    "命名管道": "Named pipe",
+    "命名管道 DACL；发送口令前校验服务端 PID、镜像路径与 Authenticode 签名":
+      "Named-pipe DACL; the server PID, image path and Authenticode signature are verified before the passphrase is sent",
+    "Windows 服务未安装或未启动时，开发模式可运行 rustvpn-clientd.exe --console；M5 安装器负责注册服务。":
+      "If the Windows service is not installed or running, use rustvpn-clientd.exe --console in development; the M5 installer registers the service.",
+    "Windows 使用当前用户的 Run 注册表项；登录时最小化到托盘，不会自动连接。":
+      "Windows uses the current user's Run registry entry; it starts minimized to the tray at login and never connects automatically.",
+    "RustVPN 客户端 · GPL-3.0-or-later · Tauri 2 + WebView2":
+      "RustVPN client · GPL-3.0-or-later · Tauri 2 + WebView2",
+    "无法连接 rustvpn-clientd 命名管道；服务可能未安装或未启动（M5 安装器），或当前账户没有管道权限。":
+      "Cannot reach the rustvpn-clientd named pipe; the service may be missing or stopped (the M5 installer registers it) or this account lacks pipe access.",
+    "Windows：排查 Wintun DLL/驱动、路由冲突和服务状态。":
+      "Windows: check the Wintun DLL/driver, route conflicts and the service state.",
+    "MTU {mtu} 推导出的接口 IP MTU {derived} 小于最小值 {min}；至少使用 {minimum}":
+      "MTU {mtu} derives interface IP MTU {derived}, below the minimum {min}; use at least {minimum}",
+    "Windows 版不支持 kill-switch；请在配置中关闭后再连接。":
+      "The Windows build does not support kill-switch; disable it in the profile before connecting.",
+    "Windows 不支持": "unsupported on Windows",
+    "Windows 暂不支持": "unavailable on Windows",
+    "Windows 版不启用应用内更新；请使用签名 MSI 升级。":
+      "In-app updates are disabled on Windows; upgrade with a signed MSI.",
+    "Windows 故障排查": "Windows troubleshooting",
+    "Wintun DLL 或驱动缺失：确认安装包包含 wintun.dll，开发时检查 RUSTVPN_WINTUN_DLL 绝对路径。":
+      "Missing Wintun DLL or driver: verify the package includes wintun.dll; in development check the absolute RUSTVPN_WINTUN_DLL path.",
+    "路由冲突：关闭其他 VPN 或默认路由程序，并移除与配置冲突的静态路由。":
+      "Route conflict: stop other VPN or default-route software and remove static routes that conflict with the profile.",
+    "服务未安装或未启动：M5 安装器会注册服务；开发时可运行 rustvpn-clientd.exe --console。":
+      "Service not installed or running: the M5 installer registers it; for development run rustvpn-clientd.exe --console.",
+    "管道权限被拒绝：把账户加入本地组 RustVPN（M5 安装器创建），或以守护进程用户身份运行。":
+      "Pipe access denied: add the account to the local RustVPN group (created by the M5 installer) or run as the daemon user.",
+    "kill-switch 与 MSS clamp 在 Windows 版不可用；界面只显示真实应用状态。":
+      "kill-switch and MSS clamp are unavailable on Windows; the UI shows only the actually applied state.",
   };
 
   const RU = {
@@ -368,6 +403,41 @@
     "恢复路由与 DNS": "Восстановление маршрутов и DNS",
     "已选择 {profile}": "Выбран {profile}",
     "累计 {value}": "Всего {value}",
+    "部分配置无法加载": "Некоторые профили не удалось загрузить",
+    "端点": "Конечная точка",
+    "类型": "Тип",
+    "命名管道": "Именованный канал",
+    "命名管道 DACL；发送口令前校验服务端 PID、镜像路径与 Authenticode 签名":
+      "DACL именованного канала; перед отправкой пароля проверяются PID сервера, путь к образу и подпись Authenticode",
+    "Windows 服务未安装或未启动时，开发模式可运行 rustvpn-clientd.exe --console；M5 安装器负责注册服务。":
+      "Если служба Windows не установлена или не запущена, в разработке используйте rustvpn-clientd.exe --console; установщик M5 регистрирует службу.",
+    "Windows 使用当前用户的 Run 注册表项；登录时最小化到托盘，不会自动连接。":
+      "Windows использует раздел Run текущего пользователя; при входе приложение сворачивается в трей и никогда не подключается автоматически.",
+    "RustVPN 客户端 · GPL-3.0-or-later · Tauri 2 + WebView2":
+      "Клиент RustVPN · GPL-3.0-or-later · Tauri 2 + WebView2",
+    "无法连接 rustvpn-clientd 命名管道；服务可能未安装或未启动（M5 安装器），或当前账户没有管道权限。":
+      "Нет связи с именованным каналом rustvpn-clientd; служба не установлена или не запущена (установщик M5), либо у учётной записи нет прав на канал.",
+    "Windows：排查 Wintun DLL/驱动、路由冲突和服务状态。":
+      "Windows: проверьте DLL/драйвер Wintun, конфликты маршрутов и состояние службы.",
+    "MTU {mtu} 推导出的接口 IP MTU {derived} 小于最小值 {min}；至少使用 {minimum}":
+      "MTU {mtu} даёт IP MTU интерфейса {derived}, меньше минимума {min}; используйте не менее {minimum}",
+    "Windows 版不支持 kill-switch；请在配置中关闭后再连接。":
+      "Сборка для Windows не поддерживает kill-switch; отключите его в профиле перед подключением.",
+    "Windows 不支持": "не поддерживается в Windows",
+    "Windows 暂不支持": "недоступно в Windows",
+    "Windows 版不启用应用内更新；请使用签名 MSI 升级。":
+      "Встроенное обновление в Windows отключено; обновляйтесь подписанным MSI.",
+    "Windows 故障排查": "Диагностика Windows",
+    "Wintun DLL 或驱动缺失：确认安装包包含 wintun.dll，开发时检查 RUSTVPN_WINTUN_DLL 绝对路径。":
+      "Нет DLL или драйвера Wintun: убедитесь, что пакет содержит wintun.dll; в разработке проверьте абсолютный путь RUSTVPN_WINTUN_DLL.",
+    "路由冲突：关闭其他 VPN 或默认路由程序，并移除与配置冲突的静态路由。":
+      "Конфликт маршрутов: остановите другие VPN или программы, меняющие маршрут по умолчанию, и удалите конфликтующие статические маршруты.",
+    "服务未安装或未启动：M5 安装器会注册服务；开发时可运行 rustvpn-clientd.exe --console。":
+      "Служба не установлена или не запущена: установщик M5 регистрирует её; в разработке запускайте rustvpn-clientd.exe --console.",
+    "管道权限被拒绝：把账户加入本地组 RustVPN（M5 安装器创建），或以守护进程用户身份运行。":
+      "Доступ к каналу запрещён: добавьте учётную запись в локальную группу RustVPN (создаётся установщиком M5) или работайте от имени пользователя демона.",
+    "kill-switch 与 MSS clamp 在 Windows 版不可用；界面只显示真实应用状态。":
+      "kill-switch и MSS clamp недоступны в Windows; интерфейс показывает только фактически применённое состояние.",
   };
 
   const MESSAGES = { en: EN, ru: RU };
