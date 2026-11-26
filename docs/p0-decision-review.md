@@ -1,6 +1,6 @@
 # P0 改进项：待决策问题评审
 
-> 日期：2026-11-26（2026-11-26 更新：应用决策并修复对抗性评审发现）
+> 日期：2026-11-26（2026-11-27 更新：修复收窄部分失败后的 DNS 状态失步并补生产顺序回归测试）
 > 状态：P0 Batch 1 / Batch 2 代码已落地，尚未提交；本文件同时记录**已执行决定与修复状态**。下方原始评审文本保留作背景。
 > 范围：MTU/MSS、kill-switch、QR、GUI、文档、status schema、rekey、keepalive、服务端声明式 TAP、diff reload。
 > 说明：代码、测试与英/中/俄文档的关键 MTU 语义已按“已执行决定”对齐；第二轮对抗性评审的 P1 修复记录见 P1-* 行，第三轮评审的 P2 修复记录见 P2-* 行（kill-switch 崩溃策略、重连 applied 状态、服务端 MTU 拒绝、派生 TAP IP MTU 下限、CLI keepalive、服务端 status 文档）。
@@ -38,6 +38,7 @@
 | P2-4 | 极小 MTU 推导 TAP IP MTU <68（`ip link set` 拒绝） | 共享校验要求派生 TAP IP MTU ≥68：plain 线路 ≥83，noise/encless 的 120 下限派生 81/97；profile、CLI、IPC/GUI 保存、verifier、admin、server 在触碰网络前拒绝并报告派生值与最小可用线路值；Windows 576 仍为平台特定限制；新增 plain 68/82/83、noise/encless 120 回归测试 | **CLOSED** |
 | P2-5 | CLI keepalive 仍为 plain 5 s / padded 15 s | CLI 改用 `rustvpn-client-core::profile` 的 10/25/3600 常量，保留 `0`=关闭与 `<timeout` 校验；新增 CLI 边界测试，与 profile/verifier/文档一致 | **CLOSED** |
 | P2-6 | 服务端 `status --json` 文档混入客户端字段 | en/zh/ru 文档拆分为公共/仅客户端/仅服务端字段，并记录 `sessions[]`；明确服务端无顶层 iface/endpoint/last_handshake/rekey/keepalive，速率为 `null` 且 `rates_available:false`；新增 `ServerStatusV1` 顶层与会话键序列化对照测试 | **CLOSED** |
+| P2-7 | 收窄部分失败后 DNS 放行状态失步（主机名远端再次死锁） | `bootstrap_commands` 以 `flush chain` 开头，收窄时若 flush 成功但后续规则失败，`bootstrap_kill_switch` 返回 `Err`，而引擎只记录日志、`BootstrapState.dns_open` 仍为 `true`；握手失败清空 `endpoints` 后 `needs_dns()` 为 false，下一次解析不再重开 DNS，旧死锁复现。新增 `BootstrapState::record_error()`：任何 bootstrap/narrow 错误都把 `dns_open` 置回 false 并保持 `active`（fail-closed，不谎报表健康）；`Ok(false)`（表已消失）仍转为 inactive；`attempt_connection()` 统一封装“开 DNS → 解析 → 收窄 → 握手”的生产顺序并被 `run_connection` 直接调用。新增 `record_error` 单元测试与 fake-nft 端到端回归测试：收窄 flush 成功后失败、重试前重开 DNS、最终成功且不残留放行；断言命令顺序而非仅最终状态。单条 `nft -f` 批量收窄因需重写命令格式/引用并改变错误语义，风险评估后延后 | **CLOSED** |
 
 其他一并修复的对抗性评审项：
 
@@ -604,7 +605,7 @@
 | 显式 MTU | 越界/低于 noise 下限/派生 TAP IP MTU <68 一律拒绝，不钳制 |
 | MSS clamp | 默认 best-effort；独立 IPv4/IPv6 值；`required` 严格模式延后 |
 | kill-switch | 默认关闭；显式开启；无 nft 时 fail-closed；仅主机 output；放行物理接口 ND/MLD/DHCPv6 |
-| kill-switch 崩溃 | clean-shutdown 标记；崩溃后保留表；首次握手成功前每次解析前重开临时 DNS、解析后收窄、握手前关闭；成功后替换/删除；表消失则不再声明 fail-closed；显式停止删表 |
+| kill-switch 崩溃 | clean-shutdown 标记；崩溃后保留表；首次握手成功前每次解析前重开临时 DNS、解析后收窄、握手前关闭；收窄部分失败也要求下次解析前重开；成功后替换/删除；表消失则不再声明 fail-closed；显式停止删表 |
 | QR | 外部 `qrencode`；临时文件 O_EXCL + 原子 rename；内置 QR 延后 |
 | GUI | 首页只读 MTU/安全状态；新 profile 默认 MTU 1515、rekey 1800；开关延后 |
 | 文档 | en/zh/ru 已对齐 MTU、keepalive、kill-switch 崩溃策略与 status 形状 |

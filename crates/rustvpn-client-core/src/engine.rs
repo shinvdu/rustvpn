@@ -4,6 +4,7 @@
 //! the daemon uses this engine for states, traffic samples, logs and
 //! exponential backoff.
 
+use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -221,6 +222,23 @@ impl BootstrapState {
         }
     }
 
+    /// Record a failed bootstrap call.
+    ///
+    /// `bootstrap_commands` flushes the `output` chain first, so *any* failure
+    /// after that flush removes the temporary DNS allowance even if the engine
+    /// previously recorded it as open.  In particular a narrow that flushes
+    /// successfully but then fails to add a rule would otherwise leave
+    /// `dns_open == true`; the handshake failure would clear `endpoints` and
+    /// the next lookup would never re-open DNS, recreating the deadlock.
+    ///
+    /// The table stays `active` (fail-closed) because the chain's `drop`
+    /// policy is untouched; a retry re-runs the idempotent bootstrap.
+    fn record_error(&mut self) {
+        if self.active {
+            self.dns_open = false;
+        }
+    }
+
     /// A successful handshake installed the full rule set (or removed the
     /// table).  The temporary allowance is gone in either case.
     fn replaced(&mut self) {
@@ -328,6 +346,7 @@ async fn run_connection(
             Err(error) => {
                 // Keep the table active but leave the allowance unconfirmed:
                 // the loop retries the bootstrap before its first lookup.
+                bootstrap.record_error();
                 emit_log(&events, "warn", format!("kill-switch bootstrap: {error:#}"));
             }
         }
@@ -439,127 +458,62 @@ async fn run_connection(
             break;
         }
 
-        if endpoints.is_none() {
-            // While a crash-preserved table is active, the temporary DNS
-            // allowance must be open before *every* lookup.  A failed
-            // handshake below clears `endpoints` after the previous iteration
-            // narrowed the table to the (now stale) outer endpoint, which
-            // drops DNS; without re-opening it the retry — and every retry
-            // after it — could never resolve a hostname remote again.
-            // `bootstrap_commands` flushes the chain first, so this is
-            // idempotent and never accumulates duplicate rules.  IP-literal
-            // remotes are parsed locally, so they keep DNS closed as before.
-            if bootstrap.needs_dns() && lookup_needs_dns(validated.outer_host()) {
-                match crate::firewall::bootstrap_kill_switch(&scope, None, true).await {
-                    Ok(present) => {
-                        if !present {
-                            emit_log(
-                                &events,
-                                "warn",
-                                "preserved kill-switch table is no longer available; \
-                                 continuing without the crash-preserved kill switch",
-                            );
-                        }
-                        bootstrap.record_dns(present);
-                    }
-                    Err(error) => emit_log(
-                        &events,
-                        "warn",
-                        format!("kill-switch DNS bootstrap: {error:#}"),
-                    ),
-                }
-            }
-            match resolve_endpoints(&spec.remote, &spec.proxy).await {
-                Ok(resolved) => endpoints = Some(resolved),
-                Err(error) => {
-                    attempt = attempt.saturating_add(1);
-                    let message = format!("resolve {}: {error:#}", validated.outer_host());
-                    emit_log(&events, "error", &message);
-                    let mut status =
-                        base_status(&validated, resolved, applied_from_guard(guard.as_ref()));
-                    status.state = "reconnecting".into();
-                    status.last_error = Some(message);
-                    last_status = status.clone();
-                    let delay = backoff(attempt);
-                    status.next_retry_in = Some(delay.as_secs());
-                    let _ = events.send(Event::State(status));
-                    emit_log(
-                        &events,
-                        "info",
-                        format!("reconnecting in {}s", delay.as_secs()),
-                    );
-                    tokio::select! {
-                        _ = tokio::time::sleep(delay) => {}
-                        _ = cancel.cancelled() => break,
-                    }
-                    continue;
-                }
-            }
-        }
-
-        if bootstrap.needs_narrow() {
-            // DNS has served its purpose.  Narrow the preserved table to the
-            // resolved outer endpoint so the handshake can pass while every
-            // other host packet still hits the drop policy.  The temporary DNS
-            // allowance is closed here; a failed handshake re-opens it before
-            // the next lookup.
-            if let Some(outer) = endpoints.as_ref().and_then(Endpoints::outer) {
-                match crate::firewall::bootstrap_kill_switch(&scope, Some(outer), false).await {
-                    Ok(present) => {
-                        if !present {
-                            emit_log(
-                                &events,
-                                "warn",
-                                "preserved kill-switch table is no longer available; \
-                                 continuing without the crash-preserved kill switch",
-                            );
-                        }
-                        bootstrap.record_narrow(present);
-                    }
-                    Err(error) => emit_log(
-                        &events,
-                        "warn",
-                        format!("kill-switch bootstrap for {outer}: {error:#}"),
-                    ),
-                }
-            }
-        }
-
-        last_status.state = "connecting".into();
-        last_status.next_retry_in = None;
-        last_status.since_unix = None;
-        let _ = events.send(Event::State(last_status.clone()));
-        emit_log(
+        let proto = validated.proto();
+        let remote = spec.remote.as_str();
+        let proxy = spec.proxy.as_str();
+        let proxy_auth = spec.proxy_auth.as_str();
+        let outcome = attempt_connection(
+            &mut bootstrap,
+            &mut endpoints,
+            &scope,
+            validated.outer_host(),
             &events,
-            "info",
-            format!(
-                "connecting {} over {} ({})",
-                spec.remote,
-                validated.proto(),
-                validated.mode()
-            ),
-        );
-
-        let cfg = validated.peer_config_with_mtu(signing_key.clone(), resolved.daemon);
-        let started = start_session(
-            cfg,
-            signing_key.clone(),
-            tap.clone(),
-            stats_state.clone(),
-            &spec.remote,
-            endpoints.as_ref().expect("resolved above"),
-            validated.proto(),
-            &spec.proxy,
-            &spec.proxy_auth,
-            "",
+            || {
+                last_status.state = "connecting".into();
+                last_status.next_retry_in = None;
+                last_status.since_unix = None;
+                let _ = events.send(Event::State(last_status.clone()));
+                emit_log(
+                    &events,
+                    "info",
+                    format!(
+                        "connecting {} over {} ({})",
+                        spec.remote,
+                        validated.proto(),
+                        validated.mode()
+                    ),
+                );
+            },
+            || resolve_endpoints(&spec.remote, &spec.proxy),
+            |endpoints: Endpoints| {
+                let cfg = validated.peer_config_with_mtu(signing_key.clone(), resolved.daemon);
+                let signing_key = signing_key.clone();
+                let tap = tap.clone();
+                let stats_state = stats_state.clone();
+                async move {
+                    start_session(
+                        cfg,
+                        signing_key,
+                        tap,
+                        stats_state,
+                        remote,
+                        &endpoints,
+                        proto,
+                        proxy,
+                        proxy_auth,
+                        "",
+                    )
+                    .await
+                }
+            },
         )
         .await;
 
-        let mut connected_status =
-            base_status(&validated, resolved, applied_from_guard(guard.as_ref()));
         let mut planned_rekey = false;
-        match started {
-            Ok(mut session) => {
+        match outcome {
+            Attempt::Succeeded(mut session) => {
+                let mut connected_status =
+                    base_status(&validated, resolved, applied_from_guard(guard.as_ref()));
                 if guard.is_none() {
                     let outer = endpoints.as_ref().and_then(Endpoints::outer);
                     let net_options = NetOptions {
@@ -659,7 +613,30 @@ async fn run_connection(
                 connected_status.last_error = Some(reason.to_string());
                 last_status = connected_status;
             }
-            Err(error) => {
+            Attempt::ResolveFailed(error) => {
+                attempt = attempt.saturating_add(1);
+                let message = format!("resolve {}: {error:#}", validated.outer_host());
+                emit_log(&events, "error", &message);
+                let mut status =
+                    base_status(&validated, resolved, applied_from_guard(guard.as_ref()));
+                status.state = "reconnecting".into();
+                status.last_error = Some(message);
+                last_status = status.clone();
+                let delay = backoff(attempt);
+                status.next_retry_in = Some(delay.as_secs());
+                let _ = events.send(Event::State(status));
+                emit_log(
+                    &events,
+                    "info",
+                    format!("reconnecting in {}s", delay.as_secs()),
+                );
+                tokio::select! {
+                    _ = tokio::time::sleep(delay) => {}
+                    _ = cancel.cancelled() => break,
+                }
+                continue;
+            }
+            Attempt::HandshakeFailed(error) => {
                 attempt = attempt.saturating_add(1);
                 let message = format!("{error:#}");
                 emit_log(&events, "error", format!("session failed: {message}"));
@@ -714,6 +691,133 @@ async fn run_connection(
     }
     drop(tap);
     emit_log(&events, "info", "tunnel stopped");
+}
+
+/// Result of one attempt's bootstrap, resolution and handshake phases.
+#[derive(Debug)]
+enum Attempt<T> {
+    /// The outer endpoint could not be resolved; the cached one stays empty.
+    ResolveFailed(anyhow::Error),
+    /// Resolution and narrowing completed but the handshake failed.
+    HandshakeFailed(anyhow::Error),
+    /// The handshake succeeded.
+    Succeeded(T),
+}
+
+/// Drive the production connect ordering for one attempt.
+///
+/// This is the single implementation of the crash-bootstrap contract used by
+/// [`run_connection`], so a reordering bug cannot hide behind tests of the
+/// state helper alone:
+///
+/// 1. While the preserved table is active and the remote needs a lookup, open
+///    the temporary DNS allowance *before* resolving.
+/// 2. Resolve the outer endpoint when none is cached.
+/// 3. Narrow the preserved table to that endpoint *before* the handshake.
+/// 4. Run the handshake.
+///
+/// `before_handshake` runs after narrowing and immediately before the
+/// handshake, which is where the engine emits its `connecting` status/log.
+#[allow(clippy::too_many_arguments)]
+async fn attempt_connection<T, RF, RFut, HF, HFut>(
+    bootstrap: &mut BootstrapState,
+    endpoints: &mut Option<Endpoints>,
+    scope: &str,
+    host: &str,
+    events: &broadcast::Sender<Event>,
+    before_handshake: impl FnOnce(),
+    resolve: RF,
+    handshake: HF,
+) -> Attempt<T>
+where
+    RF: FnOnce() -> RFut,
+    RFut: Future<Output = anyhow::Result<Endpoints>>,
+    HF: FnOnce(Endpoints) -> HFut,
+    HFut: Future<Output = anyhow::Result<T>>,
+{
+    if endpoints.is_none() {
+        // While a crash-preserved table is active, the temporary DNS
+        // allowance must be open before *every* lookup.  A failed handshake
+        // clears `endpoints` after the previous iteration narrowed the table
+        // to the (now stale) outer endpoint, which drops DNS; without
+        // re-opening it the retry — and every retry after it — could never
+        // resolve a hostname remote again.  `bootstrap_commands` flushes the
+        // chain first, so this is idempotent and never accumulates duplicate
+        // rules.  IP-literal remotes are parsed locally, so they keep DNS
+        // closed as before.
+        if bootstrap.needs_dns() && lookup_needs_dns(host) {
+            match crate::firewall::bootstrap_kill_switch(scope, None, true).await {
+                Ok(present) => {
+                    if !present {
+                        emit_log(
+                            events,
+                            "warn",
+                            "preserved kill-switch table is no longer available; \
+                             continuing without the crash-preserved kill switch",
+                        );
+                    }
+                    bootstrap.record_dns(present);
+                }
+                Err(error) => {
+                    // The flush may have removed the allowance before the
+                    // failure; require a fresh successful bootstrap before the
+                    // next lookup.
+                    bootstrap.record_error();
+                    emit_log(
+                        events,
+                        "warn",
+                        format!("kill-switch DNS bootstrap: {error:#}"),
+                    );
+                }
+            }
+        }
+        match resolve().await {
+            Ok(resolved) => *endpoints = Some(resolved),
+            Err(error) => return Attempt::ResolveFailed(error),
+        }
+    }
+
+    if bootstrap.needs_narrow() {
+        // DNS has served its purpose.  Narrow the preserved table to the
+        // resolved outer endpoint so the handshake can pass while every other
+        // host packet still hits the drop policy.  The temporary DNS allowance
+        // is closed here; a failed handshake or a partial narrowing re-opens
+        // it before the next lookup.
+        if let Some(outer) = endpoints.as_ref().and_then(Endpoints::outer) {
+            match crate::firewall::bootstrap_kill_switch(scope, Some(outer), false).await {
+                Ok(present) => {
+                    if !present {
+                        emit_log(
+                            events,
+                            "warn",
+                            "preserved kill-switch table is no longer available; \
+                             continuing without the crash-preserved kill switch",
+                        );
+                    }
+                    bootstrap.record_narrow(present);
+                }
+                Err(error) => {
+                    // `bootstrap_commands` flushes first, so a later add
+                    // failure means the DNS allowance is gone even though the
+                    // state still said it was open.  Record that so the retry
+                    // re-opens it instead of looping on blocked DNS.
+                    bootstrap.record_error();
+                    emit_log(
+                        events,
+                        "warn",
+                        format!("kill-switch bootstrap for {outer}: {error:#}"),
+                    );
+                }
+            }
+        }
+    }
+
+    before_handshake();
+    let endpoints = *endpoints.as_ref().expect("resolved above");
+    match handshake(endpoints).await {
+        Ok(value) => Attempt::Succeeded(value),
+        Err(error) => Attempt::HandshakeFailed(error),
+    }
 }
 
 async fn session_loop(
@@ -886,6 +990,9 @@ fn unix_now_ms() -> i64 {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    use std::net::SocketAddr;
+
     #[test]
     fn backoff_is_bounded_and_grows() {
         for attempt in 0..8 {
@@ -1047,6 +1154,30 @@ mod tests {
     }
 
     #[test]
+    fn narrow_error_reopens_dns_on_the_next_lookup() {
+        // Regression: a narrow that flushed the chain and then failed to add
+        // a rule used to leave `dns_open == true` even though DNS was blocked,
+        // so the next lookup after a failed handshake never re-opened it.
+        let mut bootstrap = BootstrapState::pending();
+        bootstrap.record_dns(true);
+        assert!(!bootstrap.needs_dns());
+
+        bootstrap.record_error();
+        assert!(bootstrap.active(), "the drop policy is still in force");
+        assert!(!bootstrap.dns_open, "the flushed allowance is gone");
+        assert!(bootstrap.needs_dns(), "the retry must re-open DNS");
+
+        // A retry re-opens the allowance; a successful narrow then retires the
+        // bootstrap state and leaves no allowance behind.
+        bootstrap.record_dns(true);
+        assert!(!bootstrap.needs_dns());
+        bootstrap.record_narrow(true);
+        bootstrap.replaced();
+        assert!(!bootstrap.active());
+        assert!(!bootstrap.needs_dns());
+    }
+
+    #[test]
     fn bootstrap_stops_claiming_fail_closed_when_the_table_vanishes() {
         // A failed bootstrap probe (`Ok(false)`) means no table is left; the
         // engine must not keep treating the host as fail-closed.
@@ -1064,5 +1195,354 @@ mod tests {
         assert!(!bootstrap.active());
         assert!(!bootstrap.needs_dns());
         assert!(!bootstrap.needs_narrow());
+    }
+
+    /// Serializes tests that change the process-global `RUSTVPN_NFT_BIN`.
+    #[cfg(unix)]
+    static NFT_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// Restores the nft-related environment variables when dropped.
+    #[cfg(unix)]
+    struct NftEnv {
+        saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    }
+
+    #[cfg(unix)]
+    impl NftEnv {
+        fn set(vars: &[(&'static str, String)]) -> Self {
+            let saved = vars
+                .iter()
+                .map(|(key, _)| (*key, std::env::var_os(key)))
+                .collect();
+            for (key, value) in vars {
+                std::env::set_var(key, value);
+            }
+            Self { saved }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for NftEnv {
+        fn drop(&mut self) {
+            for (key, value) in &self.saved {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+
+    /// Fake `nft` used through `RUSTVPN_NFT_BIN`; never touches the host.
+    #[cfg(unix)]
+    struct FakeNft {
+        dir: std::path::PathBuf,
+        script: std::path::PathBuf,
+        log: std::path::PathBuf,
+        fail_marker: std::path::PathBuf,
+    }
+
+    /// The script always reports the table as present (`list` exits 0) and,
+    /// when the one-shot marker exists, fails the first narrowed endpoint rule
+    /// after the preceding `flush` succeeded.
+    #[cfg(unix)]
+    const FAKE_NFT_SCRIPT: &str = r#"#!/bin/sh
+log="${RUSTVPN_FAKE_NFT_LOG:?}"
+echo "$*" >> "$log"
+if [ "$1" = "list" ]; then
+    exit 0
+fi
+if [ -f "${RUSTVPN_FAKE_NFT_FAIL_NARROW:-/nonexistent}" ] && [ "$1" = "add" ] && [ "$2" = "rule" ]; then
+    case "$*" in
+        *daddr*)
+            rm -f "$RUSTVPN_FAKE_NFT_FAIL_NARROW"
+            exit 1
+            ;;
+    esac
+fi
+exit 0
+"#;
+
+    #[cfg(unix)]
+    impl FakeNft {
+        fn new(tag: &str) -> Self {
+            use std::os::unix::fs::PermissionsExt;
+            use std::sync::atomic::{AtomicUsize, Ordering};
+
+            static COUNTER: AtomicUsize = AtomicUsize::new(0);
+            let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let dir = std::env::temp_dir().join(format!(
+                "rustvpn-fake-nft-{}-{tag}-{unique}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let script = dir.join("nft");
+            let log = dir.join("calls.log");
+            let fail_marker = dir.join("fail-narrow");
+            std::fs::write(&script, FAKE_NFT_SCRIPT).unwrap();
+            let mut perms = std::fs::metadata(&script).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&script, perms).unwrap();
+            Self {
+                dir,
+                script,
+                log,
+                fail_marker,
+            }
+        }
+
+        fn env(&self) -> Vec<(&'static str, String)> {
+            vec![
+                (
+                    "RUSTVPN_NFT_BIN",
+                    self.script.to_string_lossy().into_owned(),
+                ),
+                (
+                    "RUSTVPN_FAKE_NFT_LOG",
+                    self.log.to_string_lossy().into_owned(),
+                ),
+                (
+                    "RUSTVPN_FAKE_NFT_FAIL_NARROW",
+                    self.fail_marker.to_string_lossy().into_owned(),
+                ),
+            ]
+        }
+
+        fn arm_narrow_failure(&self) {
+            std::fs::write(&self.fail_marker, b"1").unwrap();
+        }
+
+        fn mark(&self, label: &str) {
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&self.log)
+                .unwrap();
+            writeln!(file, "MARK {label}").unwrap();
+        }
+
+        fn tokens(&self) -> Vec<String> {
+            std::fs::read_to_string(&self.log)
+                .unwrap_or_default()
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .map(classify_nft_call)
+                .collect()
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for FakeNft {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    #[cfg(unix)]
+    fn classify_nft_call(line: &str) -> String {
+        if let Some(mark) = line.strip_prefix("MARK ") {
+            return mark.to_string();
+        }
+        let line = line.trim();
+        if line.starts_with("list ") {
+            "probe".into()
+        } else if line.contains("add chain") {
+            "chain".into()
+        } else if line.contains("flush chain") {
+            "flush".into()
+        } else if line.contains("dport 53") {
+            "dns".into()
+        } else if line.contains("add rule") && line.contains("daddr") {
+            "outer".into()
+        } else if line.contains("add rule") && line.contains("oifname \"lo\"") {
+            "loopback".into()
+        } else if line.contains("sport 68") {
+            "dhcp".into()
+        } else if line.contains("icmpv6") {
+            "icmpv6".into()
+        } else if line.starts_with("delete ") {
+            "delete".into()
+        } else {
+            format!("other:{line}")
+        }
+    }
+
+    /// Production-ordering regression test.
+    ///
+    /// Uses the same [`attempt_connection`] that `run_connection` calls, a
+    /// fake `nft` and injected resolver/handshake closures, so it exercises
+    /// the real sequence without TAP, root or host firewall changes.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn production_ordering_reopens_dns_after_partial_narrow_failure() {
+        let _serial = NFT_ENV_LOCK.lock().await;
+        let fake = FakeNft::new("partial-narrow");
+        let _env = NftEnv::set(&fake.env());
+
+        let scope = "test-scope";
+        let host = "vpn.example.com:1194";
+        let outer: SocketAddr = "203.0.113.10:1194".parse().unwrap();
+        let (events, _rx) = broadcast::channel(64);
+
+        // Mirror the engine's initial crash-preserved bootstrap.
+        let present = crate::firewall::bootstrap_kill_switch(scope, None, true)
+            .await
+            .unwrap();
+        assert!(present, "fake nft must report the preserved table");
+        let mut bootstrap = BootstrapState::pending();
+        bootstrap.record_dns(true);
+        let mut endpoints: Option<Endpoints> = None;
+
+        // First narrow: `flush` succeeds, the endpoint rule add fails once.
+        fake.arm_narrow_failure();
+
+        let mut resolves = 0usize;
+        let first: Attempt<()> = attempt_connection(
+            &mut bootstrap,
+            &mut endpoints,
+            scope,
+            host,
+            &events,
+            || fake.mark("before-handshake-1"),
+            || {
+                resolves += 1;
+                fake.mark("resolve-1");
+                async {
+                    Ok(Endpoints {
+                        remote: Some(outer),
+                        proxy: None,
+                    })
+                }
+            },
+            |_| {
+                fake.mark("handshake-fail-1");
+                async { Err::<(), _>(anyhow::anyhow!("handshake failed")) }
+            },
+        )
+        .await;
+        assert!(matches!(first, Attempt::HandshakeFailed(_)));
+        assert!(bootstrap.active(), "the table must stay fail-closed");
+        assert!(
+            !bootstrap.dns_open,
+            "a partial narrow must record that the allowance is gone"
+        );
+
+        // Production clears the cached endpoint after a failed handshake.
+        endpoints = None;
+        assert!(
+            bootstrap.needs_dns(),
+            "the retry must re-open DNS before resolving"
+        );
+
+        let second: Attempt<()> = attempt_connection(
+            &mut bootstrap,
+            &mut endpoints,
+            scope,
+            host,
+            &events,
+            || fake.mark("before-handshake-2"),
+            || {
+                resolves += 1;
+                fake.mark("resolve-2");
+                async {
+                    Ok(Endpoints {
+                        remote: Some(outer),
+                        proxy: None,
+                    })
+                }
+            },
+            |_| {
+                fake.mark("handshake-ok");
+                async { Ok::<(), anyhow::Error>(()) }
+            },
+        )
+        .await;
+        assert!(matches!(second, Attempt::Succeeded(())));
+        // The post-success path installs the full current rule set (or removes
+        // the table) through the firewall; exercise that half with the same
+        // fake nft.  A full install never contains the port-53 allowance.
+        crate::firewall::apply_kill_switch(scope, "rsvpn0", outer, Some("eth0"))
+            .await
+            .unwrap();
+        bootstrap.replaced();
+
+        // A later reconnect with the endpoint pinned must not touch nft.
+        let before = fake.tokens().len();
+        let third: Attempt<()> = attempt_connection(
+            &mut bootstrap,
+            &mut endpoints,
+            scope,
+            host,
+            &events,
+            || {},
+            || async { panic!("a pinned endpoint must be reused") },
+            |_| async { Ok::<(), anyhow::Error>(()) },
+        )
+        .await;
+        assert!(matches!(third, Attempt::Succeeded(())));
+        assert_eq!(fake.tokens().len(), before, "no bootstrap after success");
+        assert_eq!(resolves, 2);
+
+        let tokens = fake.tokens();
+        let pos = |needle: &str| {
+            tokens
+                .iter()
+                .position(|token| token == needle)
+                .unwrap_or_else(|| panic!("missing {needle} in {tokens:?}"))
+        };
+        let resolve1 = pos("resolve-1");
+        let handshake_fail = pos("handshake-fail-1");
+        let resolve2 = pos("resolve-2");
+        let handshake_ok = pos("handshake-ok");
+
+        // 1. DNS allowance is open before the first lookup.
+        assert!(
+            pos("dns") < resolve1,
+            "DNS must open before the first resolve: {tokens:?}"
+        );
+        // 2. The first narrow happened before the handshake and closed DNS.
+        let narrow1 = tokens[..handshake_fail]
+            .iter()
+            .rposition(|token| token == "flush")
+            .unwrap();
+        assert!(
+            narrow1 > resolve1 && narrow1 < handshake_fail,
+            "narrow#1 must precede the handshake: {tokens:?}"
+        );
+        assert!(
+            !tokens[narrow1..handshake_fail].contains(&"dns".to_string()),
+            "narrow#1 must close the DNS allowance: {tokens:?}"
+        );
+        // 3. The partial failure re-opened DNS before the retry lookup.
+        assert!(
+            tokens[handshake_fail..resolve2].contains(&"dns".to_string()),
+            "the retry must re-open DNS before resolving again: {tokens:?}"
+        );
+        // 4. The successful narrow precedes the handshake and has no DNS rule.
+        let narrow2 = tokens[..handshake_ok]
+            .iter()
+            .rposition(|token| token == "flush")
+            .unwrap();
+        assert!(
+            narrow2 > resolve2 && narrow2 < handshake_ok,
+            "narrow#2 must precede the handshake: {tokens:?}"
+        );
+        assert!(
+            !tokens[narrow2..handshake_ok].contains(&"dns".to_string()),
+            "narrow#2 must close the DNS allowance: {tokens:?}"
+        );
+        // 5. No allowance leaks after the successful handshake.
+        assert!(
+            !tokens[handshake_ok..].contains(&"dns".to_string()),
+            "no DNS allowance may survive a successful handshake: {tokens:?}"
+        );
+        // The failing narrow really attempted the outer-endpoint rule.
+        assert!(
+            tokens[(handshake_fail.saturating_sub(4))..handshake_fail]
+                .contains(&"outer".to_string()),
+            "the failure must be a later rule, after the narrow flush: {tokens:?}"
+        );
     }
 }

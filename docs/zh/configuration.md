@@ -185,7 +185,7 @@ ipv6_mss     = inner_ip_mtu - 60
 `kill_switch: true` 创建按实例命名的 `inet rustvpn_killswitch_<hash>` 表，`output` 链策略为 `drop`，仅放行 loopback、TAP 接口、已解析的外层端点、DHCPv4，以及限定在物理接口上的 ICMPv6 ND/MLD 与 DHCPv6。它**只覆盖主机 `output`**，不保护 forward/LAN/NAT；分流 profile 会被拒绝。
 
 - **崩溃策略（fail-closed）**：正常断开/停止会删除表并恢复连通性，同时在 IPC socket 旁写入 clean-shutdown 标记。启动时若发现该标记，则清理遗留表；若**没有**标记，视为上次崩溃：保留 kill-switch 表（守护进程空闲期间主机仍 fail-closed），只删除非安全边界的 MSS 表，并在崩溃发生在建表中途时补建 `drop` 策略链，避免半套表静默放行。
-- 崩溃重启后的下一次连接会在保留 `drop` 策略的前提下工作：首次握手成功之前，每次解析远端主机名前都会重新打开**临时 DNS 放行**（UDP/TCP 53），随后把现有 `output` 链收窄为 loopback、刚解析出的外层端点和底层接口控制流量，并在握手前再次关闭该放行。若握手失败，缓存的端点会被丢弃，下一次重试会先重新打开 DNS 放行再解析，因此主机名远端不会陷入永久 DNS 被阻塞的死循环。握手成功后安装完整规则集（其中不含 DNS 放行）；若新 profile 未启用 kill switch 则删除该表。显式断开/停止始终删除保留表。
+- 崩溃重启后的下一次连接会在保留 `drop` 策略的前提下工作：首次握手成功之前，每次解析远端主机名前都会重新打开**临时 DNS 放行**（UDP/TCP 53），随后把现有 `output` 链收窄为 loopback、刚解析出的外层端点和底层接口控制流量，并在握手前再次关闭该放行。若握手失败，缓存的端点会被丢弃，下一次重试会先重新打开 DNS 放行再解析，因此主机名远端不会陷入永久 DNS 被阻塞的死循环。若收窄过程中 flush 已成功但后续规则失败，同样按“放行已关闭”处理：引擎在下次解析前重新打开 DNS 放行（期间保留表始终 fail-closed）。握手成功后安装完整规则集（其中不含 DNS 放行）；若新 profile 未启用 kill switch 则删除该表。显式断开/停止始终删除保留表。
 - 表名后缀由 IPC socket 路径哈希得到，同一 netns 的其它 RustVPN 实例不受影响。systemd unit 不执行全局 `nft delete`（会与其它实例竞争，且要求宿主 PATH 中有 `nft`）。
 - 若自动恢复无法运行（例如缺少 `nft` 或链只创建了一半），只手工清理本实例的表：
 

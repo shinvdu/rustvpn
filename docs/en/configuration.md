@@ -645,7 +645,10 @@ traffic is blocked while connected.
   resolved outer endpoint and underlay control traffic — closing the allowance
   again before the handshake.  If the handshake fails, the cached endpoint is
   discarded and the next retry re-opens the DNS allowance before resolving, so
-  a hostname remote cannot become permanently DNS-blocked.  After a successful
+  a hostname remote cannot become permanently DNS-blocked.  A narrowing that
+  fails after flushing the chain is handled the same way: the daemon records
+  the allowance as closed and re-opens it before the next lookup (the table
+  stays fail-closed in the meantime).  After a successful
   handshake it installs the full current rule set (which contains no DNS
   allowance), or removes the table if the new profile does not request a kill
   switch.  An explicit disconnect/shutdown always removes the preserved table.
