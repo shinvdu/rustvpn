@@ -436,6 +436,12 @@ pub struct RestorePlan {
     disabled_raw: Option<String>,
 }
 
+impl RestorePlan {
+    pub fn files(&self) -> &ConfigFiles {
+        &self.files
+    }
+}
+
 pub fn plan_restore(paths: &ConfigPaths, name: &str) -> Result<RestorePlan, ConfigError> {
     if name.contains('/') || name.contains('\\') || name.contains("..") {
         return Err(ConfigError::Invalid("invalid backup name".into()));
@@ -483,7 +489,7 @@ pub fn plan_restore(paths: &ConfigPaths, name: &str) -> Result<RestorePlan, Conf
 
 pub fn restore(paths: &ConfigPaths, name: &str) -> Result<(), ConfigError> {
     let plan = plan_restore(paths, name)?;
-    write_restore(paths, &plan)
+    apply_restore(paths, &plan)
 }
 
 /// Restore a backup after checking that every script path stays inside the
@@ -498,10 +504,10 @@ pub fn restore_checked(
     for (name, peer) in plan.files.enabled.iter().chain(plan.files.disabled.iter()) {
         validate_script_allowlist(name, peer, allowed_dirs)?;
     }
-    write_restore(paths, &plan)
+    apply_restore(paths, &plan)
 }
 
-fn write_restore(paths: &ConfigPaths, plan: &RestorePlan) -> Result<(), ConfigError> {
+pub fn apply_restore(paths: &ConfigPaths, plan: &RestorePlan) -> Result<(), ConfigError> {
     if let Some(raw) = &plan.enabled_raw {
         write_atomic(&paths.enabled, raw.as_bytes())?;
     }

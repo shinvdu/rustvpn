@@ -82,7 +82,10 @@ impl History {
                 let tracked = last.get(&session.session_id);
                 let delta = match tracked {
                     Some(prev) => session.counters.delta_since(&prev.counters),
-                    None => session.counters,
+                    // No baseline (e.g. a session discovered without a start
+                    // event yet): report zero rather than attributing all
+                    // traffic accumulated before this process started.
+                    None => Counters::default(),
                 };
                 rates.insert(
                     session.session_id,
@@ -136,6 +139,13 @@ impl History {
 
 impl SessionObserver for History {
     fn session_started(&self, start: SessionStart) {
+        {
+            let mut last = self.last.lock().unwrap();
+            last.entry(start.session_id).or_insert(Tracked {
+                peer_id: start.peer_id,
+                counters: start.counters,
+            });
+        }
         if self.tx.try_send(Cmd::Start(start)).is_err() {
             self.dropped.fetch_add(1, Ordering::Relaxed);
         }
@@ -218,10 +228,28 @@ mod tests {
         }
     }
 
+    fn started(id: u64, bytes: u64) -> SessionStart {
+        SessionStart {
+            session_id: id,
+            peer_id: [1u8; 16],
+            name: "alice".into(),
+            addr: "1.2.3.4:5".into(),
+            proto: "udp".into(),
+            mode: "plain".into(),
+            started_at: 1_000,
+            counters: Counters {
+                bytes_in: bytes,
+                bytes_out: bytes,
+                ..Counters::default()
+            },
+        }
+    }
+
     #[tokio::test]
     async fn records_deltas_and_rates() {
         let store = Arc::new(Store::open_in_memory().unwrap());
         let history = History::spawn(store.clone());
+        history.session_started(started(1, 0));
         history.record_tick(&[session(1, 100)], 10.0);
         let rates = history.rates();
         assert_eq!(rates.get(&1).unwrap().rate_in_bps, 10);
@@ -229,6 +257,34 @@ mod tests {
         let rates = history.rates();
         assert_eq!(rates.get(&1).unwrap().rate_in_bps, 20);
         // Let the worker drain the queue.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    #[tokio::test]
+    async fn does_not_attribute_preexisting_traffic_to_first_tick() {
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let history = History::spawn(store.clone());
+        // Reconcile sees a session that already transferred 100 bytes.
+        history.session_started(started(2, 100));
+        history.record_tick(&[session(2, 100)], 10.0);
+        let rates = history.rates();
+        assert_eq!(rates.get(&2).unwrap().rate_in_bps, 0);
+        history.record_tick(&[session(2, 300)], 10.0);
+        let rates = history.rates();
+        assert_eq!(rates.get(&2).unwrap().rate_in_bps, 20);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    #[tokio::test]
+    async fn unknown_session_baselines_at_zero() {
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let history = History::spawn(store.clone());
+        history.record_tick(&[session(3, 100)], 10.0);
+        let rates = history.rates();
+        assert_eq!(rates.get(&3).unwrap().rate_in_bps, 0);
+        history.record_tick(&[session(3, 200)], 10.0);
+        let rates = history.rates();
+        assert_eq!(rates.get(&3).unwrap().rate_in_bps, 10);
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }

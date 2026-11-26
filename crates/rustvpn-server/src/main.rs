@@ -289,7 +289,7 @@ struct Reloader {
     path: PathBuf,
     store: ConfigStore,
     requests: mpsc::Sender<MainRequest>,
-    script_dirs: Vec<PathBuf>,
+    script_dirs: Arc<Vec<PathBuf>>,
     events: Mutex<Option<broadcast::Sender<Event>>>,
     guard: tokio::sync::Mutex<()>,
     last_bytes: Mutex<Option<Vec<u8>>>,
@@ -305,7 +305,7 @@ impl Reloader {
         requests: mpsc::Sender<MainRequest>,
         initial_bytes: Option<Vec<u8>>,
         generation: u64,
-        script_dirs: Vec<PathBuf>,
+        script_dirs: Arc<Vec<PathBuf>>,
         events: Option<broadcast::Sender<Event>>,
     ) -> Self {
         Self {
@@ -472,6 +472,20 @@ impl ControlRuntime {
 ///
 /// This closes the escalation path where a non-privileged admin process can
 /// write `peers.yaml` and point it at a script it controls.
+fn validate_proposed_config(enabled_yaml: &str, script_dirs: &[PathBuf]) -> Result<()> {
+    let set = ConfigSet::from_str(enabled_yaml).context("parse proposed peers.yaml")?;
+    validate_script_paths(&set, script_dirs)
+}
+
+fn validate_control_configuration(control: &str, script_dirs: &[PathBuf]) -> Result<()> {
+    if !control.is_empty() && script_dirs.is_empty() {
+        bail!(
+            "-control requires at least one -script-dir; refusing to expose admin control without a script allow-list"
+        );
+    }
+    Ok(())
+}
+
 fn validate_script_paths(set: &ConfigSet, script_dirs: &[PathBuf]) -> Result<()> {
     if script_dirs.is_empty() {
         return Ok(());
@@ -484,6 +498,9 @@ fn validate_script_paths(set: &ConfigSet, script_dirs: &[PathBuf]) -> Result<()>
         })
         .collect::<Result<Vec<_>>>()?;
     let server_uid = server_euid();
+    for dir in &allowed {
+        validate_dir_safe("script", dir, server_uid)?;
+    }
     for peer in &set.peers {
         for (label, script) in [("up", &peer.up), ("down", &peer.down)] {
             if script.is_empty() {
@@ -506,25 +523,62 @@ fn server_euid() -> Option<u32> {
     fields.next()?.parse().ok() // effective uid
 }
 
+/// Directories on the script path must not be writable by the admin group:
+/// otherwise rename(2) can replace a root-owned script after the config has
+/// been accepted, and the next up/down call would execute the replacement.
+fn validate_dir_safe(label: &str, dir: &Path, server_uid: Option<u32>) -> Result<()> {
+    let metadata = std::fs::metadata(dir)
+        .with_context(|| format!("stat {label} directory {}", dir.display()))?;
+    if !metadata.is_dir() {
+        bail!("{label} directory {} is not a directory", dir.display());
+    }
+    if metadata.mode() & 0o022 != 0 {
+        bail!(
+            "{label} directory {} is writable by group or others",
+            dir.display()
+        );
+    }
+    if metadata.uid() != 0 && Some(metadata.uid()) != server_uid {
+        bail!(
+            "{label} directory {} is not owned by root or the server user",
+            dir.display()
+        );
+    }
+    Ok(())
+}
+
 fn validate_script_path(
     label: &str,
     path: &Path,
     allowed: &[PathBuf],
     server_uid: Option<u32>,
 ) -> Result<()> {
+    if allowed.is_empty() {
+        return Ok(());
+    }
     let canonical = path
         .canonicalize()
         .with_context(|| format!("resolve {label} script {}", path.display()))?;
-    if !allowed.iter().any(|dir| canonical.starts_with(dir)) {
+    let Some(allowed_dir) = allowed.iter().find(|dir| canonical.starts_with(dir)) else {
         bail!(
             "{label} script {} is outside the allowed -script-dir list",
             path.display()
         );
-    }
+    };
     let metadata = std::fs::metadata(&canonical)
         .with_context(|| format!("stat {label} script {}", path.display()))?;
     if !metadata.is_file() {
         bail!("{label} script {} is not a regular file", path.display());
+    }
+    // Validate every directory from the allowed root down to the script's
+    // parent; a writable intermediate directory allows admin-group rename.
+    let mut cursor = canonical.parent();
+    while let Some(dir) = cursor {
+        validate_dir_safe(label, dir, server_uid)?;
+        if dir == allowed_dir.as_path() {
+            break;
+        }
+        cursor = dir.parent();
     }
     if metadata.mode() & 0o022 != 0 {
         bail!(
@@ -556,6 +610,8 @@ struct ServerContext {
     reloader: Arc<Reloader>,
     metrics: Arc<ServerMetrics>,
     control: Option<Arc<ControlRuntime>>,
+    script_dirs: Arc<Vec<PathBuf>>,
+    server_uid: Option<u32>,
     instance: u64,
     bind: String,
     proto: String,
@@ -640,7 +696,7 @@ async fn end_session(ctx: &ServerContext, entry: Arc<PeerEntry>, reason: EndReas
         });
     }
     if !matches!(reason, EndReason::Replaced) {
-        call_down(&entry.cfg.down, entry.tap.name(), &entry.addr.to_string()).await;
+        call_down_checked(ctx, &entry.cfg, entry.tap.name(), &entry.addr.to_string()).await;
     }
 }
 
@@ -703,10 +759,42 @@ async fn take_old_peer(ctx: &ServerContext, id: [u8; 16]) -> Option<Arc<Tap>> {
 /// Open a fresh TAP for one peer.  The up script runs first (GoVPN
 /// contract) and is expected to create the persistent device; scripts are
 /// time-bounded by `run_script`.
-async fn open_tap(cfg: &PeerConfig, remote: &str) -> Result<(Arc<Tap>, String)> {
+async fn run_up_checked(
+    ctx: &ServerContext,
+    cfg: &PeerConfig,
+    remote: &str,
+) -> Result<Option<String>> {
+    if cfg.up.is_empty() {
+        return Ok(None);
+    }
+    validate_script_path("up", Path::new(&cfg.up), &ctx.script_dirs, ctx.server_uid)?;
+    run_script(&cfg.up, &cfg.iface, remote).await
+}
+
+async fn call_down_checked(ctx: &ServerContext, cfg: &PeerConfig, iface: &str, remote: &str) {
+    if cfg.down.is_empty() {
+        return;
+    }
+    if let Err(error) = validate_script_path(
+        "down",
+        Path::new(&cfg.down),
+        &ctx.script_dirs,
+        ctx.server_uid,
+    ) {
+        eprintln!("down script rejected: {error:#}");
+        return;
+    }
+    call_down(&cfg.down, iface, remote).await;
+}
+
+async fn open_tap(
+    ctx: &ServerContext,
+    cfg: &PeerConfig,
+    remote: &str,
+) -> Result<(Arc<Tap>, String)> {
     let mut iface = cfg.iface.clone();
     if !cfg.up.is_empty() {
-        if let Some(out) = run_script(&cfg.up, &cfg.iface, remote).await? {
+        if let Some(out) = run_up_checked(ctx, cfg, remote).await? {
             if cfg.iface.is_empty() {
                 iface = out.lines().next().unwrap_or("").trim().to_string();
             }
@@ -742,7 +830,7 @@ async fn create_udp_peer(
 ) -> Result<()> {
     let tap = match take_old_peer(ctx, cfg.id).await {
         Some(t) => t,
-        None => open_tap(&cfg, &addr.to_string()).await?.0,
+        None => open_tap(ctx, &cfg, &addr.to_string()).await?.0,
     };
     let stats = LiveStats::new(
         addr.to_string(),
@@ -774,8 +862,11 @@ async fn create_udp_peer(
         inbound: handle.inbound,
         proto: "udp",
     });
-    ctx.registry.insert(entry.clone());
+    // Publish the start event before the registry entry becomes visible:
+    // any subsequent end (kick/timeout/reload) can only happen after the
+    // insert, so subscribers observe start before end.
     notify_session_started(ctx, &entry);
+    ctx.registry.insert(entry.clone());
     eprintln!("peer created: {addr}");
     Ok(())
 }
@@ -1124,7 +1215,7 @@ async fn handle_tcp_conn(mut stream: TcpStream, ctx: ServerContext) -> Result<()
     // creation or the up script fails.
     let tap = match take_old_peer(&ctx, cfg.id).await {
         Some(t) => t,
-        None => open_tap(&cfg, &addr.to_string()).await?.0,
+        None => open_tap(&ctx, &cfg, &addr.to_string()).await?.0,
     };
     stream.write_all(&msg4).await?;
     let (read, write) = stream.into_split();
@@ -1182,8 +1273,11 @@ async fn create_tcp_peer(
         inbound: None,
         proto: "tcp",
     });
-    ctx.registry.insert(entry.clone());
+    // Publish the start event before the registry entry becomes visible:
+    // any subsequent end (kick/timeout/reload) can only happen after the
+    // insert, so subscribers observe start before end.
     notify_session_started(ctx, &entry);
+    ctx.registry.insert(entry.clone());
     eprintln!("peer created: {addr}");
     Ok(())
 }
@@ -1282,27 +1376,33 @@ fn main() {
     }
 }
 
+fn random_token_base() -> u64 {
+    let mut rng = OsRng;
+    let value = rng.next_u64() & ((1u64 << 52) - 1);
+    if value == 0 {
+        1
+    } else {
+        value
+    }
+}
+
 async fn run(args: Args) -> Result<()> {
     if args.proto != "udp" && args.proto != "tcp" && args.proto != "all" {
         return Err(anyhow!("Unknown protocol specified"));
     }
     let conf_path = PathBuf::from(&args.conf);
     let set = ConfigSet::from_file(&conf_path)?;
-    let script_dirs: Vec<PathBuf> = args.script_dir.iter().map(PathBuf::from).collect();
+    let script_dirs: Arc<Vec<PathBuf>> =
+        Arc::new(args.script_dir.iter().map(PathBuf::from).collect());
+    validate_control_configuration(&args.control, &script_dirs)?;
     validate_script_paths(&set, &script_dirs)?;
+    let server_uid = server_euid();
 
     // Session identifiers must not collide across server restarts: the admin
-    // history database keys sessions by this value.  Start the process-local
-    // counter at a random 64-bit base and expose it as `server_instance`.
-    let instance = {
-        let mut rng = OsRng;
-        let value = rng.next_u64();
-        if value == 0 {
-            1
-        } else {
-            value
-        }
-    };
+    // history database keys sessions by this value.  A 52-bit base keeps the
+    // SQLite key positive (i64) and avoids JavaScript Number precision loss
+    // for any API consumer that treats session ids as numbers.
+    let instance = random_token_base();
     NEXT_PEER_TOKEN.store(instance, AtomicOrdering::Relaxed);
     let metrics = Arc::new(ServerMetrics::default());
     let control = if args.control.is_empty() {
@@ -1324,7 +1424,7 @@ async fn run(args: Args) -> Result<()> {
         requests_tx.clone(),
         initial_bytes,
         1,
-        script_dirs,
+        script_dirs.clone(),
         control.as_ref().map(|runtime| runtime.sender()),
     ));
 
@@ -1342,6 +1442,8 @@ async fn run(args: Args) -> Result<()> {
         reloader: reloader.clone(),
         metrics: metrics.clone(),
         control: control.clone(),
+        script_dirs: script_dirs.clone(),
+        server_uid,
         instance,
         bind: args.bind.clone(),
         proto: args.proto.clone(),
@@ -1699,6 +1801,19 @@ async fn handle_control_connection(mut stream: UnixStream, ctx: ServerContext) -
                     .unwrap_or_default();
                 write_frame(&mut stream, &Response::RecentSessions { sessions }).await?;
             }
+            Request::ValidateConfig { enabled_yaml } => {
+                let response = match validate_proposed_config(&enabled_yaml, &ctx.script_dirs) {
+                    Ok(()) => Response::ConfigValidation {
+                        valid: true,
+                        errors: Vec::new(),
+                    },
+                    Err(error) => Response::ConfigValidation {
+                        valid: false,
+                        errors: vec![format!("{error:#}")],
+                    },
+                };
+                write_frame(&mut stream, &response).await?;
+            }
             Request::Subscribe => {
                 let Some(control) = &ctx.control else {
                     write_frame(
@@ -1830,18 +1945,25 @@ mod tests {
         path
     }
 
+    fn secure_dir() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        dir
+    }
+
     #[test]
     fn accepts_script_in_allowed_directory() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = secure_dir();
         let allowed = dir.path().canonicalize().unwrap();
         let path = script(dir.path(), 0o755);
         let uid = server_euid();
-        assert!(validate_script_path("up", &path, &[allowed], uid).is_ok());
+        let result = validate_script_path("up", &path, &[allowed], uid);
+        assert!(result.is_ok(), "{result:?}");
     }
 
     #[test]
     fn rejects_group_writable_script() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = secure_dir();
         let allowed = dir.path().canonicalize().unwrap();
         let path = script(dir.path(), 0o775);
         let uid = server_euid();
@@ -1851,8 +1973,8 @@ mod tests {
 
     #[test]
     fn rejects_script_outside_allowed_directories() {
-        let allowed_dir = tempfile::tempdir().unwrap();
-        let other_dir = tempfile::tempdir().unwrap();
+        let allowed_dir = secure_dir();
+        let other_dir = secure_dir();
         let allowed = allowed_dir.path().canonicalize().unwrap();
         let path = script(other_dir.path(), 0o755);
         let uid = server_euid();
@@ -1862,10 +1984,64 @@ mod tests {
 
     #[test]
     fn rejects_directory_as_script() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = secure_dir();
         let allowed = dir.path().canonicalize().unwrap();
         let uid = server_euid();
         let error = validate_script_path("up", dir.path(), &[allowed], uid).unwrap_err();
-        assert!(error.to_string().contains("not a regular file"));
+        assert!(
+            error.to_string().contains("not a regular file"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn control_requires_a_script_allowlist() {
+        assert!(validate_control_configuration("/run/rustvpn/control.sock", &[]).is_err());
+        assert!(validate_control_configuration(
+            "/run/rustvpn/control.sock",
+            &[PathBuf::from("/etc/rustvpn/scripts")]
+        )
+        .is_ok());
+        assert!(validate_control_configuration("", &[]).is_ok());
+    }
+
+    #[test]
+    fn rejects_group_writable_script_directory() {
+        let dir = secure_dir();
+        let path = script(dir.path(), 0o755);
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o775)).unwrap();
+        let allowed = dir.path().canonicalize().unwrap();
+        let uid = server_euid();
+        let error = validate_script_path("up", &path, &[allowed], uid).unwrap_err();
+        assert!(error.to_string().contains("directory"));
+        assert!(error.to_string().contains("writable by group or others"));
+    }
+
+    #[test]
+    fn proposed_config_uses_server_script_policy() {
+        use rustvpn_crypto::verifier::Verifier;
+
+        let dir = secure_dir();
+        let allowed = dir.path().canonicalize().unwrap();
+        let up = script(dir.path(), 0o755);
+        let mut verifier = Verifier::new(1024, 2, 1, [7u8; 16]);
+        verifier.password_apply("test").unwrap();
+        let yaml = format!(
+            "alice:\n  iface: tap0\n  up: {}\n  verifier: '{}'\n",
+            up.display(),
+            verifier.long_form().unwrap()
+        );
+        assert!(validate_proposed_config(&yaml, std::slice::from_ref(&allowed)).is_ok());
+        let bad = yaml.replace(&up.display().to_string(), "/tmp/not-allowed.sh");
+        assert!(validate_proposed_config(&bad, &[allowed]).is_err());
+    }
+
+    #[test]
+    fn token_base_is_52_bit() {
+        for _ in 0..32 {
+            let value = random_token_base();
+            assert!(value > 0);
+            assert!(value < (1u64 << 52));
+        }
     }
 }

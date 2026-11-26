@@ -13,7 +13,7 @@ Browser ──TLS──▶ Caddy/Nginx ──▶ rustvpn-admind
                                   └─ 配置校验 / 备份 / 写 peers.yaml
                                            │
                                            │ /run/rustvpn/control.sock
-                                           │ 本地 JSON-RPC + peer 凭据
+                                           │ 长度前缀 JSON + peer 凭据
                                   rustvpn-server
                                   ├─ UDP/TCP/TAP 数据面
                                   └─ status/sessions/kick/reload/subscribe
@@ -21,7 +21,7 @@ Browser ──TLS──▶ Caddy/Nginx ──▶ rustvpn-admind
 
 - `rustvpn-server` 不链接 axum/SQLite/静态资源，不因管理端故障而退出。
 - `rustvpn-admind` 以独立用户运行，**不需要 `CAP_NET_ADMIN`**；只通过控制 socket 踢线/触发热重载，通过文件读写配置。
-- 未启用 `-control` 时，server 与之前完全一致；admind 仍可启动，但处于“服务端离线：仅配置/历史”模式。
+- 未启用 `-control` 时，server 与之前完全一致；admind 仍可启动，但处于“服务端离线：只读查看配置/备份/历史，不能应用配置”模式。
 
 ## 功能
 
@@ -87,7 +87,7 @@ sudo rustvpn-admind -listen 127.0.0.1:8080 \
 |---|---|---|
 | `-control PATH` | 空（禁用） | 本地控制 socket；启用后管理端才能读取实时会话/踢线/立即重载 |
 | `-control-group GROUP` | 空 | socket 属组（组名或数字 gid）；设置后模式为 `0660`，否则 `0600` |
-| `-script-dir PATH` | 空（不限制） | 可重复；**server 侧**强制 up/down 路径白名单 |
+| `-script-dir PATH` | 空（不限制） | 可重复；**server 侧**强制 up/down 路径白名单。启用 `-control` 时**至少需要一个**，否则 server 拒绝启动 |
 
 `rustvpn-admind` 参数：
 
@@ -100,7 +100,7 @@ sudo rustvpn-admind -listen 127.0.0.1:8080 \
 | `-disabled-conf PATH` | `-conf` 同目录的 `peers.disabled.yaml` | 禁用配置 |
 | `-backup-dir PATH` | `-db` 同目录的 `backups/` | 配置备份 |
 | `-cookie-secure` | 关 | 设置 `Secure` 与 `__Host-` Cookie；经 TLS 反代时启用 |
-| `-script-dir PATH` | 空 | 可重复；与 server 使用同一白名单，用于 UI 侧校验 |
+| `-script-dir PATH` | 空 | 可重复；用于 UI 侧前缀校验；最终以 server 的 `validate_config` 预检为准 |
 
 旧的 `-admin*` 参数已移除；内嵌模式不再提供。
 
@@ -175,7 +175,7 @@ sudo install -d -m 0750 -o rustvpn-admin -g rustvpn-adm \
     /var/lib/rustvpn /var/lib/rustvpn/backups
 ```
 
-脚本必须是 root 或 server 用户所有、且组/其他不可写，且文件必须已存在；管理端用户不能写脚本目录。违反时 server 拒绝加载配置并保留上一份有效配置。恢复备份同样要满足该白名单；若备份中的脚本已不在白名单，server 不会加载，需要先修正配置。
+脚本必须是 root 或 server 用户所有、且组/其他不可写，且文件必须已存在；**脚本路径上的每一级目录**也必须满足同样的属主/权限要求。管理端用户不能写脚本目录。启用 `-control` 而未提供 `-script-dir` 时 server 拒绝启动。违反时 server 拒绝加载配置并保留上一份有效配置；每次执行 up/down 前还会重新校验，防止配置加载后脚本被替换。恢复备份同样要满足该白名单；若备份中的脚本已不在白名单，server 不会加载，需要先修正配置。
 
 ## 暴露方式
 
@@ -198,7 +198,7 @@ vpn-admin.example.com {
 - `rustvpn-admind` 没有 `CAP_NET_ADMIN`，不能直接操作 TAP/路由；踢线和重载通过受控命令完成。
 - 控制 socket 只允许 admind 用户/组；server 额外用 `SO_PEERCRED` 校验（root 或 socket 属组）。不监听 TCP。
 - 管理端**不允许**编辑/上传 up/down 脚本内容，只能填写路径；server 侧 `-script-dir` + 所有权/权限校验是最终防线。
-- 配置写入：渲染 → 用 server 同一套 `ConfigSet` 校验 → 备份 → 同目录临时文件 → fsync → rename → 调用 `reload`。校验失败不会写盘。
+- 配置写入：渲染 → 用 server 同一套 `ConfigSet` 校验 → 调用 server `validate_config` 做脚本/路径预检 → 备份 → 同目录临时文件 → fsync → rename → 调用 `reload`。任何一步失败都不会写盘；server 离线时预检失败，因此不会写盘。
 - 配置写入使用 ETag 乐观锁；若期间有人手工改了文件，接口返回 409。
 - YAML 注释会在管理端写入时丢失；手工注释请放在独立文档或备注字段中。
 - `/metrics` 与 `/healthz` 不鉴权；它们只在管理端监听地址上暴露，默认回环。
@@ -225,9 +225,10 @@ vpn-admin.example.com {
 - 采样周期 10 秒：admind 通过控制面拉取活动会话，并订阅 `session_started`/`session_ended`（含最终计数）。
 - admind 单独重启不会结束在线会话：重连后按 server 的活动会话与最近结束事件对账，只把 server 已不认识的开放记录标记为 `server_restart`。
 - server 保留最近 1024 条结束事件用于重连对账；admind 停机超过该窗口会丢失这段历史，但活动会话恢复后会重新开始记录。
-- 每个 server 启动生成随机 64 位 `server_instance` 并作为进程内会话号的基数，避免重启后与历史行撞号；`/api/system/status` 会返回该值。
+- 每个 server 启动生成随机 52 位 `server_instance` 并作为进程内会话号的基数，避免重启后与历史行撞号；`/api/system/status` 会返回该值。
 - `BytesIn/Out` 是线路字节（含心跳、noise/CPR 填充、encless 膨胀）；`BytesPayloadIn/Out` 是 TAP 载荷。计费时请明确口径。
 - 建议只运行一个 admind 实例；SQLite WAL 允许并发读，但两个实例会重复采样/互相覆盖事件状态。
+- 会话 id 以每次 server 启动的 52 位随机基数为起点，保证 SQLite 正数主键，并避免前端/外部消费者按 JS Number 使用时丢失精度。
 
 ## API 摘要
 
@@ -261,6 +262,7 @@ GET  /healthz /readyz
 ## 已知限制
 
 - 控制面是本地 Unix socket；不支持跨机管理 server（远程浏览器仍可经反代访问 admind，但控制通道必须在本机）。
+- **server 离线时不能应用/恢复配置**：admind 需要先调用 server 的 `validate_config` 预检；离线时仍可查看配置、预览 diff、查看备份/历史/审计。这是为了避免留下 server 下次启动会拒绝的配置。
 - admind 停机期间没有采样；server 环形缓冲之外的结束事件会丢失。
 - 配额只展示，不自动禁用/限速；带宽整形未实现。
 - TOTP 未实现；角色只区分 admin/viewer。
@@ -274,7 +276,10 @@ GET  /healthz /readyz
 | `admin endpoint ... no admin user` | 先运行 `rustvpn-admin-passwd` |
 | 页面显示“服务端离线”/`control unavailable` | server 未运行、未加 `-control`，或路径不一致 |
 | 连接 socket 报 `Permission denied` | admind 的主组必须是 socket 属组；检查 socket `0660` 与目录权限 |
-| 应用配置返回 `applied:false` + warning | 配置已写盘但 server 离线；server 恢复后启动/60 秒内加载 |
+| 应用配置报 `server config preflight failed` | server 离线或控制面不可达；配置未写盘，恢复 server 后重试 |
+| 应用配置返回 `applied:false` + warning | 预检通过并已写盘，但提交后 server 掉线；server 恢复后 60 秒内加载 |
+| server 启动报 `-control requires at least one -script-dir` | 启用管理端时必须配置脚本白名单 |
+| server 启动报 `script directory ... writable by group or others` | 脚本目录/路径上的某一级可被管理组写入；改成 root/server 所有且 `0755` |
 | server 拒绝配置：`script ... outside ...` | 调整 `-script-dir` 或脚本位置；脚本须 root/server 所有且不可组写 |
 | 应用配置返回 409 | 文件在编辑期间被外部修改；重新加载后重试 |
 | 流量图为空 | 尚无 10 秒采样或该会话无载荷；保持会话运行一段时间 |

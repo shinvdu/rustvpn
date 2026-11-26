@@ -7,14 +7,17 @@ These files are templates for a split deployment:
   no capabilities.
 
 The server works without the admin daemon. Only add the second unit (and the
-`-control` flag) when you want live sessions/kick/reload from the UI.
+`-control` flag) when you want live sessions/kick/reload from the UI. Enabling
+`-control` requires at least one `-script-dir`; the admin daemon refuses to
+write configuration while the server is offline because it cannot preflight it.
 
 ## Users, groups and directories
 
 ```bash
+sudo groupadd --system rustvpn
 sudo groupadd --system rustvpn-adm
 sudo useradd --system --no-create-home --shell /usr/sbin/nologin \
-    --groups rustvpn-adm rustvpn
+    --gid rustvpn --groups rustvpn-adm rustvpn
 sudo useradd --system --no-create-home --shell /usr/sbin/nologin \
     --gid rustvpn-adm rustvpn-admin
 

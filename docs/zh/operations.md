@@ -228,6 +228,7 @@ rustvpn-admind -listen 127.0.0.1:8080 -control /run/rustvpn/control.sock \
 要点：
 
 - `rustvpn-admind` 不需要 `CAP_NET_ADMIN`，以独立用户运行；踢线/立即重载经控制命令完成。
+- 启用控制 socket 时必须提供至少一个 `-script-dir`；脚本目录及路径上的各级目录需 root/server 所有且组/其他不可写。配置应用前会由 server 预检，server 离线时只读。
 - 默认只绑回环；远程访问用 SSH 隧道或 TLS 反代，并在启用了 TLS 时加 `-cookie-secure`。
 - 管理端要写 `peers.yaml`/备份，unit 需允许 `ReadWritePaths=/etc/rustvpn /var/lib/rustvpn`，目录组可写；脚本目录必须 root 所有且管理组不可写（见[管理端文档](../admin-web-ui.md)）。
 - 管理端可禁用/轮换/踢下线，但**不能编辑 `up`/`down` 脚本内容**；server 侧 `-script-dir` 是最终校验。

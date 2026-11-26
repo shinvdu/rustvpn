@@ -43,7 +43,7 @@ MVP 已在分支 `feature/admin-web-ui` 落地，使用说明见 [`admin-web-ui.
 
 已实现：feature 门控、Argon2id 登录 + 会话 + CSRF + 登录限速、客户端/会话列表、10 秒采样与 1h/24h/7d/30d 图表、会话历史、终身/月度用量、新增/编辑/禁用/启用/删除/轮换/踢下线、配置预览/应用/备份/恢复、审计、SSE、Prometheus、健康检查、systemd/反代文档、API 与配置写入测试、musl admin 构建检查。
 
-**已知正确性问题（已修复，见 0.3）**：`NEXT_PEER_TOKEN` 原是进程内计数器，每次 server 启动从 1 开始；SQLite 的 `session` 表以 `session_id = token` 为主键。server 重启后新会话会与历史行撞号，导致 `INSERT OR IGNORE` 丢会话、`UPDATE ... WHERE session_id` 改到旧行。现在每次启动生成随机 64 位 `server_instance` 并作为 token 基数，既避免撞号又无需改 schema。
+**已知正确性问题（已修复，见 0.3）**：`NEXT_PEER_TOKEN` 原是进程内计数器，每次 server 启动从 1 开始；SQLite 的 `session` 表以 `session_id = token` 为主键。server 重启后新会话会与历史行撞号，导致 `INSERT OR IGNORE` 丢会话、`UPDATE ... WHERE session_id` 改到旧行。现在每次启动生成 52 位随机 `server_instance` 并作为 token 基数，既避免撞号、保持 SQLite 正数主键，又无需改 schema。
 
 ---
 
@@ -68,7 +68,7 @@ rustvpn-admind（HTTP UI + SQLite + 采样 + 审计）
 - `rustvpn-admind`（名称暂定，也可继续叫 `rustvpn-admin`）：独立二进制/服务，承载管理 API、内嵌 UI、管理员认证、SQLite 历史/审计、配置校验与备份。
 - 共享库：`rustvpn-crypto`、`rustvpn-proto`、`rustvpn-net`（`ConfigSet`/`StatsState`/`PeerStats`），新增 `rustvpn-control`（协议 DTO + 客户端/服务端骨架）。
 - **即时踢线与立即生效仍然成立**：管理端通过 `kick`、`reload` 控制命令，服务端在主循环里走同一个 `end_session()` 路径，不需要 60 秒轮询。
-- 服务端可以在完全没有管理端的情况下独立运行；管理端可以在服务端离线时降级为“配置/历史查看”，恢复后自动重连。
+- 服务端可以在完全没有管理端的情况下独立运行；管理端在服务端离线时降级为只读的配置/备份/历史查看，恢复后自动重连。
 
 ### 为什么改
 
@@ -132,7 +132,7 @@ subscribe                        -> 事件流（见下）
 - `AdminBackend` 保留，但实现从 `ServerBackend` 换成 `ControlBackend`：
   - `system_status`/`sessions`/`kick` 走控制协议；
   - 配置读取/预览/写入/备份仍在管理端本地完成（复用 `config_edit` 与 `ConfigSet`）；
-  - `apply_config` 写盘后调用 `reload`；控制面离线时返回“已写入，等待 server 重载（≤60s）”，UI 显示 pending。
+  - `apply_config` 先调用 server 的 `validate_config` 预检，再写盘并调用 `reload`；控制面离线时预检失败，拒绝写盘。
 - `history` 采样器改造：
   - 每 10 秒通过 `sessions` 拉取活动会话（含计数）计算速率；
   - 订阅 `session_started`/`session_ended` 获取会话边界与最终计数；
@@ -226,7 +226,7 @@ ReadWritePaths=/etc/rustvpn /var/lib/rustvpn
 
 相对 0.2 方案的实现取舍：
 
-- **会话唯一性**：没有新增 `(server_instance, token)` 复合主键；每次 server 启动生成随机 64 位 `server_instance` 并作为 `NEXT_PEER_TOKEN` 的基数，`session_id` 仍为 u64。效果相同且无需迁移 SQLite schema；status/事件均暴露 `server_instance`。
+- **会话唯一性**：没有新增 `(server_instance, token)` 复合主键；每次 server 启动生成随机 52 位 `server_instance` 并作为 `NEXT_PEER_TOKEN` 的基数，`session_id` 仍为 u64。效果相同且无需迁移 SQLite schema；status/事件均暴露 `server_instance`。
 - **控制协议**：长度前缀 JSON，不是完整 JSON-RPC；`hello` 强制版本匹配。`subscribe` 在响应 `Subscribed` 后单向推送事件；服务端用广播通道 + 最近 1024 条结束事件环形缓冲。
 - **认证**：socket 模式 `0600`（未配组）或 `0660`（配组）；配组时用 `SO_PEERCRED` 校验 root 或 primary gid。admind 服务因此应把共享组设为主组（systemd `Group=`）。
 - **脚本安全**：`-script-dir` 由 **server** 强制；脚本须位于白名单目录、常规文件、组/其他不可写、属主为 root 或 server 有效 uid。配置校验失败时保留上一份有效配置。
@@ -242,7 +242,17 @@ ReadWritePaths=/etc/rustvpn /var/lib/rustvpn
 - `cargo clippy --workspace --all-targets -- -D warnings`
 - `cargo test --workspace`（含 control framing、脚本白名单、既有 admin API/存储测试）
 - 真实进程烟测：server + admind + passwd；登录、创建/禁用客户端、配置 generation 递增、备份、server 停机/重启、admind 自动重连、离线状态与事件。
-- 未覆盖：真实 TAP 客户端接入后的在线会话历史/踢线（需要 root/CAP_NET_ADMIN 与真实客户端）；控制面大量并发/长期 lag 的压测。
+- 已用用户命名空间 + 真实 TAP 客户端验证在线会话、kick、最终计数与 `admin_kick` 历史；控制面大量并发/长期 lag 仍未压测。
+
+审查后补强（2026-11-26）：
+
+- 启用 `-control` 时强制要求至少一个 `-script-dir`，否则 server 拒绝启动。
+- 脚本路径上的每一级目录都必须 root/server 所有且组/其他不可写；执行 up/down 前重新校验，防止配置加载后替换脚本。
+- 新增控制命令 `validate_config`：admind 写盘前用 server 的解析器与脚本策略预检；server 离线时拒绝应用/恢复，避免留下无法启动的配置。
+- admind 首次采样跳过 `interval` 的立即 tick，并用 `SessionStart.counters` 建立基线；未知会话按零增量处理，避免重启后速率/分钟桶重复计入历史流量。
+- 控制调用按命令设置超时（kick/reload/validate 10s），远端业务错误不再把 UI 标记为离线。
+- 会话 id 基数改为 52 位，保证 SQLite 正数主键与 JS Number 安全；开始事件在注册表可见前发布，保证订阅者先看到 start 后看到 end。
+- `Store::open` 不再无条件关闭开放会话；由控制面对账保留 active/recent，只清理 server 已不认识的行。
 
 
 ---

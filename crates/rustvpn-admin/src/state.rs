@@ -52,6 +52,10 @@ impl AdminState {
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_secs(10));
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            // `interval` yields immediately; skipping that tick gives the
+            // control subscription time to establish baselines for sessions
+            // that were already active before this admin process started.
+            tick.tick().await;
             let mut last = Instant::now();
             loop {
                 tick.tick().await;

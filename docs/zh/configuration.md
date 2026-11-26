@@ -16,7 +16,7 @@
 | `-egd PATH` | 从 EGD unix socket 而非操作系统 RNG 读取随机性。 | 操作系统 RNG |
 | `-control PATH` | **可选**：本地管理控制 socket；启用后管理端可查看实时会话/踢线/立即重载。 | 禁用 |
 | `-control-group GROUP` | 控制 socket 属组（名称或数字 gid）；设置后模式为 `0660`。 | 空（`0600`，仅 owner） |
-| `-script-dir PATH` | 可重复；限制 up/down 脚本路径（server 侧强制）。 | 不限制 |
+| `-script-dir PATH` | 可重复；限制 up/down 脚本路径（server 侧强制）。启用 `-control` 时至少需要一个。 | 不限制（未启用 control 时） |
 | `-warranty` | 打印许可证担保声明并退出。 | — |
 
 管理端是独立进程 `rustvpn-admind`，参数与部署见 [`admin-web-ui.md`](../admin-web-ui.md)。server 未启用 `-control` 时与旧版行为一致。

@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use rustvpn_control as ctl;
-use rustvpn_control::client::{call_once, ControlClient};
+use rustvpn_control::client::{call_once, ControlClient, ControlError};
 use rustvpn_control::{Event, Request, Response};
 
 use crate::config_edit::{self, ConfigPaths};
@@ -85,20 +85,61 @@ impl ControlBackend {
 
     async fn call(&self, request: Request) -> Result<Response, String> {
         let path = self.control_path.clone();
-        let result = tokio::time::timeout(Duration::from_secs(3), call_once(path, &request)).await;
+        let timeout = match &request {
+            // The server waits up to 5s for a kick and may parse a full config
+            // on reload; do not undercut those operations with a 3s client
+            // timeout that reports failure while the action succeeds.
+            Request::Kick { .. } | Request::Reload | Request::ValidateConfig { .. } => {
+                Duration::from_secs(10)
+            }
+            _ => Duration::from_secs(3),
+        };
+        let result = tokio::time::timeout(timeout, call_once(path, &request)).await;
         match result {
             Ok(Ok(response)) => {
                 self.online.store(true, Ordering::Relaxed);
                 Ok(response)
             }
             Ok(Err(error)) => {
-                self.online.store(false, Ordering::Relaxed);
+                // A server-side application error (e.g. "peer is not online")
+                // proves the control plane is reachable; do not flip the UI
+                // to offline for it.
+                let reachable = matches!(error, ControlError::Remote(_));
+                self.online.store(reachable, Ordering::Relaxed);
                 Err(error.to_string())
             }
             Err(_) => {
                 self.online.store(false, Ordering::Relaxed);
                 Err("control request timed out".to_string())
             }
+        }
+    }
+
+    async fn prevalidate_config(&self, enabled_yaml: &str) -> Result<(), ConfigError> {
+        match self
+            .call(Request::ValidateConfig {
+                enabled_yaml: enabled_yaml.to_string(),
+            })
+            .await
+        {
+            Ok(Response::ConfigValidation { valid: true, .. }) => Ok(()),
+            Ok(Response::ConfigValidation {
+                valid: false,
+                errors,
+            }) => {
+                let message = if errors.is_empty() {
+                    "server rejected the proposed configuration".to_string()
+                } else {
+                    errors.join("; ")
+                };
+                Err(ConfigError::Invalid(message))
+            }
+            Ok(_) => Err(ConfigError::Io(
+                "unexpected config validation response".to_string(),
+            )),
+            Err(error) => Err(ConfigError::Io(format!(
+                "server config preflight failed: {error}"
+            ))),
         }
     }
 
@@ -471,6 +512,7 @@ impl AdminBackend for ControlBackend {
         for (name, peer) in files.enabled.iter().chain(files.disabled.iter()) {
             config_edit::validate_script_allowlist(name, peer, &self.script_dirs)?;
         }
+        self.prevalidate_config(&request.enabled_yaml).await?;
         let (_, _, _, revoked) = config_edit::diff(&current.files, &files);
         let paths = self.paths.clone();
         let report = tokio::task::spawn_blocking(move || config_edit::commit(&paths, &files))
@@ -524,12 +566,23 @@ impl AdminBackend for ControlBackend {
         let _guard = self.config_write.lock().await;
         let paths = self.paths.clone();
         let name = name.to_string();
-        let script_dirs = self.script_dirs.clone();
-        tokio::task::spawn_blocking(move || {
-            config_edit::restore_checked(&paths, &name, &script_dirs)
-        })
-        .await
-        .map_err(|error| ConfigError::Io(error.to_string()))??;
+        let plan = tokio::task::spawn_blocking(move || config_edit::plan_restore(&paths, &name))
+            .await
+            .map_err(|error| ConfigError::Io(error.to_string()))??;
+        for (peer_name, peer) in plan
+            .files()
+            .enabled
+            .iter()
+            .chain(plan.files().disabled.iter())
+        {
+            config_edit::validate_script_allowlist(peer_name, peer, &self.script_dirs)?;
+        }
+        let (enabled_yaml, _) = plan.files().render()?;
+        self.prevalidate_config(&enabled_yaml).await?;
+        let paths = self.paths.clone();
+        tokio::task::spawn_blocking(move || config_edit::apply_restore(&paths, &plan))
+            .await
+            .map_err(|error| ConfigError::Io(error.to_string()))??;
         let paths = self.paths.clone();
         let loaded = tokio::task::spawn_blocking(move || config_edit::load(&paths))
             .await

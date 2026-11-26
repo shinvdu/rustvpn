@@ -123,12 +123,24 @@ pub enum Event {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Request {
-    Hello { version: u32 },
+    Hello {
+        version: u32,
+    },
     Status,
     Sessions,
-    Kick { id: String, reason: String },
+    Kick {
+        id: String,
+        reason: String,
+    },
     Reload,
-    RecentSessions { limit: u32 },
+    RecentSessions {
+        limit: u32,
+    },
+    /// Preflight a proposed `peers.yaml` with the server's exact parser and
+    /// script policy.  Does not change the running configuration.
+    ValidateConfig {
+        enabled_yaml: String,
+    },
     Subscribe,
 }
 
@@ -154,6 +166,10 @@ pub enum Response {
     },
     RecentSessions {
         sessions: Vec<SessionEnded>,
+    },
+    ConfigValidation {
+        valid: bool,
+        errors: Vec<String>,
     },
     Subscribed,
     Error {
