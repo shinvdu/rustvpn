@@ -37,6 +37,23 @@ pub fn default_socket_path() -> PathBuf {
     user_runtime_dir().join("rustvpn").join("client.sock")
 }
 
+/// Candidate socket paths in preference order.
+///
+/// The GUI uses this instead of resolving once at startup: a system daemon may
+/// start after the GUI, and the per-user development daemon uses XDG.
+pub fn candidate_socket_paths() -> Vec<PathBuf> {
+    if let Some(path) = std::env::var_os(SOCKET_ENV) {
+        return vec![PathBuf::from(path)];
+    }
+    let system = PathBuf::from("/run/rustvpn-client/client.sock");
+    let user = user_runtime_dir().join("rustvpn").join("client.sock");
+    if system == user {
+        vec![system]
+    } else {
+        vec![system, user]
+    }
+}
+
 fn user_runtime_dir() -> PathBuf {
     if let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR") {
         if !dir.is_empty() {

@@ -485,7 +485,7 @@ fn peer_allowed(stream: &UnixStream, gid: Option<u32>) -> bool {
     let Ok(cred) = stream.peer_cred() else {
         return false;
     };
-    if cred.uid() == 0 {
+    if cred.uid() == 0 || cred.uid() == unsafe { libc::geteuid() } {
         return true;
     }
     if let Some(gid) = gid {

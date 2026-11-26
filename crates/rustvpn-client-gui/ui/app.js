@@ -1,8 +1,8 @@
 "use strict";
 
-const TAURI = window.__TAURI__ || {};
-const invoke = TAURI.core && TAURI.core.invoke;
-const listen = TAURI.event && TAURI.event.listen;
+const BRIDGE = window.RustVpnApi || {};
+const invoke = BRIDGE.invoke;
+const listen = BRIDGE.listen;
 
 const state = {
   profiles: [],
@@ -13,9 +13,15 @@ const state = {
   samples: [],
   editingName: null,
   pendingProfile: null,
+  pendingHadSavedPassword: false,
   daemonOnline: false,
+  daemonChecked: false,
   page: "home",
 };
+
+// Any state/traffic event invalidates an in-flight status poll.  This keeps a
+// slow poll response from overwriting a newer subscription event.
+let statusEpoch = 0;
 
 const pageNames = {
   home: ["连接", "本地守护进程管理隧道，UI 不持有特权。"],
@@ -38,13 +44,20 @@ async function init() {
   }
 
   await loadDaemonInfo();
+  await loadAutostart();
   await loadProfiles();
   await pollStatus(true);
   await refreshLogs();
 
   await listen("daemon-event", (event) => handleEvent(event.payload));
-  await listen("daemon-online", () => setDaemon(true));
-  await listen("daemon-offline", () => setDaemon(false));
+  await listen("daemon-online", () => {
+    setDaemon(true);
+    renderHome();
+  });
+  await listen("daemon-offline", () => {
+    setDaemon(false);
+    renderHome();
+  });
 
   setInterval(() => pollStatus(false), 3000);
   setInterval(updateUptime, 1000);
@@ -85,6 +98,17 @@ function bindButtons() {
   on("check-daemon", async () => {
     const ok = await pollStatus(true);
     toast(ok ? "守护进程在线" : "守护进程不可达", !ok);
+  });
+
+  const autostart = document.getElementById("autostart-toggle");
+  autostart.addEventListener("change", async () => {
+    try {
+      await invoke("set_autostart", { enabled: autostart.checked });
+      toast(autostart.checked ? "已启用登录自启动" : "已关闭登录自启动");
+    } catch (error) {
+      autostart.checked = !autostart.checked;
+      toast(`设置自启动失败：${error}`, true);
+    }
   });
 
   const homeProfile = document.getElementById("home-profile");
@@ -177,11 +201,21 @@ async function loadDaemonInfo() {
 
 function setDaemon(online, text) {
   state.daemonOnline = online;
+  state.daemonChecked = true;
   const dot = document.getElementById("daemon-dot");
   dot.className = `dot ${online ? "ok" : "err"}`;
   document.getElementById("daemon-text").textContent = online
     ? "守护进程在线"
     : text || "守护进程离线";
+}
+
+async function loadAutostart() {
+  try {
+    const enabled = await invoke("autostart_enabled");
+    document.getElementById("autostart-toggle").checked = Boolean(enabled);
+  } catch (error) {
+    // Autostart is optional; missing settings do not block the UI.
+  }
 }
 
 async function loadProfiles() {
@@ -263,6 +297,26 @@ function renderHome() {
   const profile = currentProfile();
   const stateName = status.state || "idle";
   const badge = document.getElementById("conn-badge");
+  const offline = state.daemonChecked && !state.daemonOnline;
+
+  if (offline) {
+    badge.textContent = "守护进程离线";
+    badge.className = "badge error";
+    document.getElementById("state-dot").className = "dot err";
+    document.getElementById("state-title").textContent = "守护进程离线";
+    document.getElementById("state-detail").textContent =
+      "无法连接 rustvpn-clientd；检查服务、socket 和用户组权限。";
+    document.getElementById("connect-btn").classList.remove("hidden");
+    document.getElementById("connect-btn").disabled = true;
+    document.getElementById("disconnect-btn").classList.add("hidden");
+    document.getElementById("home-hint").classList.toggle("hidden", state.profiles.length > 0);
+    const offlineRemote = status.remote || profile?.remote || "—";
+    document.getElementById("meta-remote").textContent = offlineRemote;
+    document.getElementById("meta-proto").textContent = "—";
+    document.getElementById("meta-iface").textContent = status.iface || profile?.iface || "—";
+    document.getElementById("meta-uptime").textContent = "—";
+    return;
+  }
 
   const labels = {
     idle: "未连接",
@@ -353,14 +407,19 @@ function updateUptime() {
 }
 
 async function pollStatus(report) {
+  const epoch = statusEpoch;
   try {
     const status = await invoke("get_status");
-    if (!state.daemonOnline) setDaemon(true);
+    if (epoch !== statusEpoch) return true;
+    setDaemon(true);
     applyStatus(status);
     if (report) toast("守护进程在线");
     return true;
   } catch (error) {
-    if (state.daemonOnline || report) setDaemon(false);
+    if (epoch === statusEpoch) {
+      setDaemon(false);
+      renderHome();
+    }
     if (report) toast(`守护进程不可达：${error}`, true);
     return false;
   }
@@ -389,8 +448,11 @@ function applyStatus(status) {
 function handleEvent(payload) {
   if (!payload || !payload.event) return;
   if (payload.event === "state") {
+    statusEpoch += 1;
+    setDaemon(true);
     applyStatus(payload.data);
   } else if (payload.event === "traffic") {
+    statusEpoch += 1;
     state.status.traffic = payload.data;
     pushSample(payload.data);
     renderHome();
@@ -501,10 +563,26 @@ function openPassword(profile) {
     return;
   }
   state.pendingProfile = profile;
+  state.pendingHadSavedPassword = false;
   document.getElementById("password-title").textContent = `连接 ${profile.name}`;
-  document.getElementById("password-input").value = "";
+  const input = document.getElementById("password-input");
+  const save = document.getElementById("password-save");
+  input.value = "";
+  save.checked = false;
   show("password-modal");
-  setTimeout(() => document.getElementById("password-input").focus(), 30);
+  setTimeout(() => input.focus(), 30);
+
+  invoke("get_password", { profileName: profile.name })
+    .then((saved) => {
+      if (state.pendingProfile !== profile || !saved) return;
+      input.value = saved;
+      save.checked = true;
+      state.pendingHadSavedPassword = true;
+      toast("已从系统钥匙串载入口令");
+    })
+    .catch(() => {
+      // Keyring unavailable: the prompt still works without persistence.
+    });
 }
 
 async function submitPassword(event) {
@@ -519,10 +597,24 @@ async function submitPassword(event) {
   const submit = document.getElementById("password-submit");
   submit.disabled = true;
   submit.textContent = "提交中…";
+  const shouldSave = document.getElementById("password-save").checked;
   try {
     await invoke("connect", { profile, password });
+    try {
+      if (shouldSave) {
+        await invoke("save_password", {
+          profileName: profile.name,
+          password,
+        });
+      } else if (state.pendingHadSavedPassword) {
+        await invoke("delete_password", { profileName: profile.name });
+      }
+    } catch (keyError) {
+      toast(`连接已提交，但钥匙串操作失败：${keyError}`, true);
+    }
     document.getElementById("password-input").value = "";
     hide("password-modal");
+    statusEpoch += 1;
     applyStatus({
       state: "connecting",
       profile: profile.name,

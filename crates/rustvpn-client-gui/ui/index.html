@@ -147,6 +147,11 @@
           <button class="secondary" id="check-daemon">重新检测</button>
         </div>
         <div class="card settings-card">
+          <h2>启动与托盘</h2>
+          <label class="check"><input type="checkbox" id="autostart-toggle"> 登录时启动 RustVPN</label>
+          <p class="muted small">关闭窗口会隐藏到托盘；可从托盘菜单重新打开或退出。</p>
+        </div>
+        <div class="card settings-card">
           <h2>安全边界</h2>
           <ul class="plain-list">
             <li>UI 以普通用户运行，不创建 TAP、不改路由。</li>
@@ -169,6 +174,7 @@
       <p class="muted">口令仅在内存中传给守护进程，用于派生 Argon2d 密钥。</p>
       <form id="password-form">
         <label>口令 <input id="password-input" type="password" autocomplete="current-password" required></label>
+        <label class="check"><input type="checkbox" id="password-save"> 保存到系统钥匙串</label>
         <div class="modal-actions">
           <button type="button" class="secondary" data-close="password-modal">取消</button>
           <button type="submit" class="primary" id="password-submit">连接</button>
@@ -218,6 +224,7 @@
   </div>
 
   <div class="toast hidden" id="toast"></div>
+  <script src="tauri-bridge.js"></script>
   <script src="app.js"></script>
 </body>
 </html>

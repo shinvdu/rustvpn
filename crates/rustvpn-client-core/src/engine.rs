@@ -126,9 +126,16 @@ async fn run_connection(
     );
     crate::netcfg::cleanup_stale_ipv6_blackhole().await;
 
-    let signing_key = match validated.derive_signing_key(&password) {
-        Ok(key) => key,
-        Err(error) => {
+    // Argon2d is intentionally expensive.  Keep it off the async workers so
+    // status/Disconnect requests stay responsive while a profile is opened.
+    let (validated, signing_key) = match tokio::task::spawn_blocking(move || {
+        let key = validated.derive_signing_key(&password)?;
+        Ok::<_, anyhow::Error>((validated, key))
+    })
+    .await
+    {
+        Ok(Ok(value)) => value,
+        Ok(Err(error)) => {
             emit_error(&events, &spec, format!("{error:#}"));
             emit_log(
                 &events,
@@ -137,8 +144,13 @@ async fn run_connection(
             );
             return;
         }
+        Err(error) => {
+            let message = format!("key derivation task failed: {error}");
+            emit_error(&events, &spec, message.clone());
+            emit_log(&events, "error", message);
+            return;
+        }
     };
-    drop(password);
 
     emit_log(&events, "info", format!("connecting to {}", spec.remote));
     let tap = match Tap::open(&spec.iface, spec.mtu) {
@@ -381,7 +393,7 @@ async fn session_loop(
 }
 
 fn backoff(attempt: u32) -> Duration {
-    let base = 1u64 << attempt.min(4); // 1, 2, 4, 8, 16 seconds
+    let base = 1u64 << attempt.min(5); // 1, 2, 4, 8, 16, 30 seconds
     let base = base.min(30);
     let mut bytes = [0u8; 8];
     let jitter_ms = if getrandom::getrandom(&mut bytes).is_ok() {
@@ -465,5 +477,6 @@ mod tests {
             assert!(delay <= Duration::from_secs(31));
         }
         assert!(backoff(4) >= Duration::from_secs(16));
+        assert!(backoff(5) >= Duration::from_secs(30));
     }
 }
