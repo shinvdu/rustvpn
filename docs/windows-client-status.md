@@ -5,7 +5,9 @@
 > 状态：M1（核心接入）、M2（服务 + 本地 IPC）、M3（网络配置）、M4（GUI 平台适配）
 > 已完成并提交；M5（MSI/WiX 打包、服务注册、组/DACL、Wintun、签名钩子、Windows CI）
 > 已完成并在 Windows 实机完成安装/升级/卸载验证，已提交；
-> M3 的真实路由/DNS/NRPT 冒烟与真实服务端 E2E 留待 M6
+> M6（真实 E2E、硬化、fuzz、CI）进行中：分流隧道 E2E、路由/DNS 观察、5 个
+> Windows 实机 bug 修复与垫片 fuzz 已完成；断开/崩溃清理、全隧道/DNS/NRPT/
+> IPv6 与性能因 Windows 主机在断开阶段离线而未完成
 > 相关文档：
 > - [Windows 安装/升级/卸载/签名](windows-install.md)
 > - [Windows 客户端调研与方案](windows-client-research.md)
@@ -372,6 +374,78 @@ Windows 端已经完成 **开发环境 + Wintun/以太网垫片原型**，并完
     （仅静态配置/文档）、Windows CI 运行（本机无法运行 GitHub Actions）、
     使用真实证书的签名（本机无证书）。
 
+### 2.11 M6 硬化与真实 E2E（进行中，2026-11-27）
+
+**真实拓扑（手动、临时资源）**
+
+```text
+Windows 10 Pro x64 (Wintun rsvpn-m6, 10.99.0.2/24)
+  -> UDP 11940 (plain) -> <linux-host>
+  rustvpn-server TAP rsvpn-m6 10.99.0.1/24 + 手动 10.99.1.1/24
+  profile routes: 10.99.0.0/24, 10.99.1.0/24（分流；无 default）
+  dns: []；gateway: 10.99.0.1；mtu: 1515
+```
+
+Windows 侧使用已安装的 MSI（LocalSystem 服务 + 命名管道），通过一个临时
+PowerShell IPC 客户端驱动 `Connect/Status/Disconnect`；未修改现有 VPN/NAT/
+默认路由，仅在 Ubuntu 上临时放行 `11940/udp`（限定 Windows 主机源地址），
+结束时删除。Linux 侧使用独立的 `rsvpn-m6` TAP 和 `10.99.0.0/24`；服务端
+以 `sudo` 运行（创建 TAP/配置地址需要 root），退出时用 trap 清理 TAP、
+服务进程和临时防火墙规则。
+
+**已通过**
+
+- MSI 安装、服务运行、命名管道 + Hello v2 + `Status`；`verify-client-access.ps1`
+  通过。
+- 握手成功，状态 `connected`；`ping 10.99.0.1` 3/4（首包 ARP 解析超时），
+  `ping 10.99.1.1` 4/4；从 Windows 对 `10.99.0.1:22` 建立 TCP 并读到
+  `SSH-2.0-OpenSSH_...` 横幅，证明隧道双向载荷。
+- 路由：默认路由始终只有原物理默认路由（原接口, `<lan-gateway>`, metric 0）；
+  Wintun 上 `10.99.0.2/24`、`10.99.0.0/24` 直连、`10.99.1.0/24 via 10.99.0.1`
+  metric 50；防环 `<linux-host>/32` 走原接口 metric 1；无默认路由接管。
+- DNS/NRPT/IPv6：分流 profile 未设置 DNS；Wintun 无 DNS，物理接口 DNS 不变；
+  无 NRPT 规则，无 RustVPN IPv6 防火墙规则。
+- `%ProgramData%\RustVPN\netstate.json` 记录了 owner、profile 地址、
+  防环 `/32` 和分流路由，内容与上述状态一致。
+- 垫片 fuzz：新增 7 个确定性 fuzz 测试（IPv4/ARP/inbound 分类/队列上界/
+  出站帧预算/校验和工具），`rustvpn-net` 118 个测试通过。fuzz 额外发现
+  `subnet_broadcast(ip, 0)` 的移位溢出（debug 构建 panic），已修复并加回归测试。
+- CI：新增 `.github/workflows/windows-client-e2e.yml`，仅在
+  `workflow_dispatch` + 自托管提权 Windows runner + 受保护 environment 下运行，
+  默认分流、拒绝 default 路由（除非显式 `full_tunnel`），结束总是卸载。
+  `.github/workflows/windows-client.yml` 经 YAML 静态校验，未实际运行 GitHub Actions。
+
+**Windows 10 实机发现并修复的 M3 契约 bug**
+
+1. `Get-NetAdapter MtuSize` 是 NDIS L2 MTU，Wintun 固定报 `65535`；原 guard 在
+   安装地址前拿它和 inner IP MTU 比较，导致所有真实 Wintun 连接失败。现在
+   只依赖 `Get-NetIPInterface NlMtu`（地址安装后、路由安装前）检查。
+2. Windows 会给未配置静态地址的已启用适配器自动加 APIPA
+   `169.254.0.0/16`；原 guard 把它当“无关地址”拒绝。现在忽略 IPv4 link-local
+   自动地址，只拒绝其他非配置地址。
+3. Windows PowerShell 5.1 把 `AutomaticMetric`/`ConnectionState` 枚举序列化成
+   数字（0/1）；解析器现在同时接受名称和数字。
+4. Windows 10 的 `Find-NetRoute` 没有 `-AddressFamily` 参数，且会先返回一条
+   `DestinationPrefix=null` 的本机地址行；已移除该参数并只保留真正的路由行。
+5. 上述 fuzz 发现的 `/0` 移位溢出。
+
+**未完成 / 阻塞**
+
+- **断开清理与崩溃恢复未完成**：在发送 `Disconnect` 的同一阶段，Windows 主机
+  突然从网络消失（ARP/SSH/RDP 均不可达，Wake-on-LAN 无响应）。断开前最后的
+  客户端状态是 `connected`、分流路由/DNS/默认路由均正确；服务端随后记录
+  `peer removed (Timeout)`，没有收到干净的会话结束。因此 `netstate.json`
+  很可能仍在磁盘上，按设计会在下一次服务启动时（owner 已死亡）自动清理；
+  但本里程碑未能实测断开/崩溃后的路由/DNS/适配器清理。
+- 全隧道（默认路由 + per-interface DNS + NRPT + IPv6 阻断）、DNS 解析、
+  休眠/切网、性能（吞吐/CPU/延迟）均未执行：全隧道可能切断 RDP/SSH，
+  本次主机离线后也无法在干净 VM 中继续。
+- Windows 主机恢复后必须人工完成：检查主机状态；删除
+  `D:\temp\rustvpn-m6`（含临时测试口令和脚本）；用
+  `msiexec /x ... /qn` 卸载测试 MSI（当前仍安装，且 daemon 已被替换为
+  含上述修复的重建二进制）；确认 `netstate.json`/临时路由已清理；
+  在一次性 VM 中补做全隧道与断开/崩溃验收。
+
 ---
 
 ## 3. 后续与未完成项
@@ -442,16 +516,16 @@ Windows 端已经完成 **开发环境 + Wintun/以太网垫片原型**，并完
 
 | 项 | 说明 |
 |---|---|
-| Windows 实机 E2E | Windows 客户端 ↔ Linux `rustvpn-server` |
-| 基本连通 | ping 网关、LAN 主机、DNS、TCP/UDP、大包 |
-| 模式覆盖 | plain、noise、encless（TCP）、UDP/TCP |
-| 断线恢复 | 超时、重连、切网、休眠唤醒 |
-| 路由/DNS 清理 | 断开/崩溃/服务重启后无残留、无泄漏 |
-| kill-switch | 断开后无 IPv4/IPv6/DNS 泄漏；IPv6 ND 正常 |
-| 安装测试 | 🟡 安装/同版本升级/卸载/标准用户与非成员访问已实测；连接隧道与干净 VM 安装待 M6 |
-| 安全测试 | 管道 DACL、假服务端、口令不落盘、DLL 校验 |
-| 垫片 fuzz | 帧/ARP/IPv4 解析不可信输入 |
-| 性能 | 吞吐、CPU、延迟；Wintun 批量/队列调优 |
+| Windows 实机 E2E | 🟡 分流 plain/UDP 已实测：握手、ping、TCP 双向；noise/encless 未实测 |
+| 基本连通 | 🟡 ping 网关与新增分流路由、TCP 横幅已实测；DNS 解析、大包未实测 |
+| 模式覆盖 | ⬜ plain 已测；noise、encless（TCP）、UDP/TCP 外层未实测 |
+| 断线恢复 | ⬜ 超时、重连、切网、休眠唤醒未实测（主机在断开阶段离线） |
+| 路由/DNS 清理 | ⏸ 连接态已核对；断开/崩溃/服务重启后的清理未实测（阻塞） |
+| kill-switch | ⛔ Windows 明确不支持；profile/guard 拒绝 |
+| 安装测试 | 🟡 MSI 安装 + 真实隧道已实测；升级/卸载在 M5 已实测；干净 VM 待补 |
+| 安全测试 | 🟡 `verify-client-access`、非成员拒绝、口令不落盘、DLL 哈希已测；假服务端/签名固定未补 |
+| 垫片 fuzz | ✅ 7 个确定性 fuzz 测试；发现并修复 `/0` 广播移位溢出 |
+| 性能 | ⬜ 未测（主机离线；需在一次性 VM 中做吞吐/CPU/延迟） |
 
 ---
 
@@ -520,15 +594,13 @@ Windows 端已经完成 **开发环境 + Wintun/以太网垫片原型**，并完
 | M3 网络 | 路由/DNS/NRPT、防环、IPv6 阻断、清理 | 🟡 已提交；Windows 实机路由/DNS 验收待 M6 | 全隧道无泄漏，断开恢复 |
 | M4 GUI | 路径/钥匙串/自启/语言/状态/服务端身份 | ✅ 已提交 `7b73a82`，Windows RDP 实机验证 | 普通用户基础操作（真实服务端 E2E 归 M6） |
 | M5 安装 | MSI、服务安装、组/DACL、Wintun、签名钩子、Windows CI | ✅ 已提交 `cb39124`；MSI 静态检查、安装/升级/卸载、标准用户/非成员、GUI RDP 已实测 | 干净 Win10/11 安装/升级/卸载；无证书构建标记为 unsigned |
-| M6 硬化 | E2E、休眠/切网、fuzz、CI、性能 | ⬜ 未开始 | 验收矩阵通过 |
+| M6 硬化 | E2E、休眠/切网、fuzz、CI、性能 | 🟡 进行中：分流 E2E、5 个实机 bug 修复、fuzz、手动 CI 已完成；断开/崩溃清理、全隧道、性能被主机离线阻塞 | 验收矩阵通过 |
 
-**当前状态：** M1–M5 已提交。M5 的 MSI 静态检查、安装、同版本升级、卸载、服务/组、
-管理员与标准用户管道/进程校验、非成员拒绝、GUI RDP 启动、Wintun
-路径/哈希/许可证、无证书 unsigned 标记均通过；Linux fmt/clippy/test 与
-Windows 目标 check/clippy/test 通过。仍未执行：真实 Wintun 适配器/隧道、
-M3 的路由/DNS/NRPT/IPv6 实机验收、断线/休眠/切网/崩溃恢复、真实服务端
-E2E、实际降级安装、Windows CI 实际运行与真实证书签名；这些归入 M6/发布
-流程，不阻塞 M5 代码复审与提交。
+**当前状态：** M1–M5 已提交。M6 未提交：分流隧道 E2E（plain/UDP）已通过，
+修复了 4 个 Windows 10 实机契约 bug 和 1 个 fuzz 发现的移位溢出，新增垫片
+fuzz 与手动 E2E 工作流。M6 未完成项（断开/崩溃清理、全隧道 DNS/NRPT/IPv6、
+休眠/切网、性能）受 Windows 主机在断开阶段离线阻塞；恢复后须先在一次性环境
+补测，再决定是否提交 M6 代码与文档。
 
 ---
 
@@ -572,9 +644,14 @@ E2E、实际降级安装、Windows CI 实际运行与真实证书签名；这些
      RDP 会话启动；随后同版本升级、卸载与 profile 保留。
    - 不连接隧道、不改默认路由/DNS/现有 VPN/防火墙；无证书时确认
      `UNSIGNED.txt` 且 `signtool verify /pa` 失败。
-6. M3 代码已提交；M6 在 Windows 实机验证：握手后地址/默认路由/DNS/NRPT/
-   IPv6 规则；断开与崩溃后的恢复；不要在生产默认路由上直接测分流冲突。
-7. 所有 Windows 网络测试只使用 `10.88.0.0/24` 和临时适配器；不碰现有 VPN/路由/防火墙。
+6. M6 在 Windows 实机验证：握手后地址/默认路由/DNS/NRPT/IPv6 规则；断开与
+   崩溃后的恢复；不要在生产默认路由上直接测全隧道。分流 E2E 已通过；断开/
+   崩溃/全隧道仍未完成（Windows 主机在 2026-11-27 断开阶段离线）。主机恢复
+   后先检查 `%ProgramData%\RustVPN\netstate.json` 与临时路由，再在一次性
+   VM 中补做全隧道，避免切断 RDP/SSH。
+7. 所有 Windows 网络测试只使用独立测试子网和临时适配器；不碰现有
+   VPN/路由/防火墙。2026-11-27 的测试还留下 `D:\temp\rustvpn-m6` 和已安装
+   的测试 MSI，人工须删除临时口令/脚本并卸载 MSI。
 8. 每完成一个里程碑，更新本文件的“已完成/未开始/隐患”和提交记录。
 
 ---

@@ -31,6 +31,11 @@ pub mod ipv4;
 pub mod mac;
 pub mod safety;
 
+/// Deterministic fuzz-style parser tests (no external property-test crate).
+#[cfg(test)]
+#[path = "fuzz_tests.rs"]
+mod fuzz_tests;
+
 /// Windows Wintun adapter + [`crate::tap::Tap`] implementation.
 ///
 /// Public so the M2 Windows service and diagnostics can reuse the adapter and

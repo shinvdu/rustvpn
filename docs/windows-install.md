@@ -383,8 +383,14 @@ existing `windows-shim.yml` prototype workflow is separate.
 
 ## 11. Known gaps (M6)
 
-- No real tunnel/E2E, route, DNS, NRPT, IPv6 or crash-recovery acceptance in
-  this milestone.
+- A real split-tunnel E2E (plain/UDP, installed MSI/service, handshake, ping,
+  bidirectional TCP, route/DNS/IPv6 observation) passed. Disconnect cleanup,
+  crash recovery, full-tunnel DNS/NRPT/IPv6, resume/network-switch and
+  performance are still unverified. The acceptance host went offline during
+  the disconnect phase; see the status document.
+- If a test host was left with this build installed, uninstall the test MSI and
+  delete any temporary credential/profile directories after verifying the
+  network state file has been cleaned.
 - kill-switch and MSS clamp remain unsupported/disabled on Windows.
 - ARM64 is not packaged.
 - Event Log integration for the service is absent; the file log is primary.

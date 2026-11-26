@@ -212,7 +212,7 @@ pub fn script_for(command: &WinCommand) -> String {
         }
         WinCommand::GetAdapterInfo(name) => format!(
             "Get-NetAdapter -Name {} -ErrorAction Stop | \
-             Select-Object ifIndex,MtuSize,Status | ConvertTo-Json -Compress",
+             Select-Object ifIndex,Status | ConvertTo-Json -Compress",
             ps_quote(name)
         ),
         WinCommand::GetIpv4Addresses(ifindex) => format!(
@@ -221,7 +221,12 @@ pub fn script_for(command: &WinCommand) -> String {
              Select-Object IPAddress,PrefixLength | ConvertTo-Json -Compress"
         ),
         WinCommand::FindRouteTo(ip) => format!(
-            "Find-NetRoute -RemoteIPAddress {} -AddressFamily IPv4 -ErrorAction Stop | \
+            // Windows 10's Find-NetRoute has no -AddressFamily parameter
+            // (added later).  It emits one row with a null DestinationPrefix
+            // (the local source address) plus the matching route row, so
+            // filter to the row that actually carries a route.
+            "Find-NetRoute -RemoteIPAddress {} -ErrorAction Stop | \
+             Where-Object {{ $_.DestinationPrefix }} | \
              Select-Object DestinationPrefix,InterfaceIndex,NextHop,RouteMetric,IPAddress | \
              ConvertTo-Json -Compress",
             ps_quote(&ip.to_string())
@@ -353,8 +358,11 @@ struct PsRoute {
 struct PsIface {
     interface_index: u32,
     interface_metric: u32,
-    automatic_metric: Option<String>,
-    connection_state: Option<String>,
+    // Windows PowerShell 5.1 serializes these two CIM enums as numbers
+    // (`AutomaticMetric: 0/1`, `ConnectionState: 0/1`) while tests and
+    // Windows PowerShell 7 may emit the names.  Accept both shapes.
+    automatic_metric: Option<Value>,
+    connection_state: Option<Value>,
     nl_mtu: Option<u32>,
 }
 
@@ -373,7 +381,11 @@ struct PsAdapter {
     if_index: u32,
     #[serde(rename = "Name")]
     name: String,
-    mtu_size: Option<u32>,
+    // `MtuSize` from `Get-NetAdapter` is the NDIS L2 MTU.  For Wintun that is
+    // the fixed 65535 link value, not the IP interface MTU the driver sets via
+    // `SetIpInterfaceEntry`; the authoritative check uses
+    // `Get-NetIPInterface ... NlMtu` after the address is assigned.  The field
+    // is intentionally not parsed so it cannot be mistaken for the IP MTU.
     status: Option<String>,
 }
 
@@ -423,7 +435,6 @@ pub struct AdapterNameEntry {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AdapterInfo {
     pub ifindex: u32,
-    pub mtu: Option<u32>,
     pub up: bool,
 }
 
@@ -447,22 +458,27 @@ pub fn parse_routes(text: &str) -> Result<Vec<RouteEntry>> {
         .collect())
 }
 
+/// Interpret a CIM enum emitted either as its name or as a numeric value.
+///
+/// `None` when the value is absent or an unexpected JSON shape, so callers can
+/// keep their defaults.
+fn ps_flag(value: Option<&Value>, name: &str) -> Option<bool> {
+    match value? {
+        Value::String(text) => Some(text.eq_ignore_ascii_case(name)),
+        Value::Number(number) => Some(number.as_i64().is_some_and(|value| value != 0)),
+        Value::Bool(value) => Some(*value),
+        _ => None,
+    }
+}
+
 pub fn parse_interfaces(text: &str) -> Result<Vec<InterfaceEntry>> {
     Ok(parse_json_rows::<PsIface>(text)?
         .into_iter()
         .map(|row| InterfaceEntry {
             ifindex: row.interface_index,
             metric: row.interface_metric,
-            automatic: row
-                .automatic_metric
-                .as_deref()
-                .map(|value| value.eq_ignore_ascii_case("enabled"))
-                .unwrap_or(false),
-            connected: row
-                .connection_state
-                .as_deref()
-                .map(|value| value.eq_ignore_ascii_case("connected"))
-                .unwrap_or(true),
+            automatic: ps_flag(row.automatic_metric.as_ref(), "enabled").unwrap_or(false),
+            connected: ps_flag(row.connection_state.as_ref(), "connected").unwrap_or(true),
             mtu: row.nl_mtu,
         })
         .collect())
@@ -491,7 +507,6 @@ pub fn parse_adapter(text: &str) -> Result<AdapterInfo> {
         .ok_or_else(|| anyhow!("Get-NetAdapter returned no adapter"))?;
     Ok(AdapterInfo {
         ifindex: row.if_index,
-        mtu: row.mtu_size,
         up: row
             .status
             .as_deref()
@@ -1061,15 +1076,12 @@ pub async fn install_with(
         }
         Err(error) => bail!("resolve Wintun adapter {:?}: {error:#}", spec.iface),
     };
-    if let Some(mtu) = adapter.mtu {
-        if mtu as usize != inner_mtu {
-            bail!(
-                "Wintun adapter {:?} has interface MTU {mtu}, but the wire MTU derives inner IP \
-                 MTU {inner_mtu}; refusing to use the wire/frame budget as the interface MTU",
-                spec.iface
-            );
-        }
-    }
+    // The MTU is *not* checked here: `Get-NetAdapter MtuSize` is the NDIS L2
+    // MTU (65535 for Wintun), not the IP interface `NlMtu` the driver sets.
+    // The address assignment makes the interface visible to
+    // `Get-NetIPInterface`, whose `NlMtu` is checked below before any route is
+    // installed; a wrong MTU rolls back the address instead of silently using
+    // the wire/frame budget.
     if !adapter.up {
         bail!(
             "Wintun adapter {:?} is not up; refusing to install routes",
@@ -1163,7 +1175,14 @@ async fn install_steps(
             plan.prefix_len
         ),
         None => {
-            if let Some(entry) = addresses.first() {
+            // Windows auto-configures an APIPA (169.254.0.0/16) address on an
+            // up adapter that has no static address yet.  It is system-owned,
+            // not administrator state, and must not block the profile address.
+            // Any other address is a conflict and is refused.
+            if let Some(entry) = addresses
+                .iter()
+                .find(|entry| !entry.address.is_link_local())
+            {
                 bail!(
                     "Wintun adapter {:?} already has unrelated address {}/{}, but the profile \
                      asks for {}/{}; refusing to replace it",
@@ -1921,6 +1940,20 @@ mod tests {
         assert_eq!(interfaces[0].mtu, Some(1500));
         assert!(!interfaces[0].automatic);
 
+        // Windows PowerShell 5.1 emits the CIM enums as numbers: 0/1 for
+        // AutomaticMetric (Disabled/Enabled) and ConnectionState
+        // (Disconnected/Connected).
+        let numeric = parse_interfaces(
+            r#"[{"InterfaceIndex":7,"InterfaceMetric":5000,"AutomaticMetric":0,"ConnectionState":1,"NlMtu":1476},
+                {"InterfaceIndex":12,"InterfaceMetric":25,"AutomaticMetric":1,"ConnectionState":0,"NlMtu":1500}]"#,
+        )
+        .unwrap();
+        assert!(!numeric[0].automatic);
+        assert!(numeric[0].connected);
+        assert_eq!(numeric[0].mtu, Some(1476));
+        assert!(numeric[1].automatic);
+        assert!(!numeric[1].connected);
+
         let dns = parse_dns(r#"{"InterfaceIndex":7,"ServerAddresses":["10.88.0.1","10.88.0.2"]}"#)
             .unwrap();
         assert_eq!(
@@ -2071,6 +2104,15 @@ mod tests {
         assert!(!script.contains("cmd"));
         let script = script_for(&WinCommand::GetAdapterInfo("rsvpn0".into()));
         assert!(script.contains("'rsvpn0'"));
+        // Never read the NDIS L2 MtuSize for the IP MTU decision.
+        assert!(!script.contains("MtuSize"), "{script}");
+
+        // Windows 10 Find-NetRoute rejects -AddressFamily and returns a null
+        // source-address row before the route row.
+        let script = script_for(&WinCommand::FindRouteTo("192.0.2.1".parse().unwrap()));
+        assert!(!script.contains("-AddressFamily"), "{script}");
+        assert!(script.contains("Where-Object"), "{script}");
+        assert!(script.contains("'192.0.2.1'"), "{script}");
     }
 
     // ------------------------------------------------------------------
@@ -2225,9 +2267,14 @@ mod tests {
                 self.commands.lock().unwrap().push(command.clone());
                 match command {
                     WinCommand::GetAdapterInfo(_) => {
+                        // Real Wintun reports the fixed NDIS L2 MTU 65535 in
+                        // MtuSize; the IP interface NlMtu (InterfaceEntry::mtu,
+                        // 1500 by default) is the authoritative value.  Keeping
+                        // the real shape here prevents a regression to the
+                        // pre-address MtuSize check.
                         Ok(serde_json::to_string(&serde_json::json!({
                             "ifIndex": self.adapter_index,
-                            "MtuSize": 1500,
+                            "MtuSize": 65535,
                             "Status": "Up",
                         }))
                         .unwrap())
@@ -2752,6 +2799,39 @@ mod tests {
         .await
         .unwrap_err();
         assert!(format!("{error:#}").contains("interface MTU"), "{error:#}");
+    }
+
+    #[tokio::test]
+    async fn windows_apipa_auto_address_does_not_block_the_profile_address() {
+        // A Wintun adapter that is up but has no static address receives an
+        // automatic 169.254.0.0/16 APIPA address.  It is system-owned and must
+        // not be mistaken for administrator state that conflicts with the
+        // profile.
+        let system = FakeSystem::new();
+        system.addresses.lock().unwrap().push(AddressEntry {
+            address: "169.254.134.192".parse().unwrap(),
+            prefix_len: 16,
+        });
+        let store = TempStore::new("apipa");
+        let probe = Probe { alive: false };
+        let state = install_with(
+            ctx(&system, &store, &probe),
+            &split_spec(),
+            Some("203.0.113.10:1194".parse().unwrap()),
+            1500,
+            NetOptions::default(),
+        )
+        .await
+        .unwrap();
+        assert!(state.address.is_some());
+        let addresses = system.addresses.lock().unwrap().clone();
+        assert!(addresses
+            .iter()
+            .any(|entry| entry.address == Ipv4Addr::new(10, 88, 0, 2)));
+        // The APIPA address is left alone; only the profile address is ours.
+        assert!(addresses
+            .iter()
+            .any(|entry| entry.address == Ipv4Addr::new(169, 254, 134, 192)));
     }
 
     #[tokio::test]

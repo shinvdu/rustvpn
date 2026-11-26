@@ -206,6 +206,39 @@ it as the test account (it is not installed by the MSI) and expect:
 RESULT: OK (pipe, process query, installed image and Hello v2 all verified)
 ```
 
+## Manual tunnel E2E
+
+`e2e-tunnel.ps1` is a manual acceptance harness for a real tunnel. It is not
+installed or run by the MSI and not part of the default CI. Run it elevated
+against an external `rustvpn-server` (the server's `peers.yaml` holds the long
+verifier, the client uses the short verifier):
+
+```powershell
+$pass = Join-Path $env:TEMP 'rustvpn-e2e-pass.txt'
+# Create this file outside the repository with restricted ACLs; delete it after.
+powershell -NoProfile -ExecutionPolicy Bypass -File .\packaging\windows\e2e-tunnel.ps1 `
+  -Phase connect -Remote <server>:1194 -ShortVerifier '<short-verifier>' `
+  -PasswordFile $pass -Address 10.88.0.2/24 -Gateway 10.88.0.1 `
+  -Routes 10.88.0.0/24 -PingTargets 10.88.0.1 -OuterEndpoint <server-ip>
+
+powershell -NoProfile -ExecutionPolicy Bypass -File .\packaging\windows\e2e-tunnel.ps1 `
+  -Phase disconnect -WaitSeconds 60
+```
+
+Split routes are required by default and a default route is refused unless
+`-AllowFullTunnel` is passed (full tunnel can cut RDP/SSH). Use `-Phase
+snapshot`, `pingtcp` and `crash` to inspect the OS state, run ping/TCP checks,
+or kill the service and verify crash recovery. The harness never writes the
+passphrase itself and reports the default route, Wintun routes/addresses, DNS,
+NRPT, RustVPN firewall rules and `netstate.json` before/after.
+
+`.github/workflows/windows-client-e2e.yml` wraps this harness as a manual
+`workflow_dispatch` job. It requires a self-hosted, elevated Windows runner
+with the `rustvpn-e2e` label, the protected environment
+`windows-client-e2e`, and the `RUSTVPN_E2E_VERIFIER` /
+`RUSTVPN_E2E_PASSWORD` secrets. It is never triggered by push or pull_request,
+installs the MSI only for the run, and uninstalls it in an `always()` step.
+
 ## CI
 
 `.github/workflows/windows-client.yml` is an isolated `windows-latest` job. It

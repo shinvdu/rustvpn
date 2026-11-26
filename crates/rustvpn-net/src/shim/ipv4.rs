@@ -122,9 +122,13 @@ pub fn in_same_subnet(a: Ipv4Addr, b: Ipv4Addr, prefix_len: u8) -> bool {
     (u32::from(a) & mask) == (u32::from(b) & mask)
 }
 
-/// Directed broadcast address for a prefix, if one exists (/0../30).
+/// Directed broadcast address for a prefix, if one exists (/1../30).
+///
+/// Prefix 0 has no *directed* broadcast (its all-ones address is the limited
+/// broadcast handled separately), and shifting by 32 would overflow.  Prefixes
+/// /31 and /32 have no broadcast address.
 pub fn subnet_broadcast(ip: Ipv4Addr, prefix_len: u8) -> Option<Ipv4Addr> {
-    if prefix_len >= 31 || prefix_len > 32 {
+    if prefix_len == 0 || (31..=32).contains(&prefix_len) || prefix_len > 32 {
         return None;
     }
     let mask = u32::MAX << (32 - u32::from(prefix_len));
@@ -251,6 +255,12 @@ mod tests {
         assert!(in_same_subnet(a, Ipv4Addr::new(10, 88, 0, 200), 24));
         assert!(!in_same_subnet(a, Ipv4Addr::new(10, 88, 1, 2), 24));
         assert_eq!(subnet_broadcast(a, 24), Some(Ipv4Addr::new(10, 88, 0, 255)));
+        // A /0 would shift by 32; it has no directed broadcast, and /31, /32
+        // and invalid prefixes have none either.
+        for prefix in [0u8, 31, 32, 33, 40] {
+            assert_eq!(subnet_broadcast(a, prefix), None, "/{prefix}");
+        }
+        assert_eq!(prefix_to_mask(0), Some(Ipv4Addr::UNSPECIFIED));
         assert_eq!(prefix_to_mask(24), Some(Ipv4Addr::new(255, 255, 255, 0)));
         assert_eq!(prefix_to_mask(33), None);
         assert_eq!(
