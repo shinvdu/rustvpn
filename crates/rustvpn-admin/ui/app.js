@@ -9,6 +9,7 @@ let currentPeer = null;
 let currentRange = '24h';
 let clientFilter = { q: '', state: '' };
 let lastTick = null;
+let routeEpoch = 0;
 
 // ---- helpers -----------------------------------------------------------
 
@@ -218,35 +219,39 @@ function updateLive() {
 window.addEventListener('hashchange', () => { route(); });
 
 async function route() {
+  const epoch = ++routeEpoch;
   clearPoll();
   if (!me) {
     try { me = await api('/api/me'); } catch { renderLogin(); return; }
+    if (epoch !== routeEpoch) return;
     connectSse();
   }
   const hash = location.hash.replace(/^#/, '') || '/';
   const parts = hash.split('/').filter(Boolean);
   try {
-    if (parts[0] === 'clients') await renderClients();
-    else if (parts[0] === 'peer' && parts[1]) await renderPeer(parts[1]);
-    else if (parts[0] === 'settings') await renderSettings();
-    else if (parts[0] === 'audit') await renderAudit();
-    else await renderDashboard();
+    if (parts[0] === 'clients') await renderClients(epoch);
+    else if (parts[0] === 'peer' && parts[1]) await renderPeer(parts[1], epoch);
+    else if (parts[0] === 'settings') await renderSettings(epoch);
+    else if (parts[0] === 'audit') await renderAudit(epoch);
+    else await renderDashboard(epoch);
+    if (epoch !== routeEpoch) return;
     updateLive();
   } catch (err) {
-    if (err.status === 401) return;
+    if (err.status === 401 || epoch !== routeEpoch) return;
     app.innerHTML = shell('dash', '出错了', `<div class="panel"><div class="error">${esc(err.message)}</div></div>`);
   }
 }
 
 // ---- dashboard ---------------------------------------------------------
 
-async function renderDashboard() {
+async function renderDashboard(epoch) {
   app.innerHTML = `<div class="muted" style="padding:24px">加载中…</div>`;
   const [list, status, events] = await Promise.all([
     api('/api/peers'),
     api('/api/system/status'),
     api('/api/system/events'),
   ]);
+  if (epoch !== routeEpoch) return;
   const top = [...list.peers]
     .sort((a, b) => (b.rate_in_bps + b.rate_out_bps) - (a.rate_in_bps + a.rate_out_bps))
     .slice(0, 8);
@@ -293,7 +298,7 @@ async function renderDashboard() {
         </tbody>
       </table>
     </div>
-    <div class="panel">
+    <div class="panel" id="dashboard-events">
       <h3>最近事件</h3>
       <table><thead><tr><th>时间</th><th>类型</th><th>客户端</th><th>地址</th><th>详情</th></tr></thead>
         <tbody>${eventRows || '<tr><td colspan="5" class="muted">暂无事件</td></tr>'}</tbody>
@@ -301,23 +306,28 @@ async function renderDashboard() {
     </div>
   `);
   pollTimer = setInterval(async () => {
+    if (epoch !== routeEpoch) return;
     try {
       const events = await api('/api/system/events');
+      if (epoch !== routeEpoch) return;
+      const panel = document.getElementById('dashboard-events');
+      const table = panel && panel.querySelector('tbody');
+      if (!table) return;
       const rows = (events.events || []).slice().reverse().slice(0, 12).map((event) => `
         <tr><td class="small muted">${fmtTime(event.ts)}</td><td>${esc(event.kind)}</td>
         <td>${esc(event.peer || '—')}</td><td class="small">${esc(event.addr || '')}</td>
         <td class="small muted">${esc(event.detail || '')}</td></tr>`).join('');
-      const table = document.querySelector('#page .panel:last-child tbody');
-      if (table) table.innerHTML = rows || '<tr><td colspan="5" class="muted">暂无事件</td></tr>';
+      table.innerHTML = rows || '<tr><td colspan="5" class="muted">暂无事件</td></tr>';
     } catch { /* ignore */ }
   }, 10000);
 }
 
 // ---- clients -----------------------------------------------------------
 
-async function renderClients() {
+async function renderClients(epoch) {
   app.innerHTML = `<div class="muted" style="padding:24px">加载中…</div>`;
   const data = await api('/api/peers');
+  if (epoch !== routeEpoch) return;
   peersCache = data.peers;
   app.innerHTML = shell('clients', '客户端', `
     <div class="panel">
@@ -349,8 +359,10 @@ async function renderClients() {
   });
   drawClientTable(data.summary);
   pollTimer = setInterval(async () => {
+    if (epoch !== routeEpoch) return;
     try {
       const fresh = await api('/api/peers');
+      if (epoch !== routeEpoch) return;
       peersCache = fresh.peers;
       drawClientTable(fresh.summary);
     } catch { /* ignore */ }
@@ -402,12 +414,13 @@ function drawClientTable(summary) {
 
 // ---- peer detail -------------------------------------------------------
 
-async function renderPeer(id) {
+async function renderPeer(id, epoch) {
   app.innerHTML = `<div class="muted" style="padding:24px">加载中…</div>`;
   const [peer, traffic] = await Promise.all([
     api(`/api/peers/${id}`),
     api(`/api/peers/${id}/traffic?range=${currentRange}`),
   ]);
+  if (epoch !== routeEpoch) return;
   currentPeer = peer;
   app.innerHTML = shell('clients', `客户端 · ${peer.name}`, `
     <div class="panel">
@@ -476,17 +489,20 @@ async function renderPeer(id) {
       currentRange = button.dataset.range;
       document.querySelectorAll('[data-range]').forEach((b) => b.classList.toggle('active', b === button));
       try {
+        if (epoch !== routeEpoch) return;
         const fresh = await api(`/api/peers/${id}/traffic?range=${currentRange}`);
+        if (epoch !== routeEpoch) return;
         drawTrafficChart(chart, fresh);
       } catch (err) { toast(err.message, 'error'); }
     });
   });
-  loadSessionHistory(id);
+  loadSessionHistory(id, epoch);
 }
 
-async function loadSessionHistory(id) {
+async function loadSessionHistory(id, epoch) {
   try {
     const data = await api(`/api/peers/${id}/sessions?limit=50`);
+    if (epoch !== routeEpoch) return;
     const el = document.getElementById('session-history');
     if (!el) return;
     const rows = (data.sessions || []).map((session) => `
@@ -578,12 +594,13 @@ function drawTrafficChart(canvas, data) {
 
 // ---- settings ---------------------------------------------------------
 
-async function renderSettings() {
+async function renderSettings(epoch) {
   app.innerHTML = `<div class="muted" style="padding:24px">加载中…</div>`;
   const [config, backups] = await Promise.all([
     api('/api/system/config'),
     api('/api/system/backups'),
   ]);
+  if (epoch !== routeEpoch) return;
   configEtag = config.etag;
   const backupRows = (backups.backups || []).map((backup) => `
     <tr><td class="small">${esc(backup.name)}</td><td class="num">${fmtBytes(backup.size)}</td>
@@ -684,9 +701,10 @@ function currentConfigEtag() { return configEtag; }
 
 // ---- audit -------------------------------------------------------------
 
-async function renderAudit() {
+async function renderAudit(epoch) {
   app.innerHTML = `<div class="muted" style="padding:24px">加载中…</div>`;
   const data = await api('/api/audit?limit=200');
+  if (epoch !== routeEpoch) return;
   const rows = (data.audit || []).map((row) => `
     <tr>
       <td class="small muted">${fmtTime(row.ts)}</td>
