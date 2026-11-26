@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
+use rustvpn_client_core::profile::{KEEPALIVE_MAX, KEEPALIVE_MIN, KEEPALIVE_MIN_PADDED};
 use rustvpn_client_core::{resolve_endpoints, start_session, SessionEnd, TunnelLock};
 use rustvpn_client_ipc::{Client, ClientStatusV1};
 use rustvpn_crypto::verifier::Verifier;
@@ -13,7 +14,7 @@ use rustvpn_net::config::PeerConfig;
 use rustvpn_net::scripts::{call_down, call_up};
 use rustvpn_net::stats::{stats_listener, StatsState};
 use rustvpn_net::tap::Tap;
-use rustvpn_proto::{MTU_DEFAULT, MTU_MAX, MTU_MIN, MTU_MIN_NOISE};
+use rustvpn_proto::{Mode, MTU_DEFAULT};
 use tokio_util::sync::CancellationToken;
 
 const WARRANTY: &str = "This program is free software: you can redistribute it and/or modify
@@ -342,6 +343,31 @@ async fn wait_signal() {
     }
 }
 
+/// Keepalive bounds shared with profile validation.  `0` disables the idle
+/// keepalive entirely; padded modes need a longer interval because every
+/// keepalive is sent at the MTU.
+fn keepalive_error(keepalive: u64, timeout: u64, noise: bool) -> Option<String> {
+    if keepalive == 0 {
+        return None;
+    }
+    let minimum = if noise {
+        KEEPALIVE_MIN_PADDED
+    } else {
+        KEEPALIVE_MIN
+    };
+    if keepalive < minimum {
+        return Some(format!(
+            "keepalive must be 0 (off) or at least {minimum}s for this mode"
+        ));
+    }
+    if keepalive > KEEPALIVE_MAX || keepalive >= timeout {
+        return Some(format!(
+            "keepalive must be <= {KEEPALIVE_MAX}s and shorter than timeout"
+        ));
+    }
+    None
+}
+
 fn main() {
     if std::env::args().nth(1).as_deref() == Some("status") {
         status_command();
@@ -359,25 +385,21 @@ fn main() {
         eprintln!("No verifier specified");
         process::exit(1);
     }
-    if args.mtu < MTU_MIN || args.mtu > MTU_MAX {
-        eprintln!("MTU must be between {MTU_MIN} and {MTU_MAX}");
-        process::exit(1);
-    }
     let noise = args.noise || args.encless;
-    if noise && args.mtu < MTU_MIN_NOISE {
-        eprintln!("Minimum permissible MTU for noise mode is {MTU_MIN_NOISE}");
+    let mode = if args.encless {
+        Mode::Encless
+    } else if args.noise {
+        Mode::Noise
+    } else {
+        Mode::Plain
+    };
+    if let Err(error) = rustvpn_client_core::mtu::from_wire(mode, args.mtu) {
+        eprintln!("{error:#}");
         process::exit(1);
     }
-    if args.keepalive > 0 {
-        let minimum = if noise { 15 } else { 5 };
-        if args.keepalive < minimum {
-            eprintln!("keepalive must be 0 (off) or at least {minimum}s for this mode");
-            process::exit(1);
-        }
-        if args.keepalive > 3600 || args.keepalive >= args.timeout {
-            eprintln!("keepalive must be <= 3600s and shorter than timeout");
-            process::exit(1);
-        }
+    if let Some(message) = keepalive_error(args.keepalive, args.timeout, noise) {
+        eprintln!("{message}");
+        process::exit(1);
     }
     if args.rekey_time > 0 {
         if !(60..=86_400).contains(&args.rekey_time)
@@ -549,4 +571,35 @@ async fn run_once(
     let end = session.wait(&shutdown).await;
     session.close(&stats_state);
     Ok(end)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn keepalive_uses_the_shared_profile_bounds() {
+        // Plain mode: 10s floor, 3600s cap, and shorter than timeout.
+        assert!(keepalive_error(0, 60, false).is_none());
+        assert!(keepalive_error(5, 60, false).is_some());
+        assert!(keepalive_error(10, 60, false).is_none());
+        assert!(keepalive_error(3600, 7200, false).is_none());
+        assert!(keepalive_error(3601, 7200, false).is_some());
+        assert!(keepalive_error(60, 60, false).is_some());
+
+        // Noise/encless are padded to the MTU and use the 25s floor.
+        assert!(keepalive_error(15, 60, true).is_some());
+        assert!(keepalive_error(24, 60, true).is_some());
+        assert!(keepalive_error(25, 60, true).is_none());
+    }
+
+    #[test]
+    fn keepalive_errors_quote_the_shared_limits() {
+        let error = keepalive_error(5, 60, false).unwrap();
+        assert!(error.contains("10s"), "{error}");
+        let error = keepalive_error(15, 60, true).unwrap();
+        assert!(error.contains("25s"), "{error}");
+        let error = keepalive_error(3601, 7200, false).unwrap();
+        assert!(error.contains("3600s"), "{error}");
+    }
 }

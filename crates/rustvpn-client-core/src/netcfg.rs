@@ -143,6 +143,14 @@ pub async fn cleanup_stale_firewall(scope: &str) {
     firewall::cleanup_stale(scope).await;
 }
 
+/// Remove only this instance's stale MSS table.
+///
+/// Safe after a crash: MSS clamping is rebuilt on the next connection and is
+/// not a security boundary, so the kill-switch table can be preserved.
+pub async fn cleanup_stale_mss(scope: &str) {
+    firewall::cleanup_stale_mss(scope).await;
+}
+
 pub struct NetworkGuard {
     ip: PathBuf,
     enabled: bool,

@@ -28,6 +28,52 @@ const DEFAULT_HELLO_TIMEOUT_SECS: u64 = 5;
 const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 300;
 const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Content that proves the previous daemon removed its network state on a
+/// clean shutdown.  A missing or truncated marker is treated as a crash so
+/// the kill switch stays fail-closed.
+const CLEAN_SHUTDOWN_MARKER: &[u8] = b"rustvpn-clientd clean shutdown v1\n";
+
+/// Sibling state file next to the IPC socket (for systemd this lives in the
+/// writable `RuntimeDirectory`).  Appending instead of `with_extension` keeps
+/// the socket name intact and avoids clashing with `client.clean`.
+fn clean_marker_path(socket: &Path) -> PathBuf {
+    let mut name = socket.as_os_str().to_os_string();
+    name.push(".clean");
+    PathBuf::from(name)
+}
+
+fn previous_shutdown_was_clean(marker: &Path) -> bool {
+    std::fs::read(marker)
+        .map(|content| content == CLEAN_SHUTDOWN_MARKER)
+        .unwrap_or(false)
+}
+
+fn write_clean_marker(marker: &Path) -> std::io::Result<()> {
+    std::fs::write(marker, CLEAN_SHUTDOWN_MARKER)
+}
+
+fn remove_clean_marker(marker: &Path) {
+    let _ = std::fs::remove_file(marker);
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StartupFirewallCleanup {
+    /// The previous daemon shut down cleanly: remove all of this instance's
+    /// tables and start with a clean host.
+    Clean,
+    /// The previous daemon crashed: delete only the non-security MSS table and
+    /// preserve the kill switch so the host stays fail-closed.
+    AfterCrash,
+}
+
+fn startup_firewall_cleanup(previous_shutdown_was_clean: bool) -> StartupFirewallCleanup {
+    if previous_shutdown_was_clean {
+        StartupFirewallCleanup::Clean
+    } else {
+        StartupFirewallCleanup::AfterCrash
+    }
+}
+
 struct Args {
     socket: PathBuf,
     socket_group: String,
@@ -185,11 +231,45 @@ async fn run(
     prepare_socket_parent(&socket_path)?;
     remove_stale_socket(&socket_path).await?;
 
-    // Backstop for this daemon instance after a crash while a kill switch/MSS
-    // table was installed.  Table names are scoped by the socket path, so
+    // Kill-switch crash policy.  Table names are scoped by the socket path, so
     // another RustVPN daemon in the same netns is not touched.
+    //
+    //  * clean shutdown marker present -> remove both tables (the host was
+    //    restored on shutdown; this is also a backstop after a failed removal);
+    //  * marker absent -> the previous instance crashed.  Preserve the
+    //    kill-switch table (fail-closed), remove only MSS, and let the engine
+    //    bootstrap through the preserved table on the next connect.
+    //
+    // The marker is removed before cleanup so a crash during startup is still
+    // classified as a crash on the next start.
     let firewall_scope = rustvpn_client_core::firewall::instance_scope(&socket_path);
-    rustvpn_client_core::netcfg::cleanup_stale_firewall(&firewall_scope).await;
+    let marker = clean_marker_path(&socket_path);
+    let clean = previous_shutdown_was_clean(&marker);
+    remove_clean_marker(&marker);
+    match startup_firewall_cleanup(clean) {
+        StartupFirewallCleanup::Clean => {
+            rustvpn_client_core::netcfg::cleanup_stale_firewall(&firewall_scope).await;
+        }
+        StartupFirewallCleanup::AfterCrash => {
+            rustvpn_client_core::netcfg::cleanup_stale_mss(&firewall_scope).await;
+            // Keep the table and guarantee its drop-policy chain exists even if
+            // the crash happened mid-create.  No DNS is allowed while idle.
+            match rustvpn_client_core::firewall::bootstrap_kill_switch(&firewall_scope, None, false)
+                .await
+            {
+                Ok(true) => eprintln!(
+                    "previous run did not shut down cleanly; preserving this instance's \
+                     kill-switch table (fail-closed) until a connection replaces it or an \
+                     explicit disconnect removes it"
+                ),
+                Ok(false) => {}
+                Err(error) => eprintln!(
+                    "previous run did not shut down cleanly; cannot verify this instance's \
+                     kill-switch table: {error:#}"
+                ),
+            }
+        }
+    }
 
     let (commands_tx, commands_rx) = mpsc::channel(8);
     let (events_tx, _) = broadcast::channel(256);
@@ -212,7 +292,7 @@ async fn run(
         events_tx.clone(),
         EngineOptions {
             no_host_dns,
-            firewall_scope,
+            firewall_scope: firewall_scope.clone(),
         },
     );
     spawn_collector(events_tx.clone(), status.clone(), logs.clone());
@@ -238,6 +318,18 @@ async fn run(
     let _ = shared.commands.send(Command::Shutdown).await;
     let _ = engine.await;
     accept.abort();
+    // The engine removed the guard (routes, DNS, kill switch, MSS) before it
+    // returned.  A crash-preserved kill switch may still exist when the daemon
+    // was stopped while idle; a clean stop restores connectivity.  Record that
+    // so the next start removes any leftovers instead of treating them as a
+    // crash.
+    rustvpn_client_core::netcfg::cleanup_stale_firewall(&firewall_scope).await;
+    if let Err(error) = write_clean_marker(&marker) {
+        eprintln!(
+            "warning: cannot write clean-shutdown marker {}: {error}",
+            marker.display()
+        );
+    }
     let _ = std::fs::remove_file(&socket_path);
     eprintln!("rustvpn-clientd stopped");
     Ok(())
@@ -670,6 +762,40 @@ mod tests {
             .await
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn clean_shutdown_marker_requires_exact_complete_content() {
+        let dir =
+            std::env::temp_dir().join(format!("rustvpn-clientd-marker-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let socket = dir.join("client.sock");
+        let marker = clean_marker_path(&socket);
+        assert_eq!(marker, dir.join("client.sock.clean"));
+        assert!(!previous_shutdown_was_clean(&marker));
+
+        // A crash during marker creation must not be mistaken for a clean
+        // shutdown (which would delete a fail-closed kill switch).
+        std::fs::write(&marker, b"rustvpn-clientd clean").unwrap();
+        assert!(!previous_shutdown_was_clean(&marker));
+
+        write_clean_marker(&marker).unwrap();
+        assert!(previous_shutdown_was_clean(&marker));
+        remove_clean_marker(&marker);
+        assert!(!marker.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn startup_policy_preserves_the_kill_switch_only_after_a_crash() {
+        assert_eq!(
+            startup_firewall_cleanup(true),
+            StartupFirewallCleanup::Clean
+        );
+        assert_eq!(
+            startup_firewall_cleanup(false),
+            StartupFirewallCleanup::AfterCrash
+        );
     }
 
     #[test]

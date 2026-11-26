@@ -3,9 +3,15 @@
 //! Both features use their own `inet` tables whose names are derived from a
 //! daemon instance scope (`rustvpn_mss_<suffix>` / `rustvpn_killswitch_<suffix>`)
 //! so two RustVPN daemons in the same network namespace cannot delete each
-//! other's rules.  A table is deleted before it is created and on disconnect;
-//! startup cleanup removes leftovers from a crashed daemon with the same
-//! scope.
+//! other's rules.
+//!
+//! The kill switch is fail-closed across crashes: a daemon start that finds no
+//! clean-shutdown marker keeps the existing table instead of deleting it, and
+//! a restarted daemon bootstraps through it by replacing only the `output`
+//! rules while the chain's `drop` policy stays in force.  A successful
+//! connection then installs the full rule set (or removes the table when the
+//! new profile does not request a kill switch).  A clean shutdown removes the
+//! tables explicitly, so the next start has nothing to preserve.
 //!
 //! Only `rustvpn-clientd` calls the apply/remove functions.  Tests build the
 //! command vectors and never execute `nft` on the host.
@@ -68,7 +74,7 @@ fn nft_bin() -> Option<PathBuf> {
     None
 }
 
-async fn run(nft: &PathBuf, args: &[String]) -> Result<std::process::Output> {
+async fn run(nft: &Path, args: &[String]) -> Result<std::process::Output> {
     Command::new(nft)
         .args(args)
         .output()
@@ -91,11 +97,74 @@ async fn delete_table(table: &str) -> Result<()> {
     Ok(())
 }
 
-/// Remove tables left behind by a previous daemon crashed with the same
-/// instance scope.  Only this scope's RustVPN-owned tables are touched.
+/// Remove every RustVPN-owned table for this instance scope.
+///
+/// Only call this after a *clean* shutdown (or when the clean-shutdown marker
+/// proves the previous instance already removed its state).  On a crash the
+/// kill-switch table must be preserved so the host stays fail-closed.
 pub async fn cleanup_stale(scope: &str) {
     let _ = delete_table(&mss_table(scope)).await;
     let _ = delete_table(&killswitch_table(scope)).await;
+}
+
+/// Remove only the MSS table left behind by a crashed daemon.
+///
+/// MSS clamping is not a security boundary and is rebuilt on the next
+/// connection, so it is safe to delete without touching the fail-closed
+/// kill-switch table.
+pub async fn cleanup_stale_mss(scope: &str) {
+    let _ = delete_table(&mss_table(scope)).await;
+}
+
+async fn table_present(nft: &Path, table: &str) -> bool {
+    let args = vec![
+        "list".to_string(),
+        "table".to_string(),
+        "inet".to_string(),
+        table.to_string(),
+    ];
+    matches!(run(nft, &args).await, Ok(output) if output.status.success())
+}
+
+/// Whether this instance's kill-switch table is currently installed.
+///
+/// Used on daemon start to decide whether a crashed instance left the host in
+/// a fail-closed state that must be preserved and bootstrapped.
+pub async fn kill_switch_present(scope: &str) -> bool {
+    let Some(nft) = nft_bin() else {
+        return false;
+    };
+    table_present(&nft, &killswitch_table(scope)).await
+}
+
+fn stderr_indicates_exists(stderr: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(stderr).to_ascii_lowercase();
+    text.contains("file exists") || text.contains("already exists")
+}
+
+/// Ensure the preserved table has a hooking `output` chain with `drop` policy.
+///
+/// A crash during the original create can leave the table without its chain,
+/// which would silently filter nothing.  Creating the chain first (ignoring
+/// the expected "exists" error) makes the preserved state fail-closed before
+/// any bootstrap rule is added.
+async fn ensure_drop_chain(nft: &Path, table: &str) -> Result<()> {
+    let args = vec![
+        "add".to_string(),
+        "chain".to_string(),
+        "inet".to_string(),
+        table.to_string(),
+        "output".to_string(),
+        "{ type filter hook output priority 0; policy drop; }".to_string(),
+    ];
+    let output = run(nft, &args).await?;
+    if output.status.success() || stderr_indicates_exists(&output.stderr) {
+        return Ok(());
+    }
+    Err(anyhow!(
+        "ensure kill-switch chain in {table}: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    ))
 }
 
 async fn apply_commands(table: &str, commands: Vec<Vec<String>>) -> Result<()> {
@@ -194,10 +263,6 @@ pub fn kill_switch_commands(
     underlay: Option<&str>,
 ) -> Vec<Vec<String>> {
     let table = killswitch_table(scope);
-    let family = if outer.is_ipv6() { "ip6" } else { "ip" };
-    let addr = outer.ip().to_string();
-    let port = outer.port().to_string();
-    let quoted_iface = quote(iface);
     let mut commands = vec![
         cmd(&["add", "table", "inet", table.as_str()]),
         cmd(&[
@@ -208,6 +273,28 @@ pub fn kill_switch_commands(
             "output",
             "{ type filter hook output priority 0; policy drop; }",
         ]),
+    ];
+    commands.extend(kill_switch_rule_commands(scope, iface, outer, underlay));
+    commands
+}
+
+/// Rules for an existing kill-switch `output` chain.
+///
+/// The table and its `drop`-policy chain must already exist.  This is used to
+/// replace the rule set without deleting the table, so a failure can only
+/// leave the host more restricted, never open.
+pub fn kill_switch_rule_commands(
+    scope: &str,
+    iface: &str,
+    outer: SocketAddr,
+    underlay: Option<&str>,
+) -> Vec<Vec<String>> {
+    let table = killswitch_table(scope);
+    let family = if outer.is_ipv6() { "ip6" } else { "ip" };
+    let addr = outer.ip().to_string();
+    let port = outer.port().to_string();
+    let quoted_iface = quote(iface);
+    let mut commands = vec![
         cmd(&[
             "add",
             "rule",
@@ -296,6 +383,105 @@ pub fn kill_switch_commands(
     commands
 }
 
+/// Bootstrap rule set for a kill-switch table preserved after a crash.
+///
+/// The first command flushes the existing `output` rules without touching the
+/// chain's `drop` policy.  Everything else adds the minimum needed for the
+/// daemon to reach the VPN: loopback, optionally DNS (to resolve a hostname
+/// remote), and the newly resolved outer endpoint.  Once the handshake
+/// succeeds the full rule set replaces these rules, or the table is removed
+/// for a profile without a kill switch.
+pub fn bootstrap_commands(
+    scope: &str,
+    outer: Option<SocketAddr>,
+    allow_dns: bool,
+) -> Vec<Vec<String>> {
+    let table = killswitch_table(scope);
+    let mut commands = vec![
+        cmd(&["flush", "chain", "inet", table.as_str(), "output"]),
+        cmd(&[
+            "add",
+            "rule",
+            "inet",
+            table.as_str(),
+            "output",
+            "oifname",
+            quote("lo").as_str(),
+            "accept",
+        ]),
+    ];
+    if allow_dns {
+        // Temporary bootstrap hole: only name resolution for the handshake.
+        // It is flushed before the full rule set is installed.
+        for proto in ["udp", "tcp"] {
+            commands.push(cmd(&[
+                "add",
+                "rule",
+                "inet",
+                table.as_str(),
+                "output",
+                proto,
+                "dport",
+                "53",
+                "accept",
+            ]));
+        }
+    }
+    // Keep the underlay alive while bootstrapping: lease renewal and IPv6
+    // neighbour discovery/MLD.  These are temporary and unscoped because the
+    // previous underlay device may have changed; the full rule set restores
+    // the interface-scoped versions.
+    commands.push(cmd(&[
+        "add",
+        "rule",
+        "inet",
+        table.as_str(),
+        "output",
+        "udp",
+        "sport",
+        "68",
+        "udp",
+        "dport",
+        "67",
+        "accept",
+    ]));
+    commands.push(cmd(&[
+        "add",
+        "rule",
+        "inet",
+        table.as_str(),
+        "output",
+        "icmpv6",
+        "type",
+        "{ nd-router-solicit, nd-router-advert, nd-neighbor-solicit, \
+         nd-neighbor-advert, mld-listener-query, mld-listener-report, \
+         mld-listener-done, mld2-listener-report }",
+        "accept",
+    ]));
+    if let Some(outer) = outer {
+        let family = if outer.is_ipv6() { "ip6" } else { "ip" };
+        let addr = outer.ip().to_string();
+        let port = outer.port().to_string();
+        for proto in ["udp", "tcp"] {
+            commands.push(cmd(&[
+                "add",
+                "rule",
+                "inet",
+                table.as_str(),
+                "output",
+                family,
+                "daddr",
+                addr.as_str(),
+                proto,
+                "dport",
+                port.as_str(),
+                "accept",
+            ]));
+        }
+    }
+    commands
+}
+
 fn cmd(items: &[&str]) -> Vec<String> {
     items.iter().map(|item| item.to_string()).collect()
 }
@@ -341,11 +527,74 @@ pub async fn apply_kill_switch(
              resolvable underlay interface (neighbour discovery would be blocked)"
         ));
     }
-    apply_commands(
-        &killswitch_table(scope),
-        kill_switch_commands(scope, iface, outer, underlay),
-    )
-    .await
+    let table = killswitch_table(scope);
+    let nft = nft_bin().ok_or_else(|| {
+        anyhow!("nftables is required for this feature but no `nft` binary was found")
+    })?;
+    if table_present(&nft, &table).await {
+        // Replace rules inside the existing drop-policy chain.  Deleting the
+        // table first would briefly re-open the host, and a failed create
+        // would leave it open; flushing the chain keeps fail-closed.  Ensure
+        // the chain itself survived a partial crash-create.
+        ensure_drop_chain(&nft, &table).await?;
+        let flush = vec![
+            "flush".to_string(),
+            "chain".to_string(),
+            "inet".to_string(),
+            table.clone(),
+            "output".to_string(),
+        ];
+        let output = run(&nft, &flush).await?;
+        if !output.status.success() {
+            return Err(anyhow!(
+                "flush kill-switch chain {table}: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        for args in kill_switch_rule_commands(scope, iface, outer, underlay) {
+            let output = run(&nft, &args).await?;
+            if !output.status.success() {
+                return Err(anyhow!(
+                    "nft {} failed: {}",
+                    args.join(" "),
+                    String::from_utf8_lossy(&output.stderr).trim()
+                ));
+            }
+        }
+        return Ok(());
+    }
+    apply_commands(&table, kill_switch_commands(scope, iface, outer, underlay)).await
+}
+
+/// Add the minimal bootstrap rules to a preserved kill-switch table.
+///
+/// Returns `Ok(false)` when no table is installed (nothing to bootstrap).
+/// The existing `drop` policy is preserved; on failure the host stays
+/// fail-closed rather than becoming open.
+pub async fn bootstrap_kill_switch(
+    scope: &str,
+    outer: Option<SocketAddr>,
+    allow_dns: bool,
+) -> Result<bool> {
+    let Some(nft) = nft_bin() else {
+        return Ok(false);
+    };
+    let table = killswitch_table(scope);
+    if !table_present(&nft, &table).await {
+        return Ok(false);
+    }
+    ensure_drop_chain(&nft, &table).await?;
+    for args in bootstrap_commands(scope, outer, allow_dns) {
+        let output = run(&nft, &args).await?;
+        if !output.status.success() {
+            return Err(anyhow!(
+                "bootstrap kill-switch rule {} failed: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+    }
+    Ok(true)
 }
 
 pub async fn remove_mss(scope: &str) {
@@ -459,5 +708,68 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("underlay"), "{error}");
+    }
+
+    #[test]
+    fn rule_commands_replace_rules_without_recreating_the_chain() {
+        let outer: SocketAddr = "203.0.113.10:1194".parse().unwrap();
+        let text = text(&kill_switch_rule_commands(
+            "scope",
+            "rsvpn0",
+            outer,
+            Some("eth0"),
+        ));
+        assert!(!text.contains("add table"));
+        assert!(!text.contains("add chain"));
+        assert!(text.contains("oifname \"lo\" accept"));
+        assert!(text.contains("oifname \"rsvpn0\" accept"));
+        assert!(text.contains("ip daddr 203.0.113.10 udp dport 1194 accept"));
+        // The fail-closed policy lives on the preserved chain.
+        assert!(!text.contains("policy drop"));
+    }
+
+    #[test]
+    fn bootstrap_flushes_rules_and_keeps_drop_policy_chain() {
+        let outer: SocketAddr = "203.0.113.10:1194".parse().unwrap();
+        let boot = bootstrap_commands("scope", Some(outer), true);
+        assert_eq!(
+            boot[0],
+            vec![
+                "flush".to_string(),
+                "chain".to_string(),
+                "inet".to_string(),
+                killswitch_table("scope"),
+                "output".to_string(),
+            ]
+        );
+        let text = text(&boot);
+        assert!(text.contains("oifname \"lo\" accept"));
+        assert!(text.contains("udp dport 53 accept"));
+        assert!(text.contains("tcp dport 53 accept"));
+        assert!(text.contains("ip daddr 203.0.113.10 udp dport 1194 accept"));
+        assert!(text.contains("ip daddr 203.0.113.10 tcp dport 1194 accept"));
+        // Bootstrap keeps DHCPv4 and IPv6 ND/MLD alive while reconnecting.
+        assert!(text.contains("udp sport 68 udp dport 67 accept"));
+        assert!(text.contains("icmpv6 type"));
+        // Never delete or recreate the table that enforces the drop policy.
+        assert!(!text.contains("add table"));
+        assert!(!text.contains("add chain"));
+        assert!(!text.contains("delete"));
+    }
+
+    #[test]
+    fn recognizes_an_existing_chain_error_without_running_nft() {
+        assert!(stderr_indicates_exists(b"Error: File exists; add chain"));
+        assert!(stderr_indicates_exists(b"chain already exists"));
+        assert!(!stderr_indicates_exists(b"Operation not permitted"));
+    }
+
+    #[test]
+    fn bootstrap_without_dns_still_allows_the_outer_endpoint() {
+        let outer: SocketAddr = "[2001:db8::10]:1194".parse().unwrap();
+        let text = text(&bootstrap_commands("scope", Some(outer), false));
+        assert!(!text.contains("dport 53"));
+        assert!(text.contains("ip6 daddr 2001:db8::10 udp dport 1194 accept"));
+        assert!(text.contains("ip6 daddr 2001:db8::10 tcp dport 1194 accept"));
     }
 }

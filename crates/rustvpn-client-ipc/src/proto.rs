@@ -36,6 +36,22 @@ pub const MTU_MIN: usize = 68;
 /// Padded modes (noise/encless) carry more per-frame overhead.
 pub const MTU_MIN_NOISE: usize = 120;
 pub const MTU_MAX: usize = 9015;
+/// Linux `ip link set mtu` rejects a TAP IP MTU below 68.  Windows has a
+/// stricter platform-specific floor (576) checked by the Windows shim.
+pub const MIN_TAP_IP_MTU: usize = 68;
+
+/// Per-frame overhead (`Ethernet header + mode payload overhead`) stripped
+/// before the inner IP packet reaches the TAP.
+fn wire_overhead(noise: bool, encless: bool) -> usize {
+    let payload = if encless {
+        8 + 1 // nonce + pad
+    } else if noise {
+        16 + 8 + 1 // tag + nonce + pad
+    } else {
+        1 // pad
+    };
+    payload + 14
+}
 
 fn default_mtu() -> usize {
     1515
@@ -184,9 +200,23 @@ impl ProfileSpec {
         if !(MTU_MIN..=MTU_MAX).contains(&self.mtu) {
             return Err(format!("MTU must be between {MTU_MIN} and {MTU_MAX}"));
         }
-        if (self.noise || self.encless) && self.mtu < MTU_MIN_NOISE {
+        let padded = self.noise || self.encless;
+        if padded && self.mtu < MTU_MIN_NOISE {
             return Err(format!(
                 "minimum permissible MTU for noise/encless mode is {MTU_MIN_NOISE}"
+            ));
+        }
+        let derived = self.mtu.saturating_sub(wire_overhead(padded, self.encless));
+        if derived < MIN_TAP_IP_MTU {
+            let minimum = (MIN_TAP_IP_MTU + wire_overhead(padded, self.encless)).max(if padded {
+                MTU_MIN_NOISE
+            } else {
+                MTU_MIN
+            });
+            return Err(format!(
+                "MTU {} derives TAP IP MTU {derived}, below the minimum {MIN_TAP_IP_MTU}; \
+                 use at least {minimum}",
+                self.mtu
             ));
         }
         Ok(())
@@ -625,6 +655,26 @@ mod tests {
     }
 
     #[test]
+    fn validate_mtu_rejects_an_unusable_derived_tap_ip_mtu() {
+        let mut spec = ProfileSpec {
+            mtu: 68,
+            ..ProfileSpec::default()
+        };
+        let error = spec.validate_mtu().unwrap_err();
+        assert!(error.contains("derives TAP IP MTU 53"), "{error}");
+        assert!(error.contains("at least 83"), "{error}");
+
+        spec.mtu = 83;
+        assert!(spec.validate_mtu().is_ok());
+
+        spec.noise = true;
+        spec.mtu = 120;
+        assert!(spec.validate_mtu().is_ok()); // derived 81
+        spec.mtu = 119;
+        assert!(spec.validate_mtu().is_err());
+    }
+
+    #[test]
     fn generated_profile_yaml_parses() {
         // Shape emitted by `rustvpn-verifier -profile ...`.
         let yaml = r#"
@@ -710,6 +760,8 @@ ipv6: false
         status.traffic.tx_bytes = 10;
         status.traffic.rx_bytes = 20;
         status.frames_unauth = Some(0);
+        status.mss_applied = Some(false);
+        status.kill_switch_applied = Some(true);
         let doc = ClientStatusV1::from_status(&status);
         let value = serde_json::to_value(&doc).unwrap();
         assert_eq!(value["schema"], STATUS_SCHEMA);
@@ -717,6 +769,9 @@ ipv6: false
         assert_eq!(value["state"], "connected");
         assert_eq!(value["since"], "1970-01-01T00:00:00Z");
         assert_eq!(value["tx_bytes"], 10);
+        // "skipped because nft is absent" must remain visible as false.
+        assert_eq!(value["mss_applied"], false);
+        assert_eq!(value["kill_switch_applied"], true);
         let text = value.to_string().to_ascii_lowercase();
         for secret in ["password", "proxy_auth", "private", "signing"] {
             assert!(!text.contains(secret), "leaked field {secret}: {text}");

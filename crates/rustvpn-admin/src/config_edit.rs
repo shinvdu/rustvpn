@@ -12,8 +12,8 @@ use std::time::SystemTime;
 
 use rustvpn_crypto::blake2b;
 use rustvpn_crypto::verifier::Verifier;
-use rustvpn_net::config::{ConfigSet, PeerYaml};
-use rustvpn_proto::{MTU_MAX, MTU_MIN, MTU_MIN_NOISE};
+use rustvpn_net::config::{validate_wire_mtu, ConfigSet, PeerYaml};
+use rustvpn_proto::Mode;
 
 use crate::model::{
     rfc3339, BackupInfo, ConfigError, ConfigFiles, ConfigSnapshot, PeerId, PreviewReport,
@@ -194,15 +194,20 @@ pub fn validate_peer_settings(name: &str, peer: &PeerYaml) -> Result<(), ConfigE
             "{name}: either iface or up script is required"
         )));
     }
-    if peer.mtu != 0 && !(MTU_MIN..=MTU_MAX).contains(&peer.mtu) {
-        return Err(ConfigError::Invalid(format!(
-            "{name}: mtu must be between {MTU_MIN} and {MTU_MAX} (or 0 for the default)"
-        )));
-    }
-    if (peer.noise || peer.encless) && peer.mtu != 0 && peer.mtu < MTU_MIN_NOISE {
-        return Err(ConfigError::Invalid(format!(
-            "{name}: noise/encless requires mtu >= {MTU_MIN_NOISE}"
-        )));
+    // `0` is this editor's internal "field omitted / default 1515" marker; an
+    // explicit YAML `mtu: 0` is rejected during parsing.  Explicit non-zero
+    // values must satisfy the same contract as the server loader (range,
+    // noise floor and a usable derived TAP IP MTU), never silently clamped.
+    if peer.mtu != 0 {
+        let mode = if peer.encless {
+            Mode::Encless
+        } else if peer.noise {
+            Mode::Noise
+        } else {
+            Mode::Plain
+        };
+        validate_wire_mtu(mode, peer.mtu)
+            .map_err(|error| ConfigError::Invalid(format!("{name}: {error:#}")))?;
     }
     if peer.timesync < 0 {
         return Err(ConfigError::Invalid(format!(
@@ -654,11 +659,20 @@ mod tests {
         files.disabled.insert("alice".into(), peer("alice", "tap1"));
         assert!(files.validate().is_err());
 
-        let mut bad = peer("bob", "tap0");
-        bad.mtu = 10;
+        for mtu in [10, 68, 20000] {
+            let mut bad = peer("bob", "tap0");
+            bad.mtu = mtu;
+            let mut files = ConfigFiles::default();
+            files.enabled.insert("bob".into(), bad);
+            assert!(files.validate().is_err(), "mtu {mtu} must be rejected");
+        }
+
+        // Plain 83 is the smallest value that derives a usable TAP IP MTU.
+        let mut good = peer("bob", "tap0");
+        good.mtu = 83;
         let mut files = ConfigFiles::default();
-        files.enabled.insert("bob".into(), bad);
-        assert!(files.validate().is_err());
+        files.enabled.insert("bob".into(), good);
+        assert!(files.validate().is_ok());
     }
 
     #[test]

@@ -15,11 +15,16 @@ ExecStart=/usr/local/bin/rustvpn-clientd -socket /run/rustvpn-client/client.sock
 # confused with an administrator's own blackhole route.
 ExecStopPost=-/usr/sbin/ip -6 route del blackhole default proto 66 metric 50
 # nftables tables are named rustvpn_{mss,killswitch}_<hash-of-socket-path>.
-# The daemon removes them on shutdown and on the next start of the same
-# instance, so no unit-level `nft delete` is used (it would race with other
-# RustVPN daemons in the same netns and requires nft on the host PATH).
-# If the daemon is killed uncleanly, an active kill switch stays installed
-# (fail-closed) until that instance starts again; install the `nftables`
+# A clean stop removes them and writes a clean-shutdown marker next to the IPC
+# socket; a start that finds the marker removes any leftovers.  If the daemon
+# is killed uncleanly the marker is absent and the next start PRESERVES the
+# kill-switch table (fail-closed) and removes only the MSS table.  A connect
+# after that restart keeps the drop-policy chain and bootstraps through it,
+# then installs the full rule set (or removes the table) after the handshake.
+# No unit-level `nft delete` is used: it would race with other RustVPN daemons
+# in the same netns and requires nft on the host PATH.  If automatic recovery
+# cannot run, docs/en/configuration.md documents the per-instance manual
+# `nft delete table inet rustvpn_killswitch_<hash>`.  Install the `nftables`
 # package on hosts that use kill_switch/mss_clamp.
 AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW

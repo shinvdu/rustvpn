@@ -3,7 +3,7 @@
 > 日期：2026-11-26（2026-11-26 更新：应用决策并修复对抗性评审发现）
 > 状态：P0 Batch 1 / Batch 2 代码已落地，尚未提交；本文件同时记录**已执行决定与修复状态**。下方原始评审文本保留作背景。
 > 范围：MTU/MSS、kill-switch、QR、GUI、文档、status schema、rekey、keepalive、服务端声明式 TAP、diff reload。
-> 说明：代码、测试与英/中/俄文档的关键 MTU 语义已按“已执行决定”对齐；第二轮对抗性评审的 P1 修复记录见下表 P1-* 行。
+> 说明：代码、测试与英/中/俄文档的关键 MTU 语义已按“已执行决定”对齐；第二轮对抗性评审的 P1 修复记录见 P1-* 行，第三轮评审的 P2 修复记录见 P2-* 行（kill-switch 崩溃策略、重连 applied 状态、服务端 MTU 拒绝、派生 TAP IP MTU 下限、CLI keepalive、服务端 status 文档）。
 
 ---
 
@@ -16,14 +16,14 @@
 | 1 | MTU 来源与失败回退 | 不再使用链路/路径 MTU 推导；`underlay_mtu` 显式覆盖与主动 PMTU **不实现**，路径 MTU 协商列入 v2 | **已改为数值契约；auto 推迟 v2** |
 | 2 | `mtu: 0` 含义 | 客户端 IPC/profile 与服务端 `peers.yaml` 均明确拒绝显式 0；省略服务端字段仍为 1515 | **已修复** |
 | 3 | MSS clamp 缺 `nft` | 默认 best-effort 并记录 `mss_applied`；`mss_clamp: required` 严格模式**未实现** | **部分修复；required 延后** |
-| 4 | kill-switch 缺 `nft` | 保持 fail-closed；补充 `nftables` 打包说明与崩溃策略（规则保留=fail-closed，同实例下次启动清理） | **已修复** |
+| 4 | kill-switch 缺 `nft` / 崩溃策略 | 保持 fail-closed；clean-shutdown 标记区分正常停止与崩溃：正常停止删表，崩溃后下次启动**保留** kill-switch（仅删 MSS），空闲期间主机仍被 drop；连接时在保留链内引导放行外层端点，握手成功后替换为完整规则（新 profile 未启用则删表）；显式断开/停止删表恢复连通。补充 `nftables` 打包说明与手工清理命令 | **已修复（P2-1 收尾）** |
 | 5 | kill-switch 覆盖范围 | 仅主机 `output`；文档明确不覆盖 forward/LAN/NAT；补 ICMPv6 ND/MLD 与 DHCPv6（546/547）且限定物理接口 | **已修复** |
 | 6 | QR 生成方式 | 短期保留外部 `qrencode`；临时文件改为 `O_EXCL`/owner-only + 原子 rename，拒绝 symlink 竞态；内置 QR 延后 | **已加固；内置库延后** |
 | 7 | GUI 安全开关可见性 | 新 profile 默认数值 MTU 1515、rekey 1800；首页新增只读 MTU（线路/接口）与 kill-switch/MSS/rekey 状态；复选框开关**未实现** | **已做只读；开关延后** |
 | 8 | 新文档语言 | 英文文档已更新；zh/ru 的 MTU/0-auto、声明式 TAP 与 up 脚本语义已对齐，其余新章节仍可后续补齐 | **关键语义三语一致；其余翻译延后** |
 | 9 | 服务端 status 速率 | 增加 `rates_available: false`、`rate_window_sec: null`；`unavailable` 文档改为 schema 完整（相同字段 + `last_error`） | **已修复** |
 | 10 | `rekey_time` 默认值 | daemon/CLI 默认 0；新 GUI/onboarding profile 默认 1800；GUI 只读显示 | **已修复** |
-| 11 | keepalive 上下限 | 默认关闭；plain 10 s、noise/encless 25 s、上限 3600 s；noise 成本告警 | **已修复** |
+| 11 | keepalive 上下限 | 默认关闭；plain 10 s、noise/encless 25 s、上限 3600 s；noise 成本告警；CLI 与 profile 共享常量，verifier 使用相同边界（P2-5 修复了 CLI 仍用 5/15 s 的不一致） | **已修复（P2-5 收尾）** |
 | 12 | 时间重协商丢包 | 接受短暂断流；默认关闭（daemon）；文档明确非零丢包；零丢包留给 v2 | **已接受并文档化** |
 | 13 | 服务端声明式 TAP 所有权 | 严格 RustVPN 所有权：创建时写 `alias rustvpn-managed`；拒绝未标记的既有 TAP；接管标记 TAP 前先清空残留 IPv4 地址/路由/DNS；地址/路由使用 `add`（非 `replace`），`EEXIST` 仅在完全匹配时幂等，只记录/删除自己添加的项。收尾：reload 移除/修改 peer 后按当前配置剪枝遗留 guard（未变化的活跃 peer 保留）；`network:` 明确负责创建 TAP，`up` 若创建未标记 TAP 会收到明确错误（或脚本自行打标记）；移除 `network:` 不再需要重启 | **CLOSED** |
 | 14 | diff reload 吊销范围 | 保持严格吊销；日志列出变化字段；创建/插入 peer 前重查 config fingerprint；UDP 在 `registry.insert` 之后再次校验，过期则结束会话并清理本路径的声明式 guard | **已修复（P1-3 加固）** |
@@ -31,6 +31,13 @@
 | P1-2 | 仅改模式时复用旧 TAP MTU | 声明式 guard 指纹加入 `mode` 与派生的 `inner_ip_mtu`；复用旧 TAP 前检测指纹，变化则重建；plain 1515→1500、noise→1476、encless→1492 有回归测试；另新增 reload 剪枝回归测试，删除/修改 peer 不会遗留旧 guard | **CLOSED** |
 | P1-3 | UDP 配置吊销 TOCTOU | UDP 建 peer 在派生任务中运行；改为 `registry.insert` 后重新校验 fingerprint，过期则 `end_session` + 仅移除匹配指纹的声明式 guard + 计数/日志；纠正“与主任务串行”的错误注释；新增插入后重载的可单测判定 | **已修复** |
 | P1-4 | 文档仍教“线路 MTU 当作接口 MTU”、zh/ru 的 0/auto 语义 | en/zh/ru 的入门/配置/运维文档 up 脚本改为接口 IP MTU（1515 plain→1500、noise→1476、encless→1492），给出公式；删除 `mtu: 0 = 1515`，统一为 0/auto 拒绝、省略默认 1515 | **已修复** |
+| P1-5 | 崩溃保留 kill-switch 下主机名远端重连死锁 | 临时 DNS 放行原先只在连接开始时打开一次，解析后立即收窄为外层端点；握手失败清空 `endpoints` 后 DNS 已关闭，后续解析全部被 drop，主机名远端永远无法重连（IP 字面量不受影响）。新增 `BootstrapState` 显式跟踪 `active`/`dns_open`：首次握手成功前，**每次**解析前都重新打开 DNS 放行（`bootstrap_commands` 先 flush，幂等、不重复加规则），解析后收窄、握手前关闭；`bootstrap_kill_switch` 返回 `Ok(false)`（表已消失）时立即停止 fail-closed 声明，不再伪装保留。握手成功后完整规则集替换（DNS 放行随之消失）或按 profile 删表。IP 字面量与正常无崩溃路径不变。新增状态机回归测试覆盖“首次解析成功→握手失败→再次解析→最终成功”和表消失场景；因 TAP 需特权，未在 CI 跑完整引擎循环（残余缺口见评审记录）。en/zh/ru 文档同步说明临时 DNS 会在每次解析前重开、握手前关闭 | **CLOSED** |
+| P2-1 | systemd 自动重启后 kill switch 被启动清理删除（fail-open） | 新增 socket 旁的 clean-shutdown 标记（内容校验，拒绝截断）；正常停止删表并写标记，启动见标记才删遗留表；无标记视为崩溃：保留 kill-switch、只删 MSS；连接时 `flush chain output` 后仅放行 loopback/临时 DNS/新外层端点，握手成功后替换完整规则或按新 profile 删表；显式断开/停止删表。替换不再 delete 表，失败时保持 drop 策略。新增启动策略/标记/命令序列回归测试。手工恢复命令见 en/zh/ru 文档 | **CLOSED** |
+| P2-2 | 重连后 `mss_applied`/`kill_switch_applied` 被重置为 `None` | `base_status` 接收 live guard 的 applied 状态；重连、rekey、失败重连与解析失败的状态重建都携带真实值（MSS 被跳过为 `false`，kill-switch 为实际 `true/false`）；新增重连状态回归测试 | **CLOSED** |
+| P2-3 | 服务端显式 MTU 静默钳制，与客户端拒绝不一致 | `peers.yaml` 显式 `mtu` 越界（`<68`、`>9015`）、noise/encless `<120`、或推导 TAP IP MTU `<68` 一律拒绝，不再 clamp；省略仍默认 1515；admin 编辑器使用同一校验；en/zh/ru 文档改为“拒绝而非钳制”并新增边界测试 | **CLOSED** |
+| P2-4 | 极小 MTU 推导 TAP IP MTU <68（`ip link set` 拒绝） | 共享校验要求派生 TAP IP MTU ≥68：plain 线路 ≥83，noise/encless 的 120 下限派生 81/97；profile、CLI、IPC/GUI 保存、verifier、admin、server 在触碰网络前拒绝并报告派生值与最小可用线路值；Windows 576 仍为平台特定限制；新增 plain 68/82/83、noise/encless 120 回归测试 | **CLOSED** |
+| P2-5 | CLI keepalive 仍为 plain 5 s / padded 15 s | CLI 改用 `rustvpn-client-core::profile` 的 10/25/3600 常量，保留 `0`=关闭与 `<timeout` 校验；新增 CLI 边界测试，与 profile/verifier/文档一致 | **CLOSED** |
+| P2-6 | 服务端 `status --json` 文档混入客户端字段 | en/zh/ru 文档拆分为公共/仅客户端/仅服务端字段，并记录 `sessions[]`；明确服务端无顶层 iface/endpoint/last_handshake/rekey/keepalive，速率为 `null` 且 `rates_available:false`；新增 `ServerStatusV1` 顶层与会话键序列化对照测试 | **CLOSED** |
 
 其他一并修复的对抗性评审项：
 
@@ -594,16 +601,18 @@
 |---|---|
 | MTU 来源 | **数值线路 MTU（双方一致）**；拒绝 `auto`/`0`；仅推导 TAP IP MTU/MSS；auto/主动 PMTU 推迟 v2 |
 | `mtu: 0` | 客户端与服务端均拒绝显式 0（省略服务端字段默认 1515） |
+| 显式 MTU | 越界/低于 noise 下限/派生 TAP IP MTU <68 一律拒绝，不钳制 |
 | MSS clamp | 默认 best-effort；独立 IPv4/IPv6 值；`required` 严格模式延后 |
 | kill-switch | 默认关闭；显式开启；无 nft 时 fail-closed；仅主机 output；放行物理接口 ND/MLD/DHCPv6 |
+| kill-switch 崩溃 | clean-shutdown 标记；崩溃后保留表；首次握手成功前每次解析前重开临时 DNS、解析后收窄、握手前关闭；成功后替换/删除；表消失则不再声明 fail-closed；显式停止删表 |
 | QR | 外部 `qrencode`；临时文件 O_EXCL + 原子 rename；内置 QR 延后 |
 | GUI | 首页只读 MTU/安全状态；新 profile 默认 MTU 1515、rekey 1800；开关延后 |
-| 文档 | 英文已更新；中文/俄文后续 |
-| 服务端 status 速率 | `null` + `rates_available: false` + `rate_window_sec: null`；`unavailable` schema 完整 |
+| 文档 | en/zh/ru 已对齐 MTU、keepalive、kill-switch 崩溃策略与 status 形状 |
+| status 形状 | 公共/仅客户端/仅服务端字段分离；服务端速率 `null` + `rates_available:false`；`unavailable` schema 完整 |
 | `rekey_time` | daemon 默认 0；新 profile/GUI 默认 1800；GUI 只读显示 |
-| keepalive | 默认关闭；plain 10s / noise 25s / 上限 3600s |
+| keepalive | 默认关闭；plain 10s / noise 25s / 上限 3600s；CLI/profile 共享常量，verifier 使用相同边界 |
 | 时间重协商丢包 | 接受；默认关闭；零丢包留给 v2 |
-| 服务端声明式 TAP | 严格 RustVPN 所有权（`alias rustvpn-managed`）；拒绝未标记 TAP；移除 `network:` 需重启 |
+| 服务端声明式 TAP | 严格 RustVPN 所有权（`alias rustvpn-managed`）；拒绝未标记 TAP；移除 `network:`/删除 peer 时自动剪枝 guard，无需重启 |
 | diff reload | 严格吊销；日志列出变化字段；创建前重查 generation，避免 TOCTOU |
 
 ---

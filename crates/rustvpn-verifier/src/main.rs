@@ -403,6 +403,16 @@ fn validate_profile_mtu(value: &str, noise: bool) -> Result<(), String> {
     if noise && mtu < 120 {
         return Err(format!("noise/encless requires MTU >= 120 (got {mtu})"));
     }
+    // The generated profile must satisfy the same derived-TAP-IP-MTU contract
+    // as the daemon: plain wire values below 83 derive an IP MTU below 68.
+    if !noise {
+        let derived = mtu.saturating_sub(1 + 14);
+        if derived < 68 {
+            return Err(format!(
+                "MTU {mtu} derives TAP IP MTU {derived}, below the minimum 68; use at least 83"
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -747,6 +757,11 @@ mod tests {
         args.mtu = "0".into();
         let error = onboarding_profile(&args, &verifier()).unwrap_err();
         assert!(error.contains("0 is invalid"), "{error}");
+
+        let error = validate_profile_mtu("68", false).unwrap_err();
+        assert!(error.contains("derives TAP IP MTU 53"), "{error}");
+        assert!(validate_profile_mtu("83", false).is_ok());
+        assert!(validate_profile_mtu("120", true).is_ok());
     }
 
     #[test]

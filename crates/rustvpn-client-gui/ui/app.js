@@ -715,6 +715,13 @@ function validateProfileForConnect(profile) {
   if (mtu < 68 || mtu > 9015) {
     return "MTU 必须在 68 到 9015 之间";
   }
+  // The TAP interface IP MTU is derived from the wire MTU; the kernel rejects
+  // `ip link set mtu` below 68. Keep this in sync with the Rust validators.
+  const overhead = profile.encless ? 8 + 1 + 14 : profile.noise ? 16 + 8 + 1 + 14 : 1 + 14;
+  const derived = mtu - overhead;
+  if (derived < 68) {
+    return `MTU ${mtu} 推导出的 TAP IP MTU ${derived} 小于 68；至少使用 ${overhead + 68}`;
+  }
   const routes = (profile.routes || []).map((route) => String(route).trim().toLowerCase());
   const fullTunnel = routes.includes("default") || routes.includes("0.0.0.0/0");
   if (fullTunnel && !String(profile.gateway || "").trim()) {

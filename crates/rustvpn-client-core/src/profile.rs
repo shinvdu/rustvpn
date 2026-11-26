@@ -10,13 +10,15 @@ use ipnet::IpNet;
 use rustvpn_client_ipc::ProfileSpec;
 use rustvpn_crypto::verifier::Verifier;
 use rustvpn_net::config::{is_default_route, PeerConfig};
-use rustvpn_proto::{MTU_MAX, MTU_MIN, MTU_MIN_NOISE};
+use rustvpn_proto::Mode;
 
-/// Keepalive lower bounds.  Noise/encless keepalives are padded to the MTU,
-/// so they get a stricter floor to avoid a silent bandwidth burn.
-const KEEPALIVE_MIN: u64 = 10;
-const KEEPALIVE_MIN_PADDED: u64 = 25;
-const KEEPALIVE_MAX: u64 = 3600;
+/// Keepalive bounds shared by profile validation and the CLI (the verifier
+/// enforces the same limits with its dependency-light copy).
+/// Noise/encless keepalives are padded to the MTU, so they get a stricter
+/// floor to avoid a silent bandwidth burn.
+pub const KEEPALIVE_MIN: u64 = 10;
+pub const KEEPALIVE_MIN_PADDED: u64 = 25;
+pub const KEEPALIVE_MAX: u64 = 3600;
 const REKEY_TIME_MIN: u64 = 60;
 const REKEY_TIME_MAX: u64 = 86_400;
 const REKEY_JITTER_MAX: u64 = 3600;
@@ -65,12 +67,9 @@ impl ValidatedProfile {
                  path-MTU negotiation is deferred to v2"
             );
         }
-        if spec.mtu < MTU_MIN || spec.mtu > MTU_MAX {
-            bail!("MTU must be between {MTU_MIN} and {MTU_MAX}");
-        }
-        if (spec.noise || spec.encless) && spec.mtu < MTU_MIN_NOISE {
-            bail!("minimum permissible MTU for noise mode is {MTU_MIN_NOISE}");
-        }
+        // Reject an unusable derived TAP IP MTU (Linux `ip link set mtu`
+        // refuses values below 68) before any network state is touched.
+        crate::mtu::from_wire(self_mode(spec), spec.mtu).map_err(|error| anyhow!("{error:#}"))?;
         if spec.timeout == 0 {
             bail!("timeout must be positive");
         }
@@ -240,14 +239,8 @@ impl ValidatedProfile {
         })
     }
 
-    pub fn mode_enum(&self) -> rustvpn_proto::Mode {
-        if self.spec.encless {
-            rustvpn_proto::Mode::Encless
-        } else if self.spec.noise {
-            rustvpn_proto::Mode::Noise
-        } else {
-            rustvpn_proto::Mode::Plain
-        }
+    pub fn mode_enum(&self) -> Mode {
+        self_mode(&self.spec)
     }
 
     pub fn outer_host(&self) -> &str {
@@ -256,6 +249,16 @@ impl ValidatedProfile {
         } else {
             &self.spec.proxy
         }
+    }
+}
+
+fn self_mode(spec: &ProfileSpec) -> Mode {
+    if spec.encless {
+        Mode::Encless
+    } else if spec.noise {
+        Mode::Noise
+    } else {
+        Mode::Plain
     }
 }
 
@@ -268,6 +271,7 @@ fn has_default_route(routes: &[String]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rustvpn_proto::MTU_MIN_NOISE;
 
     fn base() -> ProfileSpec {
         ProfileSpec {
@@ -306,6 +310,25 @@ mod tests {
         assert!(ValidatedProfile::new(&spec).is_err());
         spec.noise = false;
         spec.ipv6 = true;
+        assert!(ValidatedProfile::new(&spec).is_err());
+    }
+
+    #[test]
+    fn rejects_derived_tap_ip_mtu_below_the_kernel_minimum() {
+        let mut spec = base();
+        spec.mtu = 68;
+        let error = ValidatedProfile::new(&spec).err().unwrap().to_string();
+        assert!(error.contains("derives TAP IP MTU 53"), "{error}");
+        assert!(error.contains("at least 83"), "{error}");
+
+        spec.mtu = 83;
+        assert!(ValidatedProfile::new(&spec).is_ok());
+
+        // The plain padded-mode floor already derives a usable TAP IP MTU.
+        spec.noise = true;
+        spec.mtu = 120;
+        assert!(ValidatedProfile::new(&spec).is_ok());
+        spec.mtu = 119;
         assert!(ValidatedProfile::new(&spec).is_err());
     }
 

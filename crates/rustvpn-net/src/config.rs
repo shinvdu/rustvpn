@@ -5,16 +5,65 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use ipnet::IpNet;
 use rustvpn_crypto::verifier::Verifier;
 use rustvpn_crypto::xtea::Xtea;
-use rustvpn_proto::{Mode, MTU_DEFAULT, MTU_MAX, MTU_MIN, MTU_MIN_NOISE};
+use rustvpn_proto::{Mode, MTU_DEFAULT, MTU_MAX};
 use serde::de::{self, Deserializer};
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
 
 use crate::DEFAULT_TIMEOUT;
+
+/// Ethernet header stripped before the inner IP packet reaches the TAP.
+pub const ETH_HEADER_LEN: usize = 14;
+
+/// Minimum usable TAP IP MTU.  Linux `ip link set ... mtu` rejects values
+/// below 68; Windows adapters have a stricter platform-specific floor (576)
+/// checked by the Windows shim.
+pub const MIN_TAP_IP_MTU: usize = 68;
+
+fn mode_label(mode: Mode) -> &'static str {
+    match mode {
+        Mode::Plain => "plain",
+        Mode::Noise => "noise",
+        Mode::Encless => "encless",
+    }
+}
+
+/// Validate a numeric wire MTU for a mode.
+///
+/// Explicit values outside `[MTU_MIN, MTU_MAX]` or below the noise minimum are
+/// rejected (never clamped), and the derived TAP IP MTU must be at least
+/// [`MIN_TAP_IP_MTU`].  The default is applied by the caller when the field is
+/// omitted.
+pub fn validate_wire_mtu(mode: Mode, mtu: usize) -> Result<()> {
+    if mtu == 0 {
+        bail!("mtu must be a positive numeric value; 0 is invalid");
+    }
+    if mtu < mode.min_mtu() {
+        bail!(
+            "wire MTU {mtu} is below the {}-byte minimum for {} mode",
+            mode.min_mtu(),
+            mode_label(mode)
+        );
+    }
+    if mtu > MTU_MAX {
+        bail!("wire MTU {mtu} exceeds the maximum {MTU_MAX}");
+    }
+    let inner = mode.max_payload(mtu).saturating_sub(ETH_HEADER_LEN);
+    if inner < MIN_TAP_IP_MTU {
+        let overhead = MTU_MAX - mode.max_payload(MTU_MAX);
+        let min_wire = (MIN_TAP_IP_MTU + ETH_HEADER_LEN + overhead).max(mode.min_mtu());
+        bail!(
+            "wire MTU {mtu} derives TAP IP MTU {inner}, below the minimum \
+             {MIN_TAP_IP_MTU}; use at least {min_wire} for {} mode",
+            mode_label(mode)
+        );
+    }
+    Ok(())
+}
 
 /// True when `route` denotes the default route.
 ///
@@ -116,7 +165,7 @@ impl PeerConfig {
     /// be able to emit frames larger than the mode payload budget and the
     /// reader would drop them.
     pub fn inner_ip_mtu(&self) -> usize {
-        self.max_payload().saturating_sub(14)
+        self.max_payload().saturating_sub(ETH_HEADER_LEN)
     }
 
     /// IPv4 TCP MSS clamp value derived from the TAP IP MTU.
@@ -293,6 +342,8 @@ impl ConfigSet {
         let mut ifaces: HashMap<String, String> = HashMap::new();
         for p in peers {
             let p = Arc::new(p);
+            validate_wire_mtu(p.mode(), p.mtu)
+                .with_context(|| format!("{}: invalid MTU", p.name))?;
             if by_id.contains_key(&p.id) {
                 return Err(anyhow!("duplicate peer verifier id for {}", p.name));
             }
@@ -342,13 +393,11 @@ impl ConfigSet {
             if y.timesync < 0 {
                 return Err(anyhow!("{name}: timesync must not be negative"));
             }
-            let mut mtu = if y.mtu == 0 { MTU_DEFAULT } else { y.mtu };
-            mtu = mtu.clamp(MTU_MIN, MTU_MAX);
+            // An omitted `mtu` keeps the historical default; explicit values are
+            // validated (not clamped) in `ConfigSet::from_peers`.
+            let mtu = if y.mtu == 0 { MTU_DEFAULT } else { y.mtu };
             let encless = y.encless;
             let noise = y.noise || encless;
-            if noise && mtu < MTU_MIN_NOISE {
-                mtu = MTU_MIN_NOISE;
-            }
             let timeout_secs = if y.timeout <= 0 {
                 DEFAULT_TIMEOUT.as_secs() as i64
             } else {
@@ -727,24 +776,40 @@ mod tests {
     }
 
     #[test]
-    fn parses_yaml_and_clamps_mtu() {
-        let id = [1u8; 16];
-        let mut verifier = Verifier::new(1, 1, 1, id);
-        verifier.public = Some([0x22u8; 32]);
-        let long = verifier.long_form().unwrap();
-        let path = std::env::temp_dir().join(format!("rustvpn-test-{}.yaml", std::process::id()));
-        std::fs::write(
-            &path,
-            format!("peer:\n  iface: tap9\n  mtu: 10\n  noise: true\n  verifier: {long}\n"),
-        )
-        .unwrap();
-        let set = ConfigSet::from_file(&path).unwrap();
-        let _ = std::fs::remove_file(&path);
-        let p = &set.peers[0];
-        assert_eq!(p.iface, "tap9");
-        assert_eq!(p.mtu, MTU_MIN_NOISE);
-        assert!(p.noise);
-        assert_eq!(p.timeout, Duration::from_secs(60));
-        assert_eq!(p.mode(), Mode::Noise);
+    fn rejects_explicit_out_of_range_and_unusable_mtu() {
+        for (line, expected) in [
+            ("  mtu: 10\n", "below the 68-byte minimum"),
+            ("  mtu: 20000\n", "exceeds the maximum"),
+            ("  mtu: 68\n", "derives TAP IP MTU 53"),
+        ] {
+            let error = format!("{:#}", parse_peer_mtu(line).unwrap_err());
+            assert!(error.contains(expected), "{line:?}: {error}");
+        }
+        // Noise minimum 120 is above the plain derived floor and is accepted.
+        let error = format!(
+            "{:#}",
+            parse_peer_mtu("  mtu: 119\n  noise: true\n").unwrap_err()
+        );
+        assert!(error.contains("minimum for noise"), "{error}");
+    }
+
+    #[test]
+    fn accepts_boundary_mtus_and_derives_a_usable_tap_ip_mtu() {
+        // Plain 68 is in range but derives 53; the smallest accepted plain
+        // value is 83 (inner IP MTU 68).
+        let plain = parse_peer_mtu("  mtu: 83\n").unwrap();
+        assert_eq!(plain.peers[0].mtu, 83);
+        assert_eq!(plain.peers[0].inner_ip_mtu(), MIN_TAP_IP_MTU);
+
+        // The noise/encless mode floor already derives a valid TAP IP MTU.
+        let noise = parse_peer_mtu("  mtu: 120\n  noise: true\n").unwrap();
+        assert_eq!(noise.peers[0].mode(), Mode::Noise);
+        assert_eq!(noise.peers[0].inner_ip_mtu(), 81);
+        let encless = parse_peer_mtu("  mtu: 120\n  encless: true\n").unwrap();
+        assert_eq!(encless.peers[0].mode(), Mode::Encless);
+        assert_eq!(encless.peers[0].inner_ip_mtu(), 97);
+
+        let max = parse_peer_mtu("  mtu: 9015\n").unwrap();
+        assert_eq!(max.peers[0].mtu, 9015);
     }
 }

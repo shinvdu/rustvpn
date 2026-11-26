@@ -51,7 +51,7 @@ sudo rustvpn-server -proto all -bind 0.0.0.0:1194 \
 
 启动时执行的校验：
 
-- `mtu` 必须是正的数值，且位于 `68..=9015` 区间；`auto` 与 `0` 会被拒绝；noise/encless 模式要求 `mtu >= 120`。
+- `mtu` 必须是正的数值，且位于 `68..=9015` 区间；`auto` 与 `0` 会被拒绝；还必须推导出至少 68 的 TAP IP MTU（plain 要求 `mtu >= 83`）；noise/encless 模式要求 `mtu >= 120`。越界值被拒绝而非钳制。
 - `-encless` 要求 `-proto tcp`（或 `-proxy`，后者强制 TCP）。
 - 未知的 `-proto` 值会被拒绝。
 
@@ -90,7 +90,7 @@ Tauri 客户端不读取 CLI 参数，而是使用
 ```yaml
 alice:
   iface: tap0           # TAP device name; may be empty if up prints it
-  mtu: 1515             # 双方一致的数值线路 MTU（默认 1515，钳制 68..9015；0 无效）
+  mtu: 1515             # 双方一致的数值线路 MTU（默认 1515；显式值经过校验且不钳制；0 无效）
   up: /etc/rustvpn/up.sh
   down: /etc/rustvpn/down.sh
   timeout: 60           # seconds; <= 0 means 60
@@ -110,7 +110,7 @@ alice:
 
 - `iface` 或 `up` 至少有一个可用。若 `iface` 为空，则使用 up 脚本 stdout 的第一行作为接口名。
 - `verifier` 必须能解码且包含公钥。短格式会被拒绝并报 `server verifier has no public key`。
-- `mtu: 0` 无效并被拒绝；省略 `mtu` 才使用历史默认值 1515。数值会被钳制到 `[68, 9015]`；noise/encless 条目会被提升到至少 120。
+- `mtu: 0` 无效并被拒绝；省略 `mtu` 才使用历史默认值 1515。显式值**越界即拒绝，不再钳制**：必须位于 `[68, 9015]`、noise/encless 不低于 120，且推导出的 TAP IP MTU 不得低于 68（plain 线路值至少 83，即 `wire - 15`）。客户端 profile、守护进程、CLI、admin 编辑器与服务端加载器使用同一契约，因此误写的 `mtu: 10`/`mtu: 20000` 会在写入/连接前明确报错，而不是在一侧被静默改成 68/9015。
 - `encless: true` 会强制 `noise: true`（填充是编码的一部分）。
 - `timeout <= 0` 表示 60 秒。
 - `network` 可选。若存在，需要 `iface`（或能打印接口名的 up 脚本）；IPv4 地址/网关/DNS/路由会被校验，默认路由（含 `00.0.0.0/0` 等非规范前缀 0 写法）会被拒绝。见下方“服务端声明式网络”。
@@ -173,11 +173,28 @@ ipv6_mss     = inner_ip_mtu - 60
 | noise | `MTU - 25`（16 tag + 8 nonce + 1 pad） | 1476 | 1436 / 1416 |
 | encless | `MTU - 9`（8 nonce + 1 pad） | 1492 | 1452 / 1432 |
 
+- **推导出的 TAP IP MTU 必须至少为 68**：Linux 拒绝 `ip link set ... mtu` 低于 68（Windows 适配器另要求至少 576）。plain 线路值低于 83（`68 - 15`）会被拒绝；noise/encless 的 120 下限本身推导为 81/97。客户端 profile、CLI、verifier、admin 编辑器与服务端加载器都会在触碰 TAP/路由**之前**校验，并在错误中给推导值与最小可用线路值。服务端显式越界值会被拒绝，而不是钳制。
 - 守护进程（`rustvpn-clientd`）与服务端声明式路径（`network:`）把 TAP 接口设置为 `inner_ip_mtu`，**绝不是帧预算本身**，并记录线路 MTU、模式、内部 MTU 与 MSS。
 - 走 Go 兼容的 CLI/up 脚本且自行配置接口时，必须写入同一个内部值：如 plain `-mtu 1515` → `ip link set ... mtu 1500`，noise → `1476`，encless → `1492`。若改用其它线路 MTU，请按上面的公式计算。
 - 超过模式有效载荷上限的帧会被拒绝并记录日志，绝不会被静默截断。
 - **自动路径 MTU 推导推迟到 v2 的 MTU 协商**。v1 不宣称路径 MTU 自适应；若路径更小，请在**两侧**同时降低数值线路 MTU。
 - encless 在普通 1500 字节外层路径上仍会记录容量告警：每个包增加 `4128` 字节。不要依赖 IP 分片；请使用 jumbo 帧或其它模式。
+
+## Kill switch（全隧道）
+
+`kill_switch: true` 创建按实例命名的 `inet rustvpn_killswitch_<hash>` 表，`output` 链策略为 `drop`，仅放行 loopback、TAP 接口、已解析的外层端点、DHCPv4，以及限定在物理接口上的 ICMPv6 ND/MLD 与 DHCPv6。它**只覆盖主机 `output`**，不保护 forward/LAN/NAT；分流 profile 会被拒绝。
+
+- **崩溃策略（fail-closed）**：正常断开/停止会删除表并恢复连通性，同时在 IPC socket 旁写入 clean-shutdown 标记。启动时若发现该标记，则清理遗留表；若**没有**标记，视为上次崩溃：保留 kill-switch 表（守护进程空闲期间主机仍 fail-closed），只删除非安全边界的 MSS 表，并在崩溃发生在建表中途时补建 `drop` 策略链，避免半套表静默放行。
+- 崩溃重启后的下一次连接会在保留 `drop` 策略的前提下工作：首次握手成功之前，每次解析远端主机名前都会重新打开**临时 DNS 放行**（UDP/TCP 53），随后把现有 `output` 链收窄为 loopback、刚解析出的外层端点和底层接口控制流量，并在握手前再次关闭该放行。若握手失败，缓存的端点会被丢弃，下一次重试会先重新打开 DNS 放行再解析，因此主机名远端不会陷入永久 DNS 被阻塞的死循环。握手成功后安装完整规则集（其中不含 DNS 放行）；若新 profile 未启用 kill switch 则删除该表。显式断开/停止始终删除保留表。
+- 表名后缀由 IPC socket 路径哈希得到，同一 netns 的其它 RustVPN 实例不受影响。systemd unit 不执行全局 `nft delete`（会与其它实例竞争，且要求宿主 PATH 中有 `nft`）。
+- 若自动恢复无法运行（例如缺少 `nft` 或链只创建了一半），只手工清理本实例的表：
+
+  ```bash
+  nft list tables | grep rustvpn_killswitch_
+  nft delete table inet rustvpn_killswitch_<hash>
+  ```
+
+  守护进程会记录 socket 路径；hash 是其 FNV-1a 哈希的前 8 位十六进制。不要删除其它实例的表或全局规则集。
 
 ## 服务端声明式网络（`network:`）
 
@@ -210,10 +227,24 @@ ipv6_mss     = inner_ip_mtu - 60
 
 `noise: true`（或 `-noise`）将每个出站帧填充至 MTU。它隐藏包长度，但可能显著增加流量。请在两侧都启用以达到预期效果。载荷开销见 [MTU](#mtu)。
 
+## Keepalive
+
+`keepalive: N`（或 `-keepalive N`）在空闲时按间隔发送一个经认证的空包，以维持 NAT/防火墙映射；`0` 表示关闭，沿用历史 `timeout/4` heartbeat。上下限在各入口一致：plain 模式 `10..=3600` 秒，noise/encless 因每个包都填充到 MTU 而要求 `25..=3600` 秒，并且必须小于 `timeout`。profile 校验、CLI、verifier 与文档使用相同的上下限。
+
 <a id="encless"></a>
 ## Encless
 
 `encless: true`（或 `-encless`）用 AONT + Chaffing-and-Winnowing 取代流加密，仅使用认证原语（不使用加密函数）来保持机密性。它会强制启用 noise，并为每个数据包增加 **4128 字节**，因此开销较大。客户端仅在 TCP 上支持它，与 Go 一致：使用默认 UDP proto 时，`-encless` 会被拒绝。参见[协议 → Encless](protocol.md#encless)。
+
+## `status --json`
+
+`rustvpn-client status --json` 与 `rustvpn-server status --json -control ...` 输出带 `"schema": "rustvpn.status.v1"` 的无密文文档。角色形状不同：
+
+- **公共字段**：`schema`、`role`、`state`、`since`、`proto`、`last_error`、`tx_bytes`/`rx_bytes`、`tx_rate_bps`/`rx_rate_bps`、`rates_available`、`rate_window_sec`、`heartbeat_sent`/`heartbeat_recv`、`frames_unauth`/`frames_dup`。
+- **仅客户端**：`profile`、`server`、`mode`、`iface`、`endpoint`、`last_handshake`、`rekey_in_sec`、`rekey_time_sec`、`keepalive_sec`、`mtu`、`inner_mtu`、`mtu_source`、`mss`/`mss_v6`、`mss_applied`、`kill_switch`、`kill_switch_applied`。客户端连接后约每 1 秒采样速率，`rates_available` 为 `true`。
+- **仅服务端**：`server_version`、`server_instance`、`bind`、`uptime_seconds`、`active_sessions`、`configured_peers`、`config_generation`、`config_last_loaded_at`、`config_last_error`、`counters`，以及 `sessions[]`（每项含 `session_id`、`peer_id`、`name`、`addr`、`proto`、`mode`、`mtu`、`established`、`last_ping`、`counters`）。
+
+服务端**不**输出顶层 `iface`/`endpoint`/`last_handshake`/`rekey_in_sec`/`rekey_time_sec`/`keepalive_sec`；mode/MTU 只在每个 session 内。顶层 `counters` 含 `handshake_requests`、`handshake_rate_limited`、`handshake_errors`、`tcp_connections_rejected`、`sessions_started`、`sessions_finished`、`events_dropped`；每个 session 的 `counters` 对应 GoVPN `/stats` 字段。服务端没有速率采样器：`tx_rate_bps`/`rx_rate_bps` 为 `null`，`rates_available: false`、`rate_window_sec: null`；需要速率时对两次计数采样求差。socket 不可达时仍输出 schema 完整的 `unavailable` 文档与 `last_error`，并以非零退出。
 
 ## 统计端点
 

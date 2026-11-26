@@ -51,8 +51,10 @@ sudo rustvpn-server -proto all -bind 0.0.0.0:1194 \
 
 Validation performed at startup:
 
-- `mtu` must be a positive number in `68..=9015` (0 and `auto` are
-  rejected); noise/encless modes require `mtu >= 120`.
+- `mtu` must be a positive number in `68..=9015` (0 and `auto` are rejected)
+  and must derive a TAP IP MTU of at least 68 (plain requires `mtu >= 83`);
+  noise/encless modes require `mtu >= 120`.  Out-of-range values are rejected,
+  not clamped.
 - `-encless` requires `-proto tcp` (or `-proxy`, which forces TCP).
 - An unknown `-proto` value is rejected.
 - `keepalive` is 0 (off) or 10..=3600 s in plain mode, 25..=3600 s in
@@ -178,7 +180,7 @@ YAML behaviour.
 ```yaml
 alice:
   iface: tap0           # TAP device name; may be empty if up prints it
-  mtu: 1515             # numeric wire MTU (default 1515, clamped 68..9015; 0 invalid)
+  mtu: 1515             # numeric wire MTU (default 1515; explicit values validated, never clamped; 0 invalid)
   up: /etc/rustvpn/up.sh
   down: /etc/rustvpn/down.sh
   timeout: 60           # seconds; <= 0 means 60
@@ -202,8 +204,12 @@ Rules applied when the file is loaded:
 - `verifier` must decode and contain a public key. The short form is
   rejected with `server verifier has no public key`.
 - `mtu: 0` is invalid and rejected.  Omitting `mtu` keeps the historical
-  default 1515.  Values are clamped to `[68, 9015]`; noise/encless entries are
-  raised to at least 120.
+  default 1515.  Explicit values are **rejected, never clamped**, when they
+  fall outside `[68, 9015]`, fall below the noise/encless floor of 120, or
+  derive a TAP IP MTU below 68 (plain values below 83, i.e. `wire - 15`).
+  The client profile, daemon, CLI, verifier, admin editor and server loader
+  enforce the same contract, so a mistyped `mtu: 10` or `mtu: 20000` fails
+  loudly instead of silently becoming 68 or 9015 on one side only.
 - `encless: true` forces `noise: true` (the padding is part of the
   encoding).
 - `timeout <= 0` means 60 seconds.
@@ -282,6 +288,14 @@ ipv6_mss     = inner_ip_mtu - 60
 | noise | `MTU - 25` (16 tag + 8 nonce + 1 pad) | 1476 | 1436 / 1416 |
 | encless | `MTU - 9` (8 nonce + 1 pad) | 1492 | 1452 / 1432 |
 
+- The **derived TAP IP MTU must be at least 68**: Linux rejects
+  `ip link set ... mtu` below 68 (and Windows adapters require at least 576).
+  Plain wire MTUs below 83 (`68 - 15`) are rejected; the noise/encless floor
+  of 120 already derives 81/97.  This is checked by profile validation, the
+  CLI, the verifier, the admin editor and the server loader **before** any TAP
+  or route is touched, with an error that quotes the derived value and the
+  minimum accepted wire MTU.  Explicit out-of-range server values are rejected
+  rather than clamped.
 - The daemon (`rustvpn-clientd`) and the declarative server path
   (`network:`) set the TAP interface to `inner_ip_mtu`, never to the frame
   budget.  Both log the wire MTU, mode, inner MTU and MSS values.
@@ -552,24 +566,47 @@ rustvpn-client status --json | jq -e '.frames_unauth == 0' || alert
 rustvpn-server status --json -control /run/rustvpn/server.sock
 ```
 
-The document starts with `"schema": "rustvpn.status.v1"` and includes
-`role`, `state`, `since`, `server`/`bind`, `proto`, `mode`, `iface`,
-`endpoint`, `last_handshake`, `rekey_in_sec` (4 GiB budget),
-`rekey_time_sec` (configured time-driven interval), `keepalive_sec`, traffic
-totals/rates, heartbeat counters, `frames_unauth`, `frames_dup` and the
-effective MTU/MSS where available.  The client additionally reports:
+The document starts with `"schema": "rustvpn.status.v1"`.  The two roles
+share a common core but deliberately have different shapes:
 
-- `mtu` (numeric wire value), `inner_mtu` (derived TAP IP MTU) and
+**Common fields (client and server):** `schema`, `role`, `state`, `since`,
+`proto`, `last_error`, `tx_bytes`, `rx_bytes`, `tx_rate_bps`, `rx_rate_bps`,
+`rates_available`, `rate_window_sec`, `heartbeat_sent`, `heartbeat_recv`,
+`frames_unauth`, `frames_dup`.
+
+**Client-only fields** (`rustvpn-client status --json`):
+
+- identity/transport: `profile`, `server` (remote), `mode`, `iface`,
+  `endpoint`, `last_handshake`, `rekey_in_sec` (4 GiB budget),
+  `rekey_time_sec` (configured interval), `keepalive_sec`;
+- MTU: `mtu` (numeric wire value), `inner_mtu` (derived TAP IP MTU) and
   `mtu_source` (`configured`; `auto` is deferred to v2);
-- `mss`/`mss_v6` (derived values) and `mss_applied` (whether the nftables
-  table was really installed);
-- `kill_switch` (profile value) and `kill_switch_applied`;
-- `rates_available` and `rate_window_sec` (the daemon samples over ~1 s).
+- firewall: `mss`/`mss_v6` (derived values), `mss_applied` (the nftables table
+  was really installed; `false` also means "skipped because `nft` is absent"),
+  `kill_switch` (profile value) and `kill_switch_applied`;
+- the client samples rates over ~1 s while connected, so `rates_available` is
+  `true` and `rate_window_sec` is set.
 
-Server output includes a `sessions` array, but no rate sampler: server
-`tx_rate_bps`/`rx_rate_bps` remain `null` with `rates_available: false` and
-`rate_window_sec: null`.  Compute rates from two counter samples if needed.
-No passwords, keys, proxy credentials or full verifier material are included.
+**Server-only fields** (`rustvpn-server status --json`):
+`server_version`, `server_instance`, `bind`, `uptime_seconds`,
+`active_sessions`, `configured_peers`, `config_generation`,
+`config_last_loaded_at`, `config_last_error`, `counters`, and a `sessions[]`
+array whose entries contain `session_id`, `peer_id`, `name`, `addr`, `proto`,
+`mode` (per session), `mtu` (per session), `established`, `last_ping` and
+`counters`.
+
+The server does **not** emit top-level `iface`, `endpoint`, `last_handshake`,
+`rekey_in_sec`, `rekey_time_sec` or `keepalive_sec`; `mode`/`mtu` exist only
+inside each `sessions[]` entry.  The top-level `counters` object contains
+`handshake_requests`, `handshake_rate_limited`, `handshake_errors`,
+`tcp_connections_rejected`, `sessions_started`, `sessions_finished` and
+`events_dropped`; a session's `counters` mirrors the GoVPN `/stats` fields
+(`bytes_in`, `bytes_out`, `payload_in`, `payload_out`, `frames_in`,
+`frames_out`, `unauth`, `dup`, `heartbeat_recv`, `heartbeat_sent`).  The server
+does not run a rate sampler: its `tx_rate_bps`/`rx_rate_bps` remain `null`
+with `rates_available: false` and `rate_window_sec: null`.  Compute rates from
+two counter samples if needed.  No passwords, keys, proxy credentials or full
+verifier material are included.
 
 If the daemon/socket is unreachable with `--json`, command still prints a
 **schema-complete** document with `"state": "unavailable"`, the same field
@@ -593,12 +630,40 @@ traffic is blocked while connected.
   profiles are rejected rather than silently downgraded.
 - **Fail-closed:** if `nft` is missing or a rule cannot be applied, the
   connection is refused instead of silently running without protection.
-- The table is removed on disconnect and on the next start of the same
-  daemon instance (the suffix is derived from the IPC socket path, so another
-  RustVPN daemon in the same netns is unaffected).  If the daemon is killed
-  uncleanly, the rules stay installed (fail-closed) until it starts again;
-  the systemd unit deliberately does not run a global `nft delete`, which
-  would race with other instances and require `nft` on the host PATH.
+- **Crash policy (fail-closed):** a clean disconnect/shutdown removes the
+  table and restores connectivity, and the daemon writes a clean-shutdown
+  marker next to its IPC socket.  A start that finds that marker removes any
+  leftover tables.  A start **without** the marker treats the previous run as
+  a crash: it preserves the kill-switch table (the host stays fail-closed
+  while the daemon is idle) and removes only the non-security MSS table.  It
+  also recreates the `drop`-policy chain if the crash happened mid-create, so
+  a partial table cannot silently filter nothing.
+- After such a restart, the next connect keeps the `drop` policy in force.
+  While the first handshake has not succeeded, the daemon opens a
+  **temporary DNS allowance** (UDP/TCP port 53) before *every* hostname
+  lookup, then narrows the existing `output` chain to loopback, the newly
+  resolved outer endpoint and underlay control traffic — closing the allowance
+  again before the handshake.  If the handshake fails, the cached endpoint is
+  discarded and the next retry re-opens the DNS allowance before resolving, so
+  a hostname remote cannot become permanently DNS-blocked.  After a successful
+  handshake it installs the full current rule set (which contains no DNS
+  allowance), or removes the table if the new profile does not request a kill
+  switch.  An explicit disconnect/shutdown always removes the preserved table.
+- The suffix is derived from the IPC socket path, so another RustVPN daemon in
+  the same netns is unaffected.  The systemd unit deliberately does not run a
+  global `nft delete` (it would race with other instances and require `nft`
+  on the host PATH).
+- If automatic recovery cannot run (for example `nft` is unavailable or the
+  chain was left half-created), inspect and remove only this instance's table
+  manually:
+
+  ```bash
+  nft list tables | grep rustvpn_killswitch_
+  nft delete table inet rustvpn_killswitch_<hash>
+  ```
+
+  The daemon logs the socket path; the hash is the first 8 hex digits of its
+  FNV-1a hash.  Never delete another instance's table or a global ruleset.
 - Install the `nftables` package on hosts using `kill_switch`/`mss_clamp`.
 - Only RustVPN-owned tables are touched; existing NAT/filter rules and
   interfaces are not modified.

@@ -394,6 +394,150 @@ mod tests {
         assert!(value["rate_window_sec"].is_null());
     }
 
+    /// Top-level keys documented for the server `status --json` document.
+    /// Keeping this list in a test makes a docs/schema drift visible.
+    const SERVER_STATUS_KEYS: &[&str] = &[
+        "schema",
+        "role",
+        "state",
+        "since",
+        "server_version",
+        "server_instance",
+        "bind",
+        "proto",
+        "uptime_seconds",
+        "active_sessions",
+        "configured_peers",
+        "config_generation",
+        "config_last_loaded_at",
+        "config_last_error",
+        "last_error",
+        "tx_bytes",
+        "rx_bytes",
+        "tx_rate_bps",
+        "rx_rate_bps",
+        "rates_available",
+        "rate_window_sec",
+        "heartbeat_sent",
+        "heartbeat_recv",
+        "frames_unauth",
+        "frames_dup",
+        "sessions",
+        "counters",
+    ];
+
+    const SERVER_SESSION_KEYS: &[&str] = &[
+        "session_id",
+        "peer_id",
+        "name",
+        "addr",
+        "proto",
+        "mode",
+        "mtu",
+        "established",
+        "last_ping",
+        "counters",
+    ];
+
+    const SERVER_COUNTER_KEYS: &[&str] = &[
+        "handshake_requests",
+        "handshake_rate_limited",
+        "handshake_errors",
+        "tcp_connections_rejected",
+        "sessions_started",
+        "sessions_finished",
+        "events_dropped",
+    ];
+
+    const SESSION_COUNTER_KEYS: &[&str] = &[
+        "bytes_in",
+        "bytes_out",
+        "payload_in",
+        "payload_out",
+        "frames_in",
+        "frames_out",
+        "unauth",
+        "dup",
+        "heartbeat_recv",
+        "heartbeat_sent",
+    ];
+
+    fn sorted_keys(value: &serde_json::Value) -> Vec<&str> {
+        let mut keys: Vec<&str> = value
+            .as_object()
+            .expect("object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        keys
+    }
+
+    fn assert_keys(value: &serde_json::Value, expected: &[&str]) {
+        let mut expected = expected.to_vec();
+        expected.sort_unstable();
+        assert_eq!(sorted_keys(value), expected);
+    }
+
+    #[test]
+    fn documented_status_keys_match_serialization() {
+        let doc = ServerStatusV1::unavailable("[::]:1194", "unreachable");
+        let value = serde_json::to_value(&doc).unwrap();
+        assert_keys(&value, SERVER_STATUS_KEYS);
+        assert_keys(&value["counters"], SERVER_COUNTER_KEYS);
+        let object = value.as_object().unwrap();
+
+        // Client-only fields must never be documented or emitted as top-level
+        // server fields.
+        for key in [
+            "iface",
+            "endpoint",
+            "last_handshake",
+            "rekey_in_sec",
+            "rekey_time_sec",
+            "keepalive_sec",
+        ] {
+            assert!(
+                !object.contains_key(key),
+                "server emitted client field {key}"
+            );
+        }
+
+        let session = SessionInfo {
+            session_id: 1,
+            peer_id: "00".repeat(16),
+            name: "alice".into(),
+            addr: "203.0.113.10:5000".into(),
+            proto: "udp".into(),
+            mode: "noise".into(),
+            mtu: 1515,
+            established: "2026-11-26T08:00:00Z".into(),
+            started_at_unix: 0,
+            last_ping: "2026-11-26T08:00:01Z".into(),
+            last_sent: "2026-11-26T08:00:01Z".into(),
+            counters: Counters::default(),
+        };
+        let status = ServerStatus {
+            server_version: "0.2.0".into(),
+            server_instance: 1,
+            uptime_seconds: 1,
+            bind: "[::]:1194".into(),
+            proto: "udp".into(),
+            active_sessions: 1,
+            configured_peers: 1,
+            config_generation: 0,
+            config_last_loaded_at: None,
+            config_last_error: None,
+            counters: ServerCounters::default(),
+        };
+        let value = serde_json::to_value(ServerStatusV1::from_parts(&status, &[session])).unwrap();
+        let sessions = value["sessions"].as_array().unwrap();
+        assert_keys(&sessions[0], SERVER_SESSION_KEYS);
+        assert_keys(&sessions[0]["counters"], SESSION_COUNTER_KEYS);
+        assert_eq!(sessions[0]["mode"], "noise");
+        assert_eq!(sessions[0]["mtu"], 1515);
+    }
+
     #[test]
     fn unavailable_document_is_schema_complete() {
         let doc = ServerStatusV1::unavailable("[::]:1194", "control socket timed out");

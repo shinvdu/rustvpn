@@ -100,6 +100,10 @@ impl Engine {
                         }
                         Some(Command::Disconnect) => {
                             stop_current(&mut current).await;
+                            // An explicit disconnect restores connectivity even
+                            // when the daemon is idle with a crash-preserved
+                            // kill-switch table (no connection guard to remove).
+                            crate::firewall::cleanup_stale(&options.firewall_scope).await;
                             let _ = events.send(Event::State(EngineStatus {
                                 state: "idle".into(),
                                 ..EngineStatus::default()
@@ -128,6 +132,99 @@ async fn stop_current(current: &mut Option<(CancellationToken, JoinHandle<()>)>)
     if let Some((cancel, handle)) = current.take() {
         cancel.cancel();
         let _ = handle.await;
+    }
+}
+
+/// Whether resolving `host` needs the temporary DNS allowance.
+///
+/// `lookup_host` parses an IP literal (with an optional port) locally, so the
+/// crash bootstrap must not widen the table for an IP-literal remote.  This
+/// keeps the DNS hole limited to hostname remotes and preserves the previous
+/// behavior for IP literals.
+fn lookup_needs_dns(host: &str) -> bool {
+    host.parse::<std::net::SocketAddr>().is_err()
+}
+
+/// Ordering contract for the kill-switch table preserved across a crash.
+///
+/// A crash-preserved table keeps its `drop` policy; the engine widens it just
+/// enough to reconnect:
+///
+/// 1. The temporary DNS allowance must be open before a DNS lookup.
+/// 2. After a successful lookup the rules are narrowed to the resolved outer
+///    endpoint, which closes the allowance again.
+/// 3. If the handshake then fails, `endpoints` is cleared and the next loop
+///    iteration must re-open the allowance before it can resolve again.
+/// 4. A successful handshake replaces the table with the full rule set (or
+///    removes it); no bootstrap is needed afterwards.
+///
+/// Tracking this explicitly instead of a single `stale` bool prevents both
+/// the DNS-blocked reconnect loop and a DNS allowance left open by accident.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BootstrapState {
+    /// A preserved table is still enforcing the kill switch.
+    active: bool,
+    /// The temporary DNS allowance is currently present in that table.
+    dns_open: bool,
+}
+
+impl BootstrapState {
+    /// No crash-preserved table; the normal path never touches the firewall.
+    fn inactive() -> Self {
+        Self {
+            active: false,
+            dns_open: false,
+        }
+    }
+
+    /// A preserved table exists but its DNS allowance is not confirmed open
+    /// (the initial bootstrap has not succeeded yet).
+    fn pending() -> Self {
+        Self {
+            active: true,
+            dns_open: false,
+        }
+    }
+
+    /// Whether the preserved table still exists and has not been replaced.
+    fn active(&self) -> bool {
+        self.active
+    }
+
+    /// Whether the engine must (re-)open the DNS allowance before resolving.
+    fn needs_dns(&self) -> bool {
+        self.active && !self.dns_open
+    }
+
+    /// Whether the engine must narrow the table before a handshake.
+    fn needs_narrow(&self) -> bool {
+        self.active
+    }
+
+    /// Record the outcome of `bootstrap_kill_switch(scope, None, true)`.
+    /// `present == false` means the table vanished; stop claiming fail-closed.
+    fn record_dns(&mut self, present: bool) {
+        if present {
+            self.dns_open = true;
+        } else {
+            *self = Self::inactive();
+        }
+    }
+
+    /// Record the outcome of `bootstrap_kill_switch(scope, Some(outer), false)`.
+    /// `present == false` means the table vanished; stop claiming fail-closed.
+    fn record_narrow(&mut self, present: bool) {
+        if present {
+            self.dns_open = false;
+        } else {
+            *self = Self::inactive();
+        }
+    }
+
+    /// A successful handshake installed the full rule set (or removed the
+    /// table).  The temporary allowance is gone in either case.
+    fn replaced(&mut self) {
+        *self = Self::inactive();
     }
 }
 
@@ -168,7 +265,6 @@ async fn run_connection(
         format!("tunnel lock acquired: {}", _lock.path().display()),
     );
     crate::netcfg::cleanup_stale_ipv6_blackhole().await;
-    crate::netcfg::cleanup_stale_firewall(&options.firewall_scope).await;
 
     // Argon2d is intentionally expensive.  Keep it off the async workers so
     // status/Disconnect requests stay responsive while a profile is opened.
@@ -195,6 +291,47 @@ async fn run_connection(
             return;
         }
     };
+
+    // The daemon start already applied the crash policy: after a clean
+    // shutdown all tables are gone, after a crash the kill switch is preserved.
+    // Never delete it here, or a crash-restarted daemon would re-open the host.
+    // Bootstrap after validation/key derivation so a bad passphrase cannot
+    // leave a temporary DNS hole in a preserved table.
+    let scope = options.firewall_scope.clone();
+    let mut bootstrap = BootstrapState::inactive();
+    if crate::firewall::kill_switch_present(&scope).await {
+        bootstrap = BootstrapState::pending();
+        match crate::firewall::bootstrap_kill_switch(&scope, None, true).await {
+            Ok(true) => {
+                bootstrap.record_dns(true);
+                emit_log(
+                    &events,
+                    "info",
+                    "preserved kill-switch table from a previous run (fail-closed); \
+                     bootstrap allows only loopback, DNS and underlay control traffic \
+                     until the handshake succeeds.  The temporary DNS allowance is \
+                     re-opened before every hostname lookup and narrowed away \
+                     before the handshake",
+                );
+            }
+            Ok(false) => {
+                // The table disappeared between the probe and the bootstrap.
+                // Nothing is preserved, so do not claim fail-closed.
+                bootstrap.record_dns(false);
+                emit_log(
+                    &events,
+                    "warn",
+                    "preserved kill-switch table is no longer available; continuing \
+                     without the crash-preserved kill switch",
+                );
+            }
+            Err(error) => {
+                // Keep the table active but leave the allowance unconfirmed:
+                // the loop retries the bootstrap before its first lookup.
+                emit_log(&events, "warn", format!("kill-switch bootstrap: {error:#}"));
+            }
+        }
+    }
 
     emit_log(&events, "info", format!("connecting to {}", spec.remote));
     if spec.keepalive > 0 && (spec.noise || spec.encless) {
@@ -295,7 +432,7 @@ async fn run_connection(
     // point, which would make a fresh DNS lookup unreliable).
     let mut guard: Option<NetworkGuard> = None;
     let mut attempt: u32 = 0;
-    let mut last_status = base_status(&validated, resolved);
+    let mut last_status = base_status(&validated, resolved, applied_from_guard(guard.as_ref()));
 
     loop {
         if cancel.is_cancelled() {
@@ -303,13 +440,43 @@ async fn run_connection(
         }
 
         if endpoints.is_none() {
+            // While a crash-preserved table is active, the temporary DNS
+            // allowance must be open before *every* lookup.  A failed
+            // handshake below clears `endpoints` after the previous iteration
+            // narrowed the table to the (now stale) outer endpoint, which
+            // drops DNS; without re-opening it the retry — and every retry
+            // after it — could never resolve a hostname remote again.
+            // `bootstrap_commands` flushes the chain first, so this is
+            // idempotent and never accumulates duplicate rules.  IP-literal
+            // remotes are parsed locally, so they keep DNS closed as before.
+            if bootstrap.needs_dns() && lookup_needs_dns(validated.outer_host()) {
+                match crate::firewall::bootstrap_kill_switch(&scope, None, true).await {
+                    Ok(present) => {
+                        if !present {
+                            emit_log(
+                                &events,
+                                "warn",
+                                "preserved kill-switch table is no longer available; \
+                                 continuing without the crash-preserved kill switch",
+                            );
+                        }
+                        bootstrap.record_dns(present);
+                    }
+                    Err(error) => emit_log(
+                        &events,
+                        "warn",
+                        format!("kill-switch DNS bootstrap: {error:#}"),
+                    ),
+                }
+            }
             match resolve_endpoints(&spec.remote, &spec.proxy).await {
                 Ok(resolved) => endpoints = Some(resolved),
                 Err(error) => {
                     attempt = attempt.saturating_add(1);
                     let message = format!("resolve {}: {error:#}", validated.outer_host());
                     emit_log(&events, "error", &message);
-                    let mut status = base_status(&validated, resolved);
+                    let mut status =
+                        base_status(&validated, resolved, applied_from_guard(guard.as_ref()));
                     status.state = "reconnecting".into();
                     status.last_error = Some(message);
                     last_status = status.clone();
@@ -326,6 +493,34 @@ async fn run_connection(
                         _ = cancel.cancelled() => break,
                     }
                     continue;
+                }
+            }
+        }
+
+        if bootstrap.needs_narrow() {
+            // DNS has served its purpose.  Narrow the preserved table to the
+            // resolved outer endpoint so the handshake can pass while every
+            // other host packet still hits the drop policy.  The temporary DNS
+            // allowance is closed here; a failed handshake re-opens it before
+            // the next lookup.
+            if let Some(outer) = endpoints.as_ref().and_then(Endpoints::outer) {
+                match crate::firewall::bootstrap_kill_switch(&scope, Some(outer), false).await {
+                    Ok(present) => {
+                        if !present {
+                            emit_log(
+                                &events,
+                                "warn",
+                                "preserved kill-switch table is no longer available; \
+                                 continuing without the crash-preserved kill switch",
+                            );
+                        }
+                        bootstrap.record_narrow(present);
+                    }
+                    Err(error) => emit_log(
+                        &events,
+                        "warn",
+                        format!("kill-switch bootstrap for {outer}: {error:#}"),
+                    ),
                 }
             }
         }
@@ -360,7 +555,8 @@ async fn run_connection(
         )
         .await;
 
-        let mut connected_status = base_status(&validated, resolved);
+        let mut connected_status =
+            base_status(&validated, resolved, applied_from_guard(guard.as_ref()));
         let mut planned_rekey = false;
         match started {
             Ok(mut session) => {
@@ -381,6 +577,27 @@ async fn run_connection(
                             connected_status.kill_switch_applied =
                                 Some(installed.kill_switch_applied());
                             guard = Some(installed);
+                            if bootstrap.active() {
+                                if spec.kill_switch {
+                                    // apply_kill_switch replaced the preserved
+                                    // table with the full current rule set.
+                                    emit_log(
+                                        &events,
+                                        "info",
+                                        "replaced the preserved kill-switch table with the \
+                                         current profile's rule set",
+                                    );
+                                } else {
+                                    crate::firewall::remove_kill_switch(&scope).await;
+                                    emit_log(
+                                        &events,
+                                        "info",
+                                        "removed the preserved kill-switch table; this \
+                                         profile does not request a kill switch",
+                                    );
+                                }
+                                bootstrap.replaced();
+                            }
                             emit_log(
                                 &events,
                                 "info",
@@ -446,7 +663,8 @@ async fn run_connection(
                 attempt = attempt.saturating_add(1);
                 let message = format!("{error:#}");
                 emit_log(&events, "error", format!("session failed: {message}"));
-                let mut status = base_status(&validated, resolved);
+                let mut status =
+                    base_status(&validated, resolved, applied_from_guard(guard.as_ref()));
                 status.state = "reconnecting".into();
                 status.last_error = Some(message);
                 last_status = status;
@@ -478,8 +696,21 @@ async fn run_connection(
         }
     }
 
+    let had_guard = guard.is_some();
     if let Some(guard) = guard {
         guard.remove().await;
+    }
+    // An explicit disconnect/stop must restore connectivity even if the daemon
+    // only ever managed to bootstrap through a preserved crash table.  A
+    // failed setup (which returns above without cancellation) deliberately
+    // leaves the table installed (fail-closed).
+    if !had_guard && bootstrap.active() && cancel.is_cancelled() {
+        crate::firewall::remove_kill_switch(&scope).await;
+        emit_log(
+            &events,
+            "info",
+            "removed the preserved kill switch on explicit stop; connectivity restored",
+        );
     }
     drop(tap);
     emit_log(&events, "info", "tunnel stopped");
@@ -567,7 +798,11 @@ fn rekey_in_sec(rx: u64, tx: u64, rx_bps: u64, tx_bps: u64) -> Option<u64> {
     remaining.checked_div(rate)
 }
 
-fn base_status(validated: &ValidatedProfile, mtu: MtuInfo) -> EngineStatus {
+fn base_status(
+    validated: &ValidatedProfile,
+    mtu: MtuInfo,
+    applied: Option<(bool, bool)>,
+) -> EngineStatus {
     let mut status = spec_status(validated.spec());
     status.proto = Some(validated.proto().to_string());
     status.mode = Some(validated.mode().to_string());
@@ -580,7 +815,18 @@ fn base_status(validated: &ValidatedProfile, mtu: MtuInfo) -> EngineStatus {
     status.keepalive_sec = (validated.spec().keepalive > 0).then_some(validated.spec().keepalive);
     status.rekey_time_sec =
         (validated.spec().rekey_time > 0).then_some(validated.spec().rekey_time);
+    // A reconnect keeps the live guard, so the applied flags must be carried
+    // into every new status instead of reverting to "unknown".
+    if let Some((mss, kill_switch)) = applied {
+        status.mss_applied = Some(mss);
+        status.kill_switch_applied = Some(kill_switch);
+    }
     status
+}
+
+/// Applied firewall state of the live guard, if one is still installed.
+fn applied_from_guard(guard: Option<&NetworkGuard>) -> Option<(bool, bool)> {
+    guard.map(|guard| (guard.mss_applied(), guard.kill_switch_applied()))
 }
 
 fn spec_status(spec: &ProfileSpec) -> EngineStatus {
@@ -649,5 +895,174 @@ mod tests {
         }
         assert!(backoff(4) >= Duration::from_secs(16));
         assert!(backoff(5) >= Duration::from_secs(30));
+    }
+
+    fn validated_profile() -> ValidatedProfile {
+        let spec = ProfileSpec {
+            name: "office".into(),
+            remote: "vpn.example.com:1194".into(),
+            proto: "udp".into(),
+            verifier: "$argon2d$m=1024,t=4,p=1$AAECAwQFBgcICQoLDA0ODw".into(),
+            mtu: 1515,
+            timeout: 60,
+            iface: "rsvpn0".into(),
+            address: "10.88.0.2/24".into(),
+            gateway: "10.88.0.1".into(),
+            routes: vec!["default".into()],
+            dns: vec!["10.88.0.1".into()],
+            ..ProfileSpec::default()
+        };
+        ValidatedProfile::new(&spec).unwrap()
+    }
+
+    fn mtu_info() -> MtuInfo {
+        MtuInfo {
+            daemon: 1515,
+            inner: 1500,
+            mss_v4: Some(1460),
+            mss_v6: Some(1440),
+        }
+    }
+
+    #[test]
+    fn reconnect_status_keeps_applied_flags_from_the_live_guard() {
+        let validated = validated_profile();
+        let mut status = base_status(&validated, mtu_info(), Some((false, true)));
+        assert_eq!(status.mss_applied, Some(false));
+        assert_eq!(status.kill_switch_applied, Some(true));
+
+        // Simulate the reconnect transition: the guard is still installed, so
+        // the flags must survive the status rebuild.
+        status.state = "reconnecting".into();
+        assert_eq!(status.mss_applied, Some(false));
+        assert_eq!(status.kill_switch_applied, Some(true));
+
+        // Without a live guard the applied state is unknown, not false.
+        let fresh = base_status(&validated, mtu_info(), None);
+        assert_eq!(fresh.mss_applied, None);
+        assert_eq!(fresh.kill_switch_applied, None);
+    }
+
+    #[test]
+    fn applied_flags_reflect_padded_mode_false_values() {
+        let validated = validated_profile();
+        let status = base_status(&validated, mtu_info(), Some((false, false)));
+        assert_eq!(status.mss_applied, Some(false));
+        assert_eq!(status.kill_switch_applied, Some(false));
+        assert_eq!(applied_from_guard(None), None);
+    }
+
+    #[test]
+    fn only_hostname_remotes_need_the_dns_allowance() {
+        // IP literals (with a port) are parsed locally by `lookup_host`, so
+        // they must not widen the preserved table to port 53.
+        assert!(!lookup_needs_dns("203.0.113.10:1194"));
+        assert!(!lookup_needs_dns("[2001:db8::10]:1194"));
+        // Hostnames and malformed inputs need (or attempt) a real lookup.
+        assert!(lookup_needs_dns("vpn.example.com:1194"));
+        assert!(lookup_needs_dns("203.0.113.10"));
+    }
+
+    #[test]
+    fn inactive_bootstrap_never_touches_the_firewall() {
+        // No crash-preserved table: the normal (and IP-literal) path must not
+        // issue bootstrap commands in either direction.
+        let bootstrap = BootstrapState::inactive();
+        assert!(!bootstrap.active());
+        assert!(!bootstrap.needs_dns());
+        assert!(!bootstrap.needs_narrow());
+    }
+
+    #[test]
+    fn bootstrap_reopens_dns_before_resolving_after_a_failed_handshake() {
+        // Regression for the hostname-remote deadlock: after a crash the
+        // initial bootstrap opens DNS, the lookup narrows the table to the
+        // outer endpoint, and a failed handshake clears `endpoints`.  The next
+        // lookup must re-open the DNS allowance or it can never resolve again.
+        let mut bootstrap = BootstrapState::pending();
+        let mut steps: Vec<&str> = Vec::new();
+
+        // Initial bootstrap confirms the preserved table and opens DNS.
+        assert!(bootstrap.needs_dns());
+        bootstrap.record_dns(true);
+        steps.push("open-dns");
+
+        // Iteration 1: resolve succeeds, narrow, handshake fails.
+        assert!(!bootstrap.needs_dns());
+        assert!(bootstrap.needs_narrow());
+        bootstrap.record_narrow(true);
+        steps.push("narrow");
+        assert!(
+            !bootstrap.dns_open,
+            "narrowing must close the DNS allowance"
+        );
+
+        // Iteration 2: the retry must re-open DNS *before* resolving.  The old
+        // code only narrowed here, so the lookup was dropped forever.
+        assert!(bootstrap.needs_dns());
+        bootstrap.record_dns(true);
+        steps.push("open-dns");
+        assert!(!bootstrap.needs_dns());
+
+        // The retry resolves, narrows, and this time the handshake succeeds.
+        assert!(bootstrap.needs_narrow());
+        bootstrap.record_narrow(true);
+        steps.push("narrow");
+        bootstrap.replaced();
+        assert!(!bootstrap.active());
+        assert!(!bootstrap.needs_dns());
+        assert!(!bootstrap.needs_narrow());
+        assert_eq!(steps, ["open-dns", "narrow", "open-dns", "narrow"]);
+    }
+
+    #[test]
+    fn bootstrap_keeps_reopening_dns_until_a_handshake_succeeds() {
+        let mut bootstrap = BootstrapState::pending();
+        bootstrap.record_dns(true); // initial bootstrap
+        let mut opens = 1;
+
+        // Seven failed handshakes: each retry must re-open DNS exactly once.
+        for round in 0..7 {
+            if bootstrap.needs_dns() {
+                bootstrap.record_dns(true);
+                opens += 1;
+            }
+            assert!(!bootstrap.needs_dns(), "round {round}");
+            assert!(bootstrap.needs_narrow(), "round {round}");
+            bootstrap.record_narrow(true);
+            // Failed handshake: `endpoints` is cleared, loop retries.
+        }
+        assert_eq!(opens, 7, "the first retry reuses the initial allowance");
+
+        // The eventual success leaves the table to be replaced by the full
+        // rule set, and no further DNS is needed.
+        if bootstrap.needs_dns() {
+            bootstrap.record_dns(true);
+            opens += 1;
+        }
+        bootstrap.record_narrow(true);
+        bootstrap.replaced();
+        assert_eq!(opens, 8);
+        assert!(!bootstrap.active());
+    }
+
+    #[test]
+    fn bootstrap_stops_claiming_fail_closed_when_the_table_vanishes() {
+        // A failed bootstrap probe (`Ok(false)`) means no table is left; the
+        // engine must not keep treating the host as fail-closed.
+        let mut bootstrap = BootstrapState::pending();
+        assert!(bootstrap.needs_dns());
+        bootstrap.record_dns(false);
+        assert!(!bootstrap.active());
+        assert!(!bootstrap.needs_dns());
+        assert!(!bootstrap.needs_narrow());
+
+        // Same for a narrow call that discovers the table is gone.
+        let mut bootstrap = BootstrapState::pending();
+        bootstrap.record_dns(true);
+        bootstrap.record_narrow(false);
+        assert!(!bootstrap.active());
+        assert!(!bootstrap.needs_dns());
+        assert!(!bootstrap.needs_narrow());
     }
 }

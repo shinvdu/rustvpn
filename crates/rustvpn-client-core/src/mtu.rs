@@ -23,6 +23,11 @@
 //! | noise   | 1490                     | 1476         |
 //! | encless | 1506                     | 1492         |
 //!
+//! The kernel rejects `ip link set ... mtu` below 68, so the derived TAP IP
+//! MTU is part of the validation contract: plain wire MTUs below 83 (68-15)
+//! are rejected, while the noise/encless floor of 120 already derives 81/97.
+//! Windows adapters add a stricter 576-byte platform check.
+//!
 //! `mtu: auto` and `mtu: 0` are rejected in v1; path-MTU negotiation is
 //! deferred to a future protocol version.
 
@@ -30,6 +35,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use anyhow::{anyhow, bail, Context, Result};
+use rustvpn_net::config::MIN_TAP_IP_MTU;
 use rustvpn_proto::{Mode, MTU_MAX};
 use tokio::process::Command;
 
@@ -119,6 +125,15 @@ pub fn from_wire(mode: Mode, wire_mtu: usize) -> Result<WireMtu> {
         bail!("wire MTU {wire_mtu} exceeds the maximum {MTU_MAX}");
     }
     let inner_ip_mtu = mode.max_payload(wire_mtu).saturating_sub(ETH_HEADER);
+    if inner_ip_mtu < MIN_TAP_IP_MTU {
+        let overhead = MTU_MAX - mode.max_payload(MTU_MAX);
+        let min_wire = (MIN_TAP_IP_MTU + ETH_HEADER + overhead).max(mode.min_mtu());
+        bail!(
+            "wire MTU {wire_mtu} for {} mode derives TAP IP MTU {inner_ip_mtu}, below the \
+             minimum {MIN_TAP_IP_MTU}; use at least {min_wire}",
+            mode_label(mode)
+        );
+    }
     Ok(WireMtu {
         wire_mtu,
         mode,
@@ -248,6 +263,32 @@ mod tests {
         assert!(zero.to_string().contains("0 is invalid"), "{zero}");
         assert!(from_wire(Mode::Plain, 67).is_err());
         assert!(from_wire(Mode::Noise, 119).is_err());
+        // `ip link set mtu 53` is rejected by the kernel; plain 68-82 derives
+        // an unusable TAP IP MTU even though 68 is the nominal wire minimum.
+        for wire in [68, 82] {
+            let error = from_wire(Mode::Plain, wire).unwrap_err().to_string();
+            assert!(
+                error.contains("derives TAP IP MTU") && error.contains("at least 83"),
+                "{wire}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn smallest_accepted_mtus_derive_a_usable_tap_ip_mtu() {
+        let plain = from_wire(Mode::Plain, 83).unwrap();
+        assert_eq!(plain.inner_ip_mtu, MIN_TAP_IP_MTU);
+        assert_eq!(plain.mss_v4, 28);
+        assert_eq!(plain.mss_v6, 8);
+
+        // The noise/encless mode floors already exceed the derived minimum.
+        let noise = from_wire(Mode::Noise, 120).unwrap();
+        assert_eq!(noise.inner_ip_mtu, 81);
+        let encless = from_wire(Mode::Encless, 120).unwrap();
+        assert_eq!(encless.inner_ip_mtu, 97);
+
+        assert!(from_wire(Mode::Plain, MTU_MAX).is_ok());
+        assert!(from_wire(Mode::Plain, MTU_MAX + 1).is_err());
     }
 
     #[test]

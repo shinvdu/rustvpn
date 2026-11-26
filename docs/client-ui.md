@@ -127,7 +127,9 @@ ipv6: false                # 暂不支持
   只告警。
 - `kill_switch: true` 仅允许全隧道（routes 含 default），使用按 daemon 实例命名的
   `inet rustvpn_killswitch_<hash>` 表；仅过滤主机 `output`（不覆盖 forward/LAN/NAT），
-  无 `nft` 时 fail-closed 拒绝连接；断开时及同实例下次启动时清理。IPv6 外层端点会
+  无 `nft` 时 fail-closed 拒绝连接。正常断开/停止会删表并恢复连通性；崩溃后下次
+  启动**保留**该表（fail-closed），只清理 MSS，连接时先在保留的 `drop` 链内引导放行
+  外层端点，握手成功后再安装完整规则（新 profile 未启用则删表）。IPv6 外层端点会
   在物理接口上放行 ND/MLD/DHCPv6（UDP 546/547），避免邻居缓存过期后断链。
 - `rustvpn-client status --json` 输出稳定的 `rustvpn.status.v1` 文档（不含口令/密钥），
   新增 `mss_applied`、`kill_switch`/`kill_switch_applied`、`mtu_source`、
@@ -172,7 +174,9 @@ sudo systemctl enable --now rustvpn-clientd
 - 守护进程以 `rustvpn` 用户运行，仅保留 `CAP_NET_ADMIN`/`CAP_NET_RAW`。
 - 使用 kill-switch/MSS clamp 的主机需安装 `nftables` 包；unit 不再在 `ExecStopPost`
   里全局 `nft delete`（会与同 netns 的其他 RustVPN 实例冲突，且依赖固定路径）。
-  daemon 崩溃时规则保留（fail-closed），同实例下次启动会清理自己命名空间的表。
+  daemon 崩溃时规则保留（fail-closed）；clean-shutdown 标记缺失时下次启动只清理 MSS，
+  保留 kill-switch，并由下一次连接引导/替换。无法自动恢复时按
+  `docs/en/configuration.md` 的说明只删除本实例的 `rustvpn_killswitch_<hash>` 表。
 - socket 为 `rustvpn:rustvpn 0660`；`SO_PEERCRED` 校验 uid，主/补充组包含
   `rustvpn` 的用户可连接。
 - GUI 的托盘/自启动/钥匙串都在用户桌面会话内；托盘不可用时关闭窗口会正常退出。
