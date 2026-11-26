@@ -427,8 +427,9 @@ Wintun 适配器 MTU 设置为 `ip_mtu`。Windows 应在 `ip_mtu < 576` 时拒�
 
 ## 7. GUI 适配
 
-> 下表已在 M4 实现并在 Windows RDP 实机验证；`bundle.active` 仍为 false，
-> MSI/服务安装属 M5。详见 `windows-client-status.md` 2.9 / 3.4。
+> 下表已在 M4 实现并在 Windows RDP 实机验证；`bundle.active` 仍为 false。
+> MSI/服务安装已在 M5 实现并实机验证，详见第 8 节、
+> `windows-client-status.md` 2.9 / 3.4 / 2.10。
 
 | 位置 | M4 实现 |
 |---|---|
@@ -448,50 +449,82 @@ Wintun 适配器 MTU 设置为 `ip_mtu`。Windows 应在 `ip_mtu < 576` 时拒�
 
 ---
 
-## 8. 安装、签名与 CI
+## 8. 安装、签名与 CI（M5 已实现）
+
+> 本节记录 M5 的最终实现；操作手册见
+> [`windows-install.md`](windows-install.md)，打包细节见
+> [`packaging/windows/README.md`](../packaging/windows/README.md)。
 
 ### 8.1 安装包
 
-推荐 **MSI（WiX）**，而不是 NSIS：
+选择 **独立 WiX 3.14 项目**（`packaging/windows/rustvpn-client.wxs`），
+不使用 NSIS，也不启用 Tauri bundler 的 WiX 模板。Tauri 模板拥有
+Product/Feature/UpgradeCode 与打包资源布局；M5 需要服务注册、延迟自启、
+失败恢复、组助手和升级停启顺序，独立 `.wxs` 更显式、可静态检查，并复用
+同一 GUI exe。`bundle.active` 保持 `false`。
 
-- 安装 GUI 与 `rustvpn-clientd.exe` 到 `Program Files\RustVPN\`。
-- `ServiceInstall`：LocalSystem、自动延迟启动、失败恢复。
-- `ServiceControl`：安装后启动，升级/卸载前停止。
-- 把 `wintun.dll`（x64）放在服务同目录，固定版本并校验哈希。
-- 卸载时停止服务、清理网络状态、删除服务；保留用户 profile/钥匙串。
-- 升级流程：停止服务 → 清理网络 → 替换文件 → 启动服务。
+实现要点：
 
-### 8.2 Wintun 分发
+- per-machine 安装到 `Program Files\RustVPN\`，安装 GUI、daemon、
+  `wintun.dll`、文档和许可证；不打包用户 profile/keychain。
+- `ServiceInstall`：LocalSystem、own process、`--service`、自动启动；
+- 服务启动方式与失败恢复：安装期 `sc.exe config ... start= delayed-auto`
+  和 `sc.exe failure ... actions= restart/5000/restart/10000/restart/30000`
+  （Windows Installer 的 `ServiceConfig*` 表在实机触发 Error 1939）；
+- `ServiceControl Stop="both" Start="install" Remove="uninstall" Wait="yes"`：
+  升级/卸载前停止、安装后启动、卸载删除 SCM 项；
+- 开始菜单快捷方式；桌面快捷方式由 `INSTALLDESKTOPSHORTCUT=1` 开启；
+- 卸载停止服务、删除文件/快捷方式/注册表/SCM，保留用户 profile/钥匙串、
+  `RustVPN` 组和 `%ProgramData%\RustVPN`；
+- 升级流程：停止服务 → 清理网络（daemon 正常停止路径）→ 替换文件 →
+  重新创建/加入组 → 启动服务。
 
-- 只分发与目标架构匹配的 `wintun.dll`。
-- 附带 Wintun 许可证文本。
-- 固定版本和 SHA-256；发布前校验。
-- 服务应使用绝对路径加载 DLL，避免服务工作目录为 System32 时找不到。
+### 8.2 组、服务访问与进程查询
 
-### 8.3 签名
+- 安装器在 `StartServices` 前运行 `installer\setup-group.ps1`，创建本地
+  `RustVPN` 组并把 `[LogonUser]`（或 `RUSTVPN_USER`）加入；失败时只回滚
+  本次创建的组，保留 INTERACTIVE 回退，避免锁死非管理员用户。
+- daemon 的 pipe DACL 使用该组；M2 的客户端 token 校验也在同一组上。
+- daemon 启动时给同一组/INTERACTIVE 授予
+  `PROCESS_QUERY_LIMITED_INFORMATION`（仅 0x1000），使 M4 GUI 能在发送
+  口令前解析 LocalSystem 服务镜像并校验 Authenticode；不授予内存、句柄
+  或终止权限。
+- 标准用户需要重新登录以刷新包含组的 token；安装器/文档已说明。
+- M5 修复了 `group_sid_bytes()` 保留 68 字节缓冲区的 bug：Windows 10 的
+  `LookupAccountNameW` 成功时不总是更新 `cbSid`，导致 `ClientPolicy` 的
+  字节比较拒绝合法组成员（pipe/进程 DACL 使用字符串 SID，不受影响）。
+  现在用 `GetLengthSid` 截断，并有 Windows 回归测试。
 
-- GUI、daemon、MSI 全部 Authenticode SHA-256 时间戳签名。
-- 正式分发建议 EV 证书，降低 SmartScreen 误报。
-- 开发版可以先不签名，但必须标明未签名。
+### 8.3 Wintun 分发
 
-### 8.4 版本与更新
+- 只分发 Wintun 0.14.1 amd64；构建脚本校验 PE 架构和 SHA-256
+  `e5da8447...dafce`。
+- 附带 `wintun-LICENSE.txt`、`wintun-VERSION.txt`、`wintun-SHA256SUMS.txt`；
+  许可证文本进入仓库，DLL 本身由构建机/CI 提供。
+- `rustvpn-net` 默认绝对路径 `C:\Program Files\RustVPN\wintun.dll`，加载前
+  再次校验哈希；服务工作目录为 System32 也不会误加载。
 
-- Cargo/Tauri 版本可以用 `0.2.0-beta.1`。
-- MSI 的 ProductVersion 只接受数字，需要把 beta 映射为更低的数字版本
-  （例如 `0.1.99.0`），否则会排在正式 `0.2.0` 之后。
-- Windows 服务安装模式建议首版关闭 Tauri updater；
-  更新走“检查新 MSI → 校验签名 → 提权安装”，不要用普通用户进程替换
-  Program Files 中的服务文件。
+### 8.4 版本、升级与签名
+
+- Cargo/Tauri `0.2.0-beta.1` → MSI `ProductVersion 0.1.99.0`；semver 保留在
+  Product name、GUI、`HKLM\Software\RustVPN\Client\Version`、
+  `docs\VERSION.txt` 与产物名。
+- `MajorUpgrade AllowSameVersionUpgrades="yes"`：同数字版本的 beta 重建可用
+  新 ProductCode 升级；更低版本被拒绝并提示先卸载。实际旧版本降级安装未
+  在 M5 实机执行。
+- `sign-artifacts.ps1` 支持证书存储指纹/PFX 环境变量；先签 exe，再签 MSI，
+  并 `signtool verify /pa`。仓库不保存证书/私钥。无证书时验证产物确实
+  未签名，写 `UNSIGNED.txt`/Product comments/`docs\SIGNING.txt`。
+- 正式分发建议 EV/OV 证书 + RFC 3161 时间戳；未签名或新 OV 会触发
+  SmartScreen 警告，企业应在部署策略中校验签名/指纹。
 
 ### 8.5 CI
 
-- 新增 `windows-latest` job。
-- `cargo check/test` 覆盖 Windows target。
-- 构建 MSI。
-- 签名只在有证书的 release job 执行。
-- WebDriver UI 测试可后置，首版先保证编译、单元测试和安装包结构。
-
----
+- `.github/workflows/windows-client.yml` 独立 job（`windows-latest`）：
+  安装 Rust/WiX 3.14、下载并校验 Wintun、运行客户端 crate 的
+  check/clippy/test、构建未签名 MSI、用 `msiexec /a` + MSI 表 + dark 检查。
+- 不安装 MSI/服务，不使用签名密钥；原型 `windows-shim.yml` 保持不变。
+- 真实证书签名留给 release job；WebDriver UI 测试仍后置。
 
 ## 9. 分阶段实施计划
 

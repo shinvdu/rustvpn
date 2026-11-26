@@ -28,18 +28,21 @@ use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle};
 use std::path::{Path, PathBuf};
 use std::ptr;
 
-use windows_sys::Win32::Foundation::{LocalFree, HANDLE, HLOCAL};
+use windows_sys::Win32::Foundation::{LocalFree, ERROR_SUCCESS, HANDLE, HLOCAL};
 use windows_sys::Win32::Security::Authorization::{
-    ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+    ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, SetSecurityInfo,
+    SDDL_REVISION_1, SE_KERNEL_OBJECT,
 };
 use windows_sys::Win32::Security::{
-    CreateWellKnownSid, GetLengthSid, GetTokenInformation, TokenGroups, TokenUser,
-    WinBuiltinAdministratorsSid, WinInteractiveSid, PSID, SECURITY_ATTRIBUTES,
-    SECURITY_MAX_SID_SIZE, TOKEN_GROUPS, TOKEN_QUERY, TOKEN_USER,
+    CreateWellKnownSid, GetLengthSid, GetSecurityDescriptorDacl, GetTokenInformation, TokenGroups,
+    TokenUser, WinBuiltinAdministratorsSid, WinInteractiveSid, ACL, DACL_SECURITY_INFORMATION,
+    PROTECTED_DACL_SECURITY_INFORMATION, PSID, SECURITY_ATTRIBUTES, SECURITY_MAX_SID_SIZE,
+    TOKEN_GROUPS, TOKEN_QUERY, TOKEN_USER,
 };
 use windows_sys::Win32::System::Pipes::GetNamedPipeClientProcessId;
 use windows_sys::Win32::System::Threading::{
-    GetCurrentProcessId, OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION,
+    GetCurrentProcess, GetCurrentProcessId, OpenProcess, OpenProcessToken,
+    PROCESS_QUERY_LIMITED_INFORMATION,
 };
 
 /// Prefix required for a Win32 named-pipe path.
@@ -139,6 +142,87 @@ pub fn pipe_sddl(group_sid: Option<&str>, daemon_user: Option<&str>) -> String {
     format!("D:{}", aces.concat())
 }
 
+/// SDDL DACL for the daemon **process object**.
+///
+/// The GUI verifies the named-pipe server before sending a passphrase:
+/// it resolves the server PID, opens the process with
+/// `PROCESS_QUERY_LIMITED_INFORMATION`, reads the image path with
+/// `QueryFullProcessImageNameW` and checks the embedded Authenticode signer.
+/// A LocalSystem service process is owned by SYSTEM and is not openable by a
+/// standard user by default, so the daemon grants exactly the query right to
+/// the same audience as the pipe: the dedicated group when configured,
+/// otherwise INTERACTIVE.  SYSTEM and Administrators keep full access because
+/// the SCM needs to stop and restart the service.
+///
+/// This does **not** weaken the GUI's identity policy: it only makes the
+/// read-only image query possible, and still exposes no memory, handle
+/// duplication or terminate rights to ordinary users.
+pub fn process_sddl(group_sid: Option<&str>, daemon_user: Option<&str>) -> String {
+    let query = format!("(A;;0x{PROCESS_QUERY_LIMITED_INFORMATION:X};;;");
+    let mut aces = vec!["(A;;FA;;;SY)".to_string(), "(A;;FA;;;BA)".to_string()];
+    match group_sid {
+        Some(sid) => aces.push(format!("{query}{sid})")),
+        None => aces.push(format!("{query}IU)")),
+    }
+    if let Some(user) = daemon_user {
+        let already_covered = aces.iter().any(|ace| ace.contains(&format!(";;;{user})")))
+            || (user == "S-1-5-18" && aces.iter().any(|ace| ace.contains(";;;SY)")));
+        if !already_covered {
+            aces.push(format!("{query}{user})"));
+        }
+    }
+    // `P` keeps this explicit DACL protected from inherited ACEs.
+    format!("D:P{}", aces.concat())
+}
+
+/// Apply [`process_sddl`] to the current daemon process.
+///
+/// Called once after argument/config resolution and before the pipe starts
+/// serving.  Failure is reported by the caller but is not fatal: the service
+/// can still be controlled by Administrators and the GUI fails closed rather
+/// than sending a passphrase to an unverified server.
+pub fn apply_process_query_acl(group: Option<&str>) -> io::Result<()> {
+    let group_sid = match group {
+        Some(name) => Some(group_sid_string(name)?),
+        None => None,
+    };
+    let own_user = current_user_sid_string()?;
+    let sddl = process_sddl(group_sid.as_deref(), Some(&own_user));
+    let (descriptor, _attributes) = security_attributes(&sddl)?;
+
+    let mut present = 0i32;
+    let mut defaulted = 0i32;
+    let mut dacl: *mut ACL = ptr::null_mut();
+    // SAFETY: `descriptor` is a valid absolute security descriptor that stays
+    // alive for the duration of this function.
+    let ok =
+        unsafe { GetSecurityDescriptorDacl(descriptor.0, &mut present, &mut dacl, &mut defaulted) };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if present == 0 || dacl.is_null() {
+        return Err(io::Error::other("converted SDDL has no DACL"));
+    }
+
+    // SAFETY: the pseudo-handle is valid, the DACL belongs to `descriptor`, and
+    // only the DACL is changed (owner/group/SACL are left untouched).
+    let status = unsafe {
+        SetSecurityInfo(
+            GetCurrentProcess(),
+            SE_KERNEL_OBJECT,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            dacl,
+            ptr::null_mut(),
+        )
+    };
+    if status != ERROR_SUCCESS {
+        return Err(io::Error::from_raw_os_error(status as i32));
+    }
+    Ok(())
+}
+
 /// A security descriptor allocated by `ConvertStringSecurityDescriptorTo...`.
 pub(crate) struct SecurityDescriptor(*mut c_void);
 
@@ -207,7 +291,13 @@ fn group_sid_bytes(name: &str) -> io::Result<Vec<u8>> {
     if ok == 0 {
         return Err(io::Error::last_os_error());
     }
-    sid.truncate(sid_len as usize);
+    // `cbSid` is not consistently updated on success (Windows 10 leaves the
+    // input capacity in place), so derive the real length from the SID header.
+    // Keeping the 68-byte buffer made the byte comparison in ClientPolicy
+    // reject every member of an otherwise valid local group.
+    // SAFETY: `sid` contains a SID written by LookupAccountNameW.
+    let actual = unsafe { GetLengthSid(sid.as_mut_ptr().cast()) } as usize;
+    sid.truncate(actual);
     Ok(sid)
 }
 
@@ -258,23 +348,51 @@ impl ClientPolicy {
 
     /// Whether the process may use the daemon.  Denies on any query failure.
     pub fn allows(&self, pid: u32) -> bool {
+        self.evaluate(pid).is_ok()
+    }
+
+    /// Explain a denied client.  Called only after [`Self::allows`] returned
+    /// false, so a successful client never pays for the extra formatting.
+    pub fn rejection_reason(&self, pid: u32) -> String {
+        match self.evaluate(pid) {
+            Ok(()) => "allowed".into(),
+            Err(reason) => reason,
+        }
+    }
+
+    fn evaluate(&self, pid: u32) -> Result<(), String> {
         if pid == 0 {
-            return false;
+            return Err("client PID is 0".into());
         }
-        let Ok(token) = open_process_token(pid) else {
-            return false;
-        };
-        if let Ok(user) = token_user_sid(&token) {
-            if user == self.own_user {
-                return true;
-            }
+        let token = open_process_token(pid)
+            .map_err(|error| format!("cannot open process {pid}: {error}"))?;
+        let user = token_user_sid(&token)
+            .map_err(|error| format!("cannot read the user SID of process {pid}: {error}"))?;
+        if user == self.own_user {
+            return Ok(());
         }
-        let Ok(groups) = token_group_sids(&token) else {
-            return false;
-        };
-        groups
+        let groups = token_group_sids(&token)
+            .map_err(|error| format!("cannot read the group SIDs of process {pid}: {error}"))?;
+        if groups
             .iter()
             .any(|group| self.allowed.iter().any(|allowed| allowed == group))
+        {
+            return Ok(());
+        }
+        Err(format!(
+            "pid {pid} user {} has none of the allowed SIDs [{}] (groups [{}])",
+            sid_text(&user),
+            self.allowed
+                .iter()
+                .map(|sid| sid_text(sid))
+                .collect::<Vec<_>>()
+                .join(", "),
+            groups
+                .iter()
+                .map(|sid| sid_text(sid))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))
     }
 }
 
@@ -394,6 +512,10 @@ fn token_information(token: &OwnedHandle, class: i32) -> io::Result<Vec<usize>> 
     Ok(buffer)
 }
 
+fn sid_text(sid: &[u8]) -> String {
+    sid_to_string(sid).unwrap_or_else(|_| format!("<{} bytes>", sid.len()))
+}
+
 fn sid_bytes(sid: PSID) -> io::Result<Vec<u8>> {
     if sid.is_null() {
         return Err(io::Error::other("null SID"));
@@ -494,5 +616,54 @@ mod tests {
     #[test]
     fn unknown_group_is_rejected_at_configuration_time() {
         assert!(ClientPolicy::new(Some("RustVPN-does-not-exist")).is_err());
+    }
+
+    #[test]
+    fn process_dacl_grants_only_query_to_interactive_users() {
+        let sddl = process_sddl(None, None);
+        assert!(sddl.starts_with("D:P"), "{sddl}");
+        assert!(sddl.contains("(A;;FA;;;SY)"), "{sddl}");
+        assert!(sddl.contains("(A;;FA;;;BA)"), "{sddl}");
+        assert!(sddl.contains("(A;;0x1000;;;IU)"), "{sddl}");
+        // No write/terminate-style access for ordinary users.
+        assert!(!sddl.contains("0x1F"), "{sddl}");
+        assert!(!sddl.contains("WD"), "{sddl}");
+        assert!(!sddl.contains("AN"), "{sddl}");
+    }
+
+    #[test]
+    fn process_dacl_dedicated_group_replaces_interactive() {
+        let sddl = process_sddl(Some("S-1-5-21-1-2-3-1001"), None);
+        assert!(sddl.contains("(A;;0x1000;;;S-1-5-21-1-2-3-1001)"), "{sddl}");
+        assert!(!sddl.contains(";;;IU)"), "{sddl}");
+    }
+
+    #[test]
+    fn process_dacl_adds_the_daemon_user_once() {
+        let sddl = process_sddl(None, Some("S-1-5-21-9-9-9-1001"));
+        assert!(
+            sddl.matches(";;;S-1-5-21-9-9-9-1001)").count() == 1,
+            "{sddl}"
+        );
+        // SYSTEM is already covered by the SY alias.
+        let system = process_sddl(None, Some("S-1-5-18"));
+        assert!(!system.contains(";;;S-1-5-18)"), "{system}");
+    }
+
+    #[test]
+    fn looked_up_sid_bytes_match_the_sid_header_length() {
+        // LookupAccountNameW does not reliably update cbSid on success
+        // (Windows 10 leaves the input capacity), so group_sid_bytes must derive
+        // the length from GetLengthSid.  A trailing zero tail made every byte
+        // comparison in ClientPolicy fail for an otherwise valid group.
+        let Some(name) = std::env::var_os("USERNAME").filter(|value| !value.is_empty()) else {
+            return;
+        };
+        let Ok(bytes) = group_sid_bytes(&name.to_string_lossy()) else {
+            return;
+        };
+        // SAFETY: `bytes` is a SID written by LookupAccountNameW.
+        let header_len = unsafe { GetLengthSid(bytes.as_ptr() as *mut c_void) } as usize;
+        assert_eq!(bytes.len(), header_len, "SID has a non-canonical length");
     }
 }

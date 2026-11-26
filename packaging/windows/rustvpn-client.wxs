@@ -1,0 +1,288 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  RustVPN Windows client installer (WiX Toolset 3.14).
+
+  This is deliberately a standalone WiX project instead of a Tauri bundler
+  fragment: the bundle owns the GUI product, upgrade identity and WiX main
+  template, while M5 needs a LocalSystem service, delayed auto-start, failure
+  recovery, a local group helper and upgrade/stop ordering.  Building the MSI
+  directly with candle/light keeps every table explicit and verifiable.
+
+  Values supplied by build-msi.ps1 (-d...):
+    Semver, MsiVersion, SigningStatus
+    GuiExe, DaemonExe, WintunDll
+    WintunLicense, WintunVersion, WintunSha
+    Copying, WindowsInstallDoc, PackagingReadme, SigningTxt, VersionTxt
+    SetupGroupScript, IconFile
+  light also receives -dWixUILicenseRtf=<license.rtf>.
+-->
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi"
+     xmlns:util="http://schemas.microsoft.com/wix/UtilExtension">
+
+  <Product Id="*"
+           Name="RustVPN $(var.Semver)"
+           Language="1033"
+           Version="$(var.MsiVersion)"
+           Manufacturer="RustVPN contributors"
+           UpgradeCode="0117b8be-626a-43aa-bd50-90f6d9234d7f">
+
+    <Package Id="*"
+             Keywords="RustVPN, VPN, Wintun"
+             Description="RustVPN Windows client (GUI, LocalSystem daemon and Wintun)"
+             Manufacturer="RustVPN contributors"
+             InstallerVersion="500"
+             Compressed="yes"
+             InstallScope="perMachine"
+             Platform="x64" />
+
+    <!--
+      A pre-release semver maps to a numeric ProductVersion below the stable
+      release (0.2.0-beta.1 -> 0.1.99.0).  AllowSameVersionUpgrades lets a
+      rebuilt beta with the same numeric version but a new ProductCode upgrade
+      in place; downgrades still require an uninstall.
+    -->
+    <MajorUpgrade AllowSameVersionUpgrades="yes"
+                  Schedule="afterInstallInitialize"
+                  DowngradeErrorMessage="A newer version of RustVPN is already installed. Uninstall it before installing this older build." />
+
+    <MediaTemplate EmbedCab="yes" />
+
+    <Icon Id="AppIcon" SourceFile="$(var.IconFile)" />
+    <!-- Close a running GUI so an upgrade/uninstall can replace its exe. -->
+    <util:CloseApplication Id="CloseRustVPNGui"
+                           Target="rustvpn-client-ui.exe"
+                           Description="RustVPN is still running and must close before installation can continue."
+                           CloseMessage="yes"
+                           RebootPrompt="no"
+                           PromptToContinue="no"
+                           TerminateProcess="1"
+                           Timeout="10" />
+    <Property Id="ARPPRODUCTICON" Value="AppIcon" />
+    <Property Id="ARPHELPLINK" Value="https://github.com/shinvdu/rustvpn" />
+    <Property Id="ARPCOMMENTS" Value="$(var.SigningStatus)" />
+
+    <!--
+      The user that launched the elevated install.  setup-group.ps1 adds it to
+      the RustVPN local group so the daemon's pipe DACL accepts it.  A
+      deployment that installs as SYSTEM can pass RUSTVPN_USER explicitly.
+    -->
+    <Property Id="RUSTVPN_USER" Secure="yes" />
+    <Property Id="INSTALLDESKTOPSHORTCUT" Value="0" />
+
+    <Property Id="WEBVIEW2X86">
+      <RegistrySearch Id="WebView2X86Search" Root="HKLM"
+                      Key="SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}"
+                      Name="pv" Type="raw" Win64="yes" />
+    </Property>
+    <Property Id="WEBVIEW2X64">
+      <RegistrySearch Id="WebView2X64Search" Root="HKLM"
+                      Key="SOFTWARE\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}"
+                      Name="pv" Type="raw" Win64="yes" />
+    </Property>
+    <Property Id="WEBVIEW2USER">
+      <RegistrySearch Id="WebView2UserSearch" Root="HKCU"
+                      Key="SOFTWARE\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}"
+                      Name="pv" Type="raw" />
+    </Property>
+
+    <!-- VersionNT reports 603 on this Windows 10 build, so require Vista+
+         here and let the mandatory WebView2 Evergreen check enforce Windows
+         10+ (Microsoft does not ship WebView2 for older Windows). -->
+    <Condition Message="RustVPN requires Windows 10 or later (64-bit).">
+      <![CDATA[Installed OR (VersionNT >= 600 AND VersionNT64)]]>
+    </Condition>
+    <Condition Message="RustVPN needs the Microsoft Edge WebView2 Evergreen Runtime. Install it from https://go.microsoft.com/fwlink/p/?LinkId=2124703 and run this installer again.">
+      <![CDATA[Installed OR WEBVIEW2X86 OR WEBVIEW2X64 OR WEBVIEW2USER]]>
+    </Condition>
+
+    <Directory Id="TARGETDIR" Name="SourceDir">
+      <Directory Id="ProgramFiles64Folder">
+        <Directory Id="INSTALLDIR" Name="RustVPN">
+
+          <Component Id="GuiComponent" Guid="7504c8c9-6384-4329-943f-5126175486e0" Win64="yes">
+            <File Id="GuiExe" Source="$(var.GuiExe)" KeyPath="yes" />
+          </Component>
+
+          <Component Id="DaemonComponent" Guid="2eb4f14f-e651-481b-84ec-c1a972b48ac8" Win64="yes">
+            <File Id="DaemonExe" Source="$(var.DaemonExe)" KeyPath="yes" />
+            <ServiceInstall Id="RustVPNDaemon"
+                            Name="rustvpn-clientd"
+                            DisplayName="RustVPN client daemon"
+                            Description="Runs the RustVPN tunnel with the privileges needed for Wintun, routes and DNS, and exposes a local named pipe to the GUI."
+                            Type="ownProcess"
+                            Start="auto"
+                            ErrorControl="normal"
+                            Account="LocalSystem"
+                            Arguments="--service"
+                            Vital="yes" />
+            <!--
+              Stop="both" stops the old service before files are replaced and
+              during uninstall; Start="install" starts it after the install
+              sequence; Remove="uninstall" deletes the SCM entry last.
+            -->
+            <ServiceControl Id="RustVPNDaemonControl"
+                            Name="rustvpn-clientd"
+                            Stop="both"
+                            Start="install"
+                            Remove="uninstall"
+                            Wait="yes" />
+          </Component>
+
+          <Component Id="WintunComponent" Guid="996c5aaa-e1f8-4d4e-ac79-6e174011db45" Win64="yes">
+            <File Id="WintunDll" Source="$(var.WintunDll)" KeyPath="yes" />
+          </Component>
+
+          <Component Id="RegistryComponent" Guid="83e08c2c-daec-4b45-9144-145148c6592e" Win64="yes">
+            <RegistryKey Root="HKLM" Key="Software\RustVPN\Client">
+              <RegistryValue Name="Version" Type="string" Value="$(var.Semver)" KeyPath="yes" />
+              <RegistryValue Name="MsiVersion" Type="string" Value="$(var.MsiVersion)" />
+              <RegistryValue Name="InstallDir" Type="string" Value="[INSTALLDIR]" />
+            </RegistryKey>
+          </Component>
+
+          <Directory Id="InstallerDir" Name="installer">
+            <Component Id="InstallerScriptComponent" Guid="f5b5ea11-080f-4cb2-9910-47d845efd833" Win64="yes">
+              <File Id="SetupGroupScript" Source="$(var.SetupGroupScript)" KeyPath="yes" />
+            </Component>
+          </Directory>
+
+          <Directory Id="DocsDir" Name="docs">
+            <Component Id="DocsComponent" Guid="49b666ee-8ca3-463b-a7bb-eaed0508df90" Win64="yes">
+              <File Id="Copying" Source="$(var.Copying)" KeyPath="yes" />
+              <File Id="WindowsInstallDoc" Source="$(var.WindowsInstallDoc)" />
+              <File Id="PackagingReadme" Source="$(var.PackagingReadme)" />
+              <File Id="SigningTxt" Source="$(var.SigningTxt)" />
+              <File Id="VersionTxt" Source="$(var.VersionTxt)" />
+            </Component>
+          </Directory>
+
+          <Directory Id="LicensesDir" Name="licenses">
+            <Component Id="LicensesComponent" Guid="c6af740e-0a93-445d-80b4-ce430f948687" Win64="yes">
+              <File Id="WintunLicense" Source="$(var.WintunLicense)" KeyPath="yes" />
+              <File Id="WintunVersion" Source="$(var.WintunVersion)" />
+              <File Id="WintunSha" Source="$(var.WintunSha)" />
+            </Component>
+          </Directory>
+
+        </Directory>
+      </Directory>
+
+      <Directory Id="ProgramMenuFolder">
+        <Directory Id="ProgramMenuDir" Name="RustVPN" />
+      </Directory>
+      <Directory Id="DesktopFolder" />
+    </Directory>
+
+    <DirectoryRef Id="ProgramMenuDir">
+      <Component Id="StartMenuComponent" Guid="78f00b92-ab3c-4d03-867a-74b6bd000093" Win64="yes">
+        <Shortcut Id="StartMenuShortcut"
+                  Name="RustVPN"
+                  Description="RustVPN client"
+                  Target="[INSTALLDIR]rustvpn-client-ui.exe"
+                  WorkingDirectory="INSTALLDIR"
+                  Icon="AppIcon" />
+        <RemoveFolder Id="RemoveProgramMenuDir" On="uninstall" />
+        <RegistryValue Root="HKCU" Key="Software\RustVPN\Client"
+                       Name="StartMenuInstalled" Type="integer" Value="1" KeyPath="yes" />
+      </Component>
+    </DirectoryRef>
+
+    <DirectoryRef Id="DesktopFolder">
+      <Component Id="DesktopShortcutComponent" Guid="06593824-e9c5-4836-83d3-e919051b80ff" Win64="yes">
+        <Condition><![CDATA[INSTALLDESKTOPSHORTCUT = "1"]]></Condition>
+        <Shortcut Id="DesktopShortcut"
+                  Name="RustVPN"
+                  Description="RustVPN client"
+                  Target="[INSTALLDIR]rustvpn-client-ui.exe"
+                  WorkingDirectory="INSTALLDIR"
+                  Icon="AppIcon" />
+        <RegistryValue Root="HKCU" Key="Software\RustVPN\Client"
+                       Name="DesktopShortcutInstalled" Type="integer" Value="1" KeyPath="yes" />
+      </Component>
+    </DirectoryRef>
+
+    <Feature Id="ProductFeature" Title="RustVPN client" Level="1" Display="expand" AllowAdvertise="no">
+      <ComponentRef Id="GuiComponent" />
+      <ComponentRef Id="DaemonComponent" />
+      <ComponentRef Id="WintunComponent" />
+      <ComponentRef Id="RegistryComponent" />
+      <ComponentRef Id="InstallerScriptComponent" />
+      <ComponentRef Id="DocsComponent" />
+      <ComponentRef Id="LicensesComponent" />
+      <ComponentRef Id="StartMenuComponent" />
+      <ComponentRef Id="DesktopShortcutComponent" />
+    </Feature>
+
+    <!--
+      Create the local group and add the installing user before StartServices.
+      The helper is deliberately tolerant: it rolls back only a group it
+      created when membership could not be applied, so an existing INTERACTIVE
+      fallback is preserved instead of locking standard users out.
+    -->
+    <!--
+      The Windows Installer ServiceConfig / ServiceConfigFailureActions tables
+      are documented as unreliable and Error 1939 appeared on Windows 10.
+      Apply the same settings with sc.exe after the service is installed and
+      before it is started: delayed automatic start and restart-on-failure
+      after 5 s, 10 s and 30 s.
+    -->
+    <CustomAction Id="SetDaemonStartModeCommand"
+                  Property="RunDaemonStartMode"
+                  Value="&quot;[System64Folder]sc.exe&quot; config rustvpn-clientd start= delayed-auto" />
+    <CustomAction Id="RunDaemonStartMode"
+                  BinaryKey="WixCA"
+                  DllEntry="WixQuietExec"
+                  Execute="deferred"
+                  Impersonate="no"
+                  Return="check" />
+    <CustomAction Id="SetDaemonFailureActionsCommand"
+                  Property="RunDaemonFailureActions"
+                  Value="&quot;[System64Folder]sc.exe&quot; failure rustvpn-clientd reset= 86400 actions= restart/5000/restart/10000/restart/30000" />
+    <CustomAction Id="RunDaemonFailureActions"
+                  BinaryKey="WixCA"
+                  DllEntry="WixQuietExec"
+                  Execute="deferred"
+                  Impersonate="no"
+                  Return="check" />
+
+    <CustomAction Id="SetRustVPNUser"
+                  Property="RUSTVPN_USER"
+                  Value="[LogonUser]" />
+    <CustomAction Id="SetRustVPNGroupCommand"
+                  Property="RunRustVPNGroupSetup"
+                  Value="&quot;[System64Folder]WindowsPowerShell\v1.0\powershell.exe&quot; -NoProfile -NonInteractive -ExecutionPolicy Bypass -File &quot;[INSTALLDIR]installer\setup-group.ps1&quot; -User &quot;[RUSTVPN_USER]&quot;" />
+    <CustomAction Id="RunRustVPNGroupSetup"
+                  BinaryKey="WixCA"
+                  DllEntry="WixQuietExec"
+                  Execute="deferred"
+                  Impersonate="no"
+                  Return="ignore" />
+
+    <InstallExecuteSequence>
+      <Custom Action="SetRustVPNUser" Before="SetRustVPNGroupCommand">
+        <![CDATA[NOT Installed AND RUSTVPN_USER = ""]]>
+      </Custom>
+      <Custom Action="SetRustVPNGroupCommand" Before="RunRustVPNGroupSetup">
+        NOT Installed
+      </Custom>
+      <Custom Action="RunRustVPNGroupSetup" Before="StartServices">
+        NOT Installed
+      </Custom>
+      <Custom Action="SetDaemonStartModeCommand" Before="RunDaemonStartMode">
+        NOT Installed
+      </Custom>
+      <Custom Action="RunDaemonStartMode" Before="StartServices">
+        NOT Installed
+      </Custom>
+      <Custom Action="SetDaemonFailureActionsCommand" Before="RunDaemonFailureActions">
+        NOT Installed
+      </Custom>
+      <Custom Action="RunDaemonFailureActions" Before="StartServices">
+        NOT Installed
+      </Custom>
+    </InstallExecuteSequence>
+
+    <UIRef Id="WixUI_Minimal" />
+    <UIRef Id="WixUI_ErrorProgressText" />
+  </Product>
+</Wix>

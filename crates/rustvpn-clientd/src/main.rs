@@ -329,6 +329,32 @@ fn resolve_pipe_group(_args: &Args) -> Option<String> {
     None
 }
 
+/// Let the pipe's audience open this process for a read-only image query.
+///
+/// The GUI verifies the pipe server's image path and Authenticode signer
+/// before sending a passphrase.  A LocalSystem service is not openable by a
+/// standard user by default, so the daemon grants `PROCESS_QUERY_LIMITED_
+/// INFORMATION` to the same group that the pipe DACL allows.  This is
+/// additive to the GUI policy in M4: it exposes no memory or control rights
+/// and the GUI still fails closed when the image is not the installed daemon.
+#[cfg(windows)]
+pub(crate) fn harden_process_identity(config: &RunConfig) {
+    let audience = config.pipe_group.as_deref().unwrap_or("INTERACTIVE users");
+    match rustvpn_client_ipc::windows::apply_process_query_acl(config.pipe_group.as_deref()) {
+        Ok(()) => dlog!(
+            "process DACL: granted read-only image query access to {audience} \
+             (SYSTEM/Administrators retain full access)"
+        ),
+        Err(error) => dlog!(
+            "warning: cannot grant process image-query access to {audience}: {error}; \
+             unprivileged GUI verification will fail closed until this is fixed"
+        ),
+    }
+}
+
+#[cfg(not(windows))]
+pub(crate) fn harden_process_identity(_config: &RunConfig) {}
+
 #[derive(Clone)]
 struct Shared {
     status: Arc<RwLock<EngineStatus>>,
@@ -367,6 +393,7 @@ fn main() {
             process::exit(1);
         }
     };
+    harden_process_identity(&config);
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -844,7 +871,19 @@ fn peer_allowed(stream: &Connection, gid: &PeerPolicy) -> bool {
 #[cfg(windows)]
 fn peer_allowed(stream: &Connection, policy: &PeerPolicy) -> bool {
     match stream.peer_pid() {
-        Ok(pid) => policy.allows(pid),
+        Ok(pid) => {
+            let allowed = policy.allows(pid);
+            if !allowed {
+                // Log the actual user/groups/allowed SIDs: this is the only
+                // place a standard-user access failure is visible without a
+                // debugger, and it never includes a passphrase or profile.
+                dlog!(
+                    "rejected unauthorized IPC client: {}",
+                    policy.rejection_reason(pid)
+                );
+            }
+            allowed
+        }
         Err(_) => false,
     }
 }

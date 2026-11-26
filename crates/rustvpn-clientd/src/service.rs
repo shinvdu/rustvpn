@@ -40,6 +40,7 @@ fn service_main(_arguments: Vec<OsString>) {
             process::exit(1);
         }
     };
+    crate::harden_process_identity(&config);
 
     let shutdown = CancellationToken::new();
     let handler_shutdown = shutdown.clone();

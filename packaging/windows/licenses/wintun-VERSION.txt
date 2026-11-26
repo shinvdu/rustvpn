@@ -1,0 +1,6 @@
+Wintun 0.14.1
+Source: https://www.wintun.net/builds/wintun-0.14.1.zip
+Zip SHA256: 07C256185D6EE3652E09FA55C0B673E2624B565E02C4B9091C79CA7D2F24EF51
+Architecture: amd64
+License: WireGuard LLC Prebuilt Binaries License (see LICENSE.txt)
+Downloaded: 2026-11-26

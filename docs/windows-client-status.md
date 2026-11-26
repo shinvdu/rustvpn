@@ -2,10 +2,12 @@
 
 > 最后更新：2026-11-27
 > 分支：`feature/client-ui`
-> 状态：M1（核心接入）、M2（服务 + 本地 IPC）、M3（网络配置）已完成并提交；
-> M4（GUI 平台适配）已实现、提交，并在 Windows RDP 实机通过单元与交互验证；
+> 状态：M1（核心接入）、M2（服务 + 本地 IPC）、M3（网络配置）、M4（GUI 平台适配）
+> 已完成并提交；M5（MSI/WiX 打包、服务注册、组/DACL、Wintun、签名钩子、Windows CI）
+> 已在工作区实现并在 Windows 实机完成安装/升级/卸载验证，尚未提交；
 > M3 的真实路由/DNS/NRPT 冒烟与真实服务端 E2E 留待 M6
 > 相关文档：
+> - [Windows 安装/升级/卸载/签名](windows-install.md)
 > - [Windows 客户端调研与方案](windows-client-research.md)
 > - [Windows 开发环境与依赖](windows-dev-environment.md)
 > - [P0 决策与修复状态](p0-decision-review.md)
@@ -15,8 +17,8 @@
 
 ## 0. 一句话状态
 
-Windows 端已经完成 **开发环境 + Wintun/以太网垫片原型**，并完成了 **M1 核心接入**（`9bc1466`）、**M2 服务 + 本地 IPC**（`8cef993`）、**M3 网络配置**（`cac143a`，测试修正 `2fdd705`）和 **M4 GUI 平台适配**（`7b73a82`）：Windows 路径/ACL、Credential Manager、HKCU 自启动、Windows 语言、管道信息、发送口令前的服务端镜像/签名校验，以及 Windows 状态与错误提示。
-> 说明：M3 的 Linux 测试、Windows 目标测试（72 + 99）与 clippy 通过；M4 的 Linux 测试、Windows 目标 check/clippy、Windows 实机单元测试（31 passed + 2 ignored）通过，并在 Windows RDP 桌面会话验证了 GUI 启动、中文 locale、命名管道在线、Credential Manager roundtrip、HKCU 自启动开关、单实例、托盘图标与关闭到托盘。真实 Windows 路由/DNS/NRPT 冒烟、休眠/切网与崩溃验收留待 M6；真实服务端连接受 Wintun DLL（M5 安装）缺失阻塞。MSI/服务注册（M5）仍未开始。
+Windows 端已经完成 **开发环境 + Wintun/以太网垫片原型**，并完成了 **M1 核心接入**（`9bc1466`）、**M2 服务 + 本地 IPC**（`8cef993`）、**M3 网络配置**（`cac143a`，测试修正 `2fdd705`）、**M4 GUI 平台适配**（`7b73a82`）和 **M5 打包/安装**（工作区，未提交）：Windows 路径/ACL、Credential Manager、HKCU 自启动、Windows 语言、管道信息、发送口令前的服务端镜像/签名校验，以及 Windows 状态与错误提示；M5 增加未签名的 per-machine MSI/WiX、LocalSystem 延迟自动服务、失败恢复、`RustVPN` 组与成员、标准用户进程查询 DACL、Wintun DLL/许可证、版本映射、签名钩子和独立 Windows CI。
+> 说明：M5 的 Windows 实机验证包括 MSI 静态检查（`msiexec /a` + MSI 表 + dark）、安装、服务/管道、标准用户与非成员访问、GUI RDP 启动、升级、卸载与 profile 保留；没有连接隧道、没有改默认路由/DNS 或现有 VPN/防火墙。真实 Windows 路由/DNS/NRPT 冒烟、休眠/切网、崩溃验收、真实服务端 E2E 与性能仍归 M6。
 
 ---
 
@@ -25,15 +27,16 @@ Windows 端已经完成 **开发环境 + Wintun/以太网垫片原型**，并完
 | 项 | 状态 |
 |---|---|
 | 代码分支 | `feature/client-ui` |
-| 最近提交 | `7b73a82 feat(windows): adapt GUI paths, keyring, autostart and identity checks`（M4） |
-| M4 代码 | 已提交（GUI 平台适配） |
+| 最近提交 | `65a4bfa docs(windows): record M4 completion` |
+| M5 代码 | **工作区已实现，未提交**（MSI/服务/组/DACL/CI/文档） |
+| M4 代码 | `7b73a82 feat(windows): adapt GUI paths, keyring, autostart and identity checks` |
 | M3 代码 | `cac143a feat(windows): add network guard and crash recovery` |
 | M2 代码 | `8cef993 feat(windows): add service, named-pipe IPC and tunnel lock` |
 | M1 代码 | `9bc1466 feat(windows): integrate Wintun shim into client core` |
 | 远端 | 领先 `origin/feature/client-ui`，**未推送** |
-| 主仓库剩余改动 | M4 已提交；M3 真实路由/DNS/NRPT 与真实服务端 E2E 留待 M6 |
+| 主仓库剩余改动 | M5 工作区改动待复审/提交；M3 真实路由/DNS/NRPT、M6 E2E 留待后续 |
 | Windows 原型位置 | `prototypes/windows-shim/`，独立 crate，不加入 workspace |
-| Windows CI | `.github/workflows/windows-shim.yml`，只测原型 |
+| Windows CI | `.github/workflows/windows-client.yml`（M5 客户端构建/MSI）与 `.github/workflows/windows-shim.yml`（原型）相互独立 |
 | 原型状态 | Phase 0 参考实现，不是生产代码 |
 
 ---
@@ -253,7 +256,8 @@ Windows 端已经完成 **开发环境 + Wintun/以太网垫片原型**，并完
   `downloadBootstrapper`、MSI/NSIS targets 和 resources 脚手架（`active`
   仍为 false，不安装服务、不打包）；单实例/托盘/关闭到托盘代码不变。
   Windows 实机 `cargo tauri build --target x86_64-pc-windows-msvc` 成功生成
-  release exe；因 `bundle.active=false` 未产出 MSI/NSIS，M5 再启用打包。
+  release exe；因 `bundle.active=false` 未产出 MSI/NSIS。M5 最终改用独立
+  WiX 项目打包，`bundle.active` 保持 false。
 - **测试**：Linux `cargo fmt/clippy/test` 通过；Windows 目标 check/clippy
   通过；Windows 实机 `cargo test -p rustvpn-client-gui` 31 passed + 2
   ignored；JS i18n 测试 7 passed。ACL、locale、profile 路径、管道错误映射、
@@ -285,6 +289,89 @@ Windows 端已经完成 **开发环境 + Wintun/以太网垫片原型**，并完
   查询权限）。真实服务端 E2E（需要 M5 安装 Wintun DLL）、M3 的路由/DNS/
   NRPT/IPv6 实机验收、休眠/切网/崩溃恢复；归入 M6。
 
+### 2.10 M5 打包与安装（工作区，未提交）
+
+- **安装包选择**：使用独立 WiX 3.14 项目
+  `packaging/windows/rustvpn-client.wxs` + `candle.exe`/`light.exe`，而不是
+  Tauri bundler 的 WiX fragment。原因是 Tauri 模板拥有 Product/Feature/
+  UpgradeCode，M5 需要 LocalSystem 服务、延迟自启、失败恢复、组助手以及
+  “先停服务再替换文件、安装后再启动”的升级顺序；独立 WiX 让所有表显式、
+  可检查，且仍使用 M4 已构建的同一 GUI exe。`bundle.active` 保持 `false`，
+  GUI 行为不变。
+- **MSI 内容**：per-machine `Program Files\RustVPN`，包含
+  `rustvpn-client-ui.exe`、`rustvpn-clientd.exe`、`wintun.dll`、
+  `installer\setup-group.ps1`、`docs\`（COPYING、windows-install.md、
+  打包说明、SIGNING.txt、VERSION.txt）和 `licenses\`
+  （Wintun 许可证/版本/SHA-256）。开始菜单快捷方式默认创建；桌面快捷方式
+  默认关闭（`INSTALLDESKTOPSHORTCUT=1` 开启）。不打包用户 profile、
+  keychain 或安装者信息。
+- **服务**：`rustvpn-clientd --service`，LocalSystem、own process、
+  自动延迟启动、失败后 5/10/30 秒重启（`reset=86400`）。
+  `ServiceControl Stop="both" Start="install" Remove="uninstall" Wait="yes"`：
+  升级/卸载前停止、安装后启动、卸载时删除 SCM 项。Windows Installer 的
+  `ServiceConfig`/`ServiceConfigFailureActions` 在实机触发 Error 1939，
+  改用安装期 `sc.exe config/failure` 自定义动作，避免依赖不可靠的 MSI
+  服务配置 API；`verify-msi.ps1` 静态检查 `start= delayed-auto`、
+  `restart/5000/10000/30000`。
+- **组与访问控制**：延迟自定义动作在 `StartServices` 前运行
+  `installer\setup-group.ps1`，创建本地 `RustVPN` 组并把
+  `[LogonUser]`（可用公共属性 `RUSTVPN_USER` 覆盖）加入；无法加入时只回滚
+  本次创建的组，保留 INTERACTIVE 回退。守护进程启动时把
+  `PROCESS_QUERY_LIMITED_INFORMATION`（0x1000）授予同一组/INTERACTIVE，
+  使 M4 GUI 能在发送口令前用 `QueryFullProcessImageNameW` 校验
+  LocalSystem 服务镜像；没有授予内存/句柄/终止权限。
+- **修复 M2 组策略 bug**：`group_sid_bytes()` 直接相信
+  `LookupAccountNameW` 的 `cbSid`，在 Windows 10 上保留了 68 字节缓冲区，
+  导致 `ClientPolicy` 的 SID 字节比较拒绝合法 `RustVPN` 组成员（pipe
+  DACL/进程 DACL 用字符串 SID，不受影响）。改为用 `GetLengthSid` 截断，
+  并新增 Windows 回归测试 `looked_up_sid_bytes_match_the_sid_header_length`。
+  新增被拒绝客户端的日志（PID、用户 SID、组 SID、允许 SID），便于现场
+  排查，不记录口令/profile。
+- **版本**：Cargo/Tauri `0.2.0-beta.1` → MSI `ProductVersion 0.1.99.0`；
+  Product name、`HKLM\Software\RustVPN\Client\Version`、GUI、
+  `docs\VERSION.txt` 与产物名保留 semver。`MajorUpgrade`
+  `AllowSameVersionUpgrades=yes`，同一数字版本的 beta 重建可通过新
+  ProductCode 升级；更低版本被拒绝并提示先卸载。
+- **签名**：`sign-artifacts.ps1` 支持证书存储指纹或 PFX 环境变量，
+  在打包前签名 GUI/daemon、链接后签名 MSI，并 `signtool verify /pa`。
+  仓库不保存证书/私钥。无证书时实际验证产物未签名，并写
+  `UNSIGNED.txt`、Product comments、`docs\SIGNING.txt`。
+- **Wintun**：构建时校验 DLL 为 amd64、SHA-256 为
+  `e5da8447...dafce`；安装到 `C:\Program Files\RustVPN\wintun.dll`，
+  与 `rustvpn-net` 的绝对默认路径一致；附带上游许可证、版本与 SHA 文件。
+- **CI**：`.github/workflows/windows-client.yml` 独立于
+  `windows-shim.yml`，在 `windows-latest` 上安装 Rust + WiX 3.14、下载并
+  校验 Wintun 0.14.1、运行客户端 crate 的 check/clippy/test、构建未签名
+  MSI 并用 `msiexec /a` + MSI 表 + dark 检查；不安装服务、不使用签名密钥。
+- **Windows 实机验证（2026-11-27）**：
+  - Linux `cargo fmt/clippy/test`；Windows 目标 check/clippy 通过；
+    Windows 客户端 72 + 31(+2 ignored) + 24 + 2 + 3 + 1 + 99(+1 ignored)
+    测试通过。
+  - MSI 静态检查通过：payload 完整；`ProductVersion=0.1.99.0`；
+    `ALLUSERS=1`；`ServiceInstall` 为 `rustvpn-clientd`/StartType=2/
+    LocalSystem/`--service`；`ServiceControl` Event=163；
+    delayed-auto 与 5/10/30 秒失败动作均存在；开始菜单/可选桌面快捷方式/
+    组助手/升级表存在。
+  - 安装 `msiexec /i ... /qn RUSTVPN_USER=Administrator` 退出 0；服务
+    Running、`AUTO_START (DELAYED)`、`sc qfailure` 显示 5/10/30 秒；
+    `RustVPN` 组包含 Administrator；文件与 `wintun.dll` SHA-256 正确；
+    未签名状态经 signtool 验证。
+  - 管理员与**新登录的标准用户**（临时本地账号，加入 RustVPN 组）都通过
+    `verify-client-access.ps1`：连接命名管道、读取服务端 PID、以
+    `PROCESS_QUERY_LIMITED_INFORMATION` 打开 LocalSystem 进程、解析
+    `C:\Program Files\RustVPN\rustvpn-clientd.exe`、Hello v2 往返；非成员
+    账号在 `Connect` 处被 DACL 拒绝（访问被拒绝）。
+  - GUI 在 RDP 会话 1 启动（WebView2 子进程、UIA 窗口 `RustVPN`，
+    1096×779、非 offscreen）；未连接隧道，未改路由/DNS/现有 VPN/防火墙。
+  - 同版本升级：旧 ProductCode 卸载、新 ProductCode 安装，服务 PID
+    变化，安装后二进制哈希与最终 release 一致，组成员保留。
+  - 卸载退出 0：服务、`Program Files\RustVPN`、开始菜单、HKLM 注册表项
+    全部移除；`%LOCALAPPDATA%\RustVPN\profiles` 中的测试 profile 保留；
+    `RustVPN` 组和 `%ProgramData%\RustVPN` 按设计保留。
+  - 未执行：真实 Wintun 适配器/隧道连接（M6）、实际旧版本降级安装
+    （仅静态配置/文档）、Windows CI 运行（本机无法运行 GitHub Actions）、
+    使用真实证书的签名（本机无证书）。
+
 ---
 
 ## 3. 后续与未完成项
@@ -306,7 +393,7 @@ Windows 端已经完成 **开发环境 + Wintun/以太网垫片原型**，并完
 | IPC v2 | ✅ 帧/Hello 不变 |
 | 隧道锁 | ✅ `Global\RustVPNTunnel`，崩溃由 OS 释放；Windows 测试通过 |
 | 服务停止清理 | ✅ 与 Linux 共用 shutdown 路径；Windows 清理由 M3 guard + 启动/停止清理实现 |
-| 多用户/会话策略 | ⬜ M5 安装器创建 `RustVPN` 组并加用户；当前默认 INTERACTIVE |
+| 多用户/会话策略 | ✅ M5 安装器创建 `RustVPN` 组并加入安装者；标准用户实测通过，非成员被拒绝 |
 
 ### 3.3 Windows 网络配置（M3 已实现并提交，实机验收待 M6）
 
@@ -340,16 +427,16 @@ Windows 端已经完成 **开发环境 + Wintun/以太网垫片原型**，并完
 
 ### 3.5 安装与分发
 
-| 项 | 说明 |
+| 项 | 状态 |
 |---|---|
-| MSI/WiX | 安装 GUI + 服务 + Wintun DLL + 服务安装/升级/卸载 |
-| 服务注册 | `ServiceInstall` / `ServiceControl`，LocalSystem，自动延迟启动 |
-| Wintun DLL | 固定版本、哈希、许可证、绝对路径加载 |
-| Authenticode | GUI、daemon、MSI 签名；正式分发建议 EV 证书 |
-| 版本映射 | Cargo/Tauri `0.2.0-beta.1` → MSI 数字版本（如 `0.1.99.0`） |
-| 卸载清理 | 停服务、删规则/适配器/服务；保留用户 profile/钥匙串 |
-| Windows CI | 主仓库 Windows 构建、测试、MSI；目前只有原型 CI |
-| Wintun 许可 | 分发前确认许可并附声明 |
+| MSI/WiX | ✅ 独立 WiX 3.14 项目；包含 GUI、daemon、Wintun、文档/许可证 |
+| 服务注册 | ✅ LocalSystem、自动延迟启动、5/10/30 秒失败恢复、升级/卸载控制；实机验证 |
+| Wintun DLL | ✅ 版本/SHA 固定、amd64 校验、绝对路径、许可证随包 |
+| Authenticode | 🟡 签名钩子/未签名标记/验证已实现；本机无证书，正式发布需 EV/OV |
+| 版本映射 | ✅ `0.2.0-beta.1` → `0.1.99.0`；同版本 beta 升级实测 |
+| 卸载清理 | ✅ 停服务、删文件/快捷方式/注册表/SCM；profile 保留；组/ProgramData 按设计保留 |
+| Windows CI | ✅ `windows-client.yml` 构建/测试/未签名 MSI/静态检查；未在本机运行 |
+| Wintun 许可 | ✅ WireGuard 预编译许可证、版本、SHA 随包 |
 
 ### 3.6 测试与验收
 
@@ -361,7 +448,7 @@ Windows 端已经完成 **开发环境 + Wintun/以太网垫片原型**，并完
 | 断线恢复 | 超时、重连、切网、休眠唤醒 |
 | 路由/DNS 清理 | 断开/崩溃/服务重启后无残留、无泄漏 |
 | kill-switch | 断开后无 IPv4/IPv6/DNS 泄漏；IPv6 ND 正常 |
-| 安装测试 | 干净 Win10/Win11 安装 → 连接 → 升级 → 卸载 |
+| 安装测试 | 🟡 安装/同版本升级/卸载/标准用户与非成员访问已实测；连接隧道与干净 VM 安装待 M6 |
 | 安全测试 | 管道 DACL、假服务端、口令不落盘、DLL 校验 |
 | 垫片 fuzz | 帧/ARP/IPv4 解析不可信输入 |
 | 性能 | 吞吐、CPU、延迟；Wintun 批量/队列调优 |
@@ -387,7 +474,7 @@ Windows 端已经完成 **开发环境 + Wintun/以太网垫片原型**，并完
 |---|---|---|
 | Windows 服务 LocalSystem | 权限高，IPC 是攻击面 | 命名管道 DACL + 客户端身份校验；最小化命令集 |
 | 假管道服务端 | GUI 可能把口令发给恶意进程 | ✅ M4 在发口令前校验 PID + 镜像名/安装路径 + Authenticode publisher；残留：debug 构建允许同目录未签名 daemon（便于 `cargo tauri dev`），有目标目录写权限的同用户进程仍可通过；只校验嵌入 Authenticode（catalog-only 视为未签名），接受条件是 subject 含 `RustVPN` 而非证书 pin，M5 应固定证书/指纹 |
-| 服务端镜像校验的进程访问权 | LocalSystem 服务的进程 DACL 若拒绝普通用户 `PROCESS_QUERY_LIMITED_INFORMATION`/`QueryFullProcessImageNameW`，GUI 会 fail-closed，普通用户无法连接 | M5 必须用标准用户实测；若被拒绝，由 daemon 启动时给 RustVPN 组/Users 查询权限，或提供签名的状态通道；**不得**降级为只看管道 DACL 后发送口令 |
+| 服务端镜像校验的进程访问权 | ✅ 已解决：daemon 启动时给 pipe 同组/INTERACTIVE 授予 `PROCESS_QUERY_LIMITED_INFORMATION`（仅查询），标准用户实测可解析 LocalSystem 服务镜像并完成 Hello；未授予内存/句柄/终止权限。残留：日志会记录被拒绝客户端的 SID 组列表，但不含口令/profile |
 | Wintun DLL | 未校验 DLL 可导致提权代码执行 | 固定绝对路径、哈希/签名、ACL、不可由配置指定 |
 | Windows kill-switch fail-open | 崩溃/重启可能恢复明文出口 | Windows 明确拒绝 `kill_switch`（Fail-closed 可恢复方案未实现）；不要声称与 Linux 等价 |
 | SSH 管理员 | Ubuntu 侧被攻破即 Windows 管理员 | 限制 SSH、密钥、专用账号、审计 |
@@ -432,17 +519,17 @@ Windows 端已经完成 **开发环境 + Wintun/以太网垫片原型**，并完
 | M2 服务/IPC | Windows 服务 + 命名管道 + DACL + 锁 | ✅ 已提交 `8cef993`/`8132f24` | GUI 可连接/断开，无权限越界 |
 | M3 网络 | 路由/DNS/NRPT、防环、IPv6 阻断、清理 | 🟡 已提交；Windows 实机路由/DNS 验收待 M6 | 全隧道无泄漏，断开恢复 |
 | M4 GUI | 路径/钥匙串/自启/语言/状态/服务端身份 | ✅ 已提交 `7b73a82`，Windows RDP 实机验证 | 普通用户基础操作（真实服务端 E2E 归 M6） |
-| M5 安装 | MSI、服务安装、签名、Wintun DLL | ⬜ 未开始 | 干净 Win10/11 安装/升级/卸载 |
+| M5 安装 | MSI、服务安装、组/DACL、Wintun、签名钩子、Windows CI | ✅ 工作区实现；MSI 静态检查、安装/升级/卸载、标准用户/非成员、GUI RDP 已实测（未提交） | 干净 Win10/11 安装/升级/卸载；无证书构建标记为 unsigned |
 | M6 硬化 | E2E、休眠/切网、fuzz、CI、性能 | ⬜ 未开始 | 验收矩阵通过 |
 
-**当前状态：** M3、M4 代码已提交。M4 的 Linux
-fmt/clippy/test、Windows 目标 check/clippy、Windows 实机
-`cargo test -p rustvpn-client-gui`（31 passed + 2 ignored），以及 RDP
-桌面会话中的 GUI 启动/中文 locale/命名管道/身份校验/HKCU 自启动/单实例/
-托盘/关闭到托盘/Credential Manager roundtrip 均已通过。GUI 连接真实服务端
-被 M5 尚未安装的 Wintun DLL 阻塞（UI 已正确提示），因此 M3 的连接后地址/
-默认路由/DNS/NRPT/IPv6 规则、断开与崩溃恢复，以及 M2 的 SCM 启停和越权
-连接测试仍需 M5/M6 验收；这不阻塞 M5 的 MSI 工作。
+**当前状态：** M1–M4 已提交，M5 在工作区实现并完成 Windows 实机验证，
+**尚未提交**。M5 的 MSI 静态检查、安装、同版本升级、卸载、服务/组、
+管理员与标准用户管道/进程校验、非成员拒绝、GUI RDP 启动、Wintun
+路径/哈希/许可证、无证书 unsigned 标记均通过；Linux fmt/clippy/test 与
+Windows 目标 check/clippy/test 通过。仍未执行：真实 Wintun 适配器/隧道、
+M3 的路由/DNS/NRPT/IPv6 实机验收、断线/休眠/切网/崩溃恢复、真实服务端
+E2E、实际降级安装、Windows CI 实际运行与真实证书签名；这些归入 M6/发布
+流程，不阻塞 M5 代码复审与提交。
 
 ---
 
@@ -478,11 +565,18 @@ fmt/clippy/test、Windows 目标 check/clippy、Windows 实机
      `ERROR_NO_SUCH_LOGON_SESSION` 明确跳过。
    - 启动 GUI 检查托盘/关闭到托盘/单实例/`--minimized`；用 `--console`
      daemon 检查命名管道连接和服务未运行提示。
-   - 不要安装服务；M5 负责 MSI/服务注册。
-5. M3 代码已提交；M6 在 Windows 实机验证：握手后地址/默认路由/DNS/NRPT/
+5. M5 验证（Windows 实机，按 [`windows-install.md`](windows-install.md)）：
+   - `packaging\windows\build-msi.ps1`，再用 `verify-msi.ps1` 做
+     `msiexec /a` + MSI 表 + dark 静态检查。
+   - 安装后检查服务/延迟启动/失败恢复/组，运行
+     `verify-client-access.ps1`（管理员、RustVPN 组成员、非成员）；GUI 在
+     RDP 会话启动；随后同版本升级、卸载与 profile 保留。
+   - 不连接隧道、不改默认路由/DNS/现有 VPN/防火墙；无证书时确认
+     `UNSIGNED.txt` 且 `signtool verify /pa` 失败。
+6. M3 代码已提交；M6 在 Windows 实机验证：握手后地址/默认路由/DNS/NRPT/
    IPv6 规则；断开与崩溃后的恢复；不要在生产默认路由上直接测分流冲突。
-6. 所有 Windows 网络测试只使用 `10.88.0.0/24` 和临时适配器；不碰现有 VPN/路由/防火墙。
-7. 每完成一个里程碑，更新本文件的“已完成/未开始/隐患”和提交记录。
+7. 所有 Windows 网络测试只使用 `10.88.0.0/24` 和临时适配器；不碰现有 VPN/路由/防火墙。
+8. 每完成一个里程碑，更新本文件的“已完成/未开始/隐患”和提交记录。
 
 ---
 

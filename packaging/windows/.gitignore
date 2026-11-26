@@ -1,0 +1,10 @@
+# Never commit signing certificates, private keys or passwords.
+*.pfx
+*.p12
+*.pvk
+*.cer
+*.crt
+*.key
+*.pem
+*.snk
+signing-*.txt

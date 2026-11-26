@@ -122,6 +122,24 @@ libxdo-dev libssl-dev libdbus-1-dev`. The tray uses
 Secret Service (GNOME Keyring or KWallet). See
 [`docs/client-ui.md`](../docs/client-ui.md).
 
+## Windows client (MSI / WiX)
+
+The Windows client is packaged as a per-machine MSI. The Tauri GUI binary is
+unchanged (`bundle.active` stays `false`); a standalone WiX 3.14 project adds a
+LocalSystem service, delayed auto-start/failure recovery, the local `RustVPN`
+group, Start Menu shortcut and the Wintun DLL/license.
+
+```powershell
+$env:CARGO_TARGET_DIR = 'D:\rustvpn-dev\target-m5'
+powershell -NoProfile -ExecutionPolicy Bypass -File packaging\windows\build-msi.ps1
+```
+
+Artifacts are written to `dist\windows\`. See
+[`windows/README.md`](windows/README.md) for the payload, service tables,
+version mapping, signing hooks, MSI inspection and CI, and
+[`docs/windows-install.md`](../docs/windows-install.md) for installation,
+group membership, upgrade/downgrade and uninstall.
+
 ## Distribution packages (deb / rpm)
 
 Formal Linux packages for the desktop stack live in [`linux/`](linux/README.md).
