@@ -103,7 +103,14 @@ secrecy.
   blocks the IPv6 default route and requires IPv4 DNS only for a full tunnel
   (`routes` containing `default`). Split-tunnel profiles do not block IPv6 or
   system DNS and may leak. Routes/DNS are installed only after the first
-  successful handshake; the daemon and CLI share a tunnel lock. See the
+  successful handshake; the daemon and CLI share a tunnel lock. IPC listens on
+  a local Unix socket only, caps concurrent connections at 16 and applies
+  hello/idle/write timeouts; event subscriptions are not closed for idleness.
+- **Desktop client updates must be verifiable.** The Tauri updater is opt-in,
+  enabled only when a build carries a public key and HTTPS endpoint, and it
+  verifies update signatures. The repository ships neither a private key nor an
+  update service. Install deb/rpm packages from a trusted build and upgrade
+  through the package manager. See the
   [desktop client guide](../client-ui.md) (currently in Chinese).
 - **Only Linux is tested.** Run on platforms you can audit and test.
 
@@ -122,6 +129,9 @@ secrecy.
 - [ ] Use a build you compiled yourself or verified (`cargo build
       --release --locked`), and track dependency audits (`cargo audit`,
       `cargo deny`).
+- [ ] If you distribute GUI updates, use your own updater signing key and HTTPS
+      endpoint; keep the private key in the build environment only, and deliver
+      deb/rpm through a trusted repository or package manager.
 - [ ] Backups of `peers.yaml` are protected as credentials.
 
 ## Reporting issues

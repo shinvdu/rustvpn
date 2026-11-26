@@ -130,6 +130,7 @@ alice:
 - [FAQ](docs/ru/faq.md)
 - [Дизайн](docs/ru/design.md)
 - [Производительность](docs/ru/performance.md)
+- [Клиентский GUI (Linux, deb/rpm; документация на китайском)](docs/client-ui.md)
 
 ## Тесты и бенчмарки
 

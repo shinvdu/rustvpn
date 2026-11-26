@@ -63,6 +63,11 @@ The Tauri client does not read CLI flags; it uses
   `rustvpn-client` using `tap0`/`rsvpn0`.
 - `up`/`down` scripts are not supported; `rustvpn-clientd` manages addresses,
   routes, DNS and IPv6 leak protection itself.
+- The UI/tray language and login autostart are GUI settings, not profile fields;
+  the language lives in WebView local storage and autostart writes
+  `~/.config/autostart/rustvpn-client.desktop`.
+- The update source (Tauri updater) is build-time configuration in
+  `tauri.conf.json`, not part of a profile.
 - Full fields, build, systemd, migration and troubleshooting are in the
   [desktop client guide](../client-ui.md) (currently in Chinese).
 

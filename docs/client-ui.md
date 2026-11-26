@@ -28,6 +28,28 @@ rustvpn-crypto / proto / net（现有数据面库）
 | `rustvpn-client-gui` | Tauri 2 外壳（`rustvpn-client-ui`） | 否 |
 | `rustvpn-client` | 原 CLI，保持独立，不依赖 daemon/GUI/IPC | **是** |
 
+## 快速开始（deb / rpm）
+
+推荐用发行包安装 CLI、daemon、GUI、systemd unit 和 desktop 文件：
+
+```bash
+packaging/linux/build-packages.sh              # 构建 deb + rpm
+sudo apt install ./dist/rustvpn-client_*.deb    # Debian/Ubuntu
+# 或：sudo dnf install ./dist/rustvpn-client-*.rpm
+sudo systemctl enable --now rustvpn-clientd
+sudo usermod -aG rustvpn "$USER"               # 重新登录后 GUI 才有权限
+rustvpn-client-ui
+```
+
+首次使用：
+
+1. 打开“配置”，填写服务器、verifier、地址；全隧道再填网关和 IPv4 DNS；
+2. 回到“连接”选择配置并连接；
+3. 在“设置”选择界面语言（中文 / English / Русский），可开启登录自启动；
+4. 口令可直接输入，或勾选保存到系统钥匙串。
+
+如果只想从源码运行，跳过本节，按下文“构建依赖”和“开发运行”操作。
+
 ## 构建依赖（Ubuntu 24.04）
 
 GUI crate 的 MSRV 为 **Rust 1.90**（Tauri 2.12 要求）；CLI/core 仍为 workspace
@@ -174,6 +196,16 @@ sudo usermod -aG rustvpn "$USER"          # 重新登录后 GUI 才能访问 soc
 - 守护进程日志（SSE/事件流 + 2000 行环形缓冲）。
 - 守护进程离线时显示离线并自动重试订阅。
 
+### 界面语言、自启动与钥匙串
+
+- 首次启动跟随系统 `LANG`（`zh*` / `ru*` / 其他回退英文）；之后使用设置页
+  保存的选择，保存在 WebView 本地存储中，不写 profile。
+- 切换语言立即更新页面和托盘菜单；守护进程的错误/日志仍是英文诊断文本。
+- 登录自启动只启动 GUI，写入
+  `~/.config/autostart/rustvpn-client.desktop`，不会启动 daemon。
+- 勾选“保存到系统钥匙串”后，口令存入 Secret Service（服务名
+  `rustvpn-client`，账户为 profile 名）；删除或重命名 profile 会清理旧条目。
+
 ### 可选：签名更新
 
 Tauri updater 默认关闭，避免在没有签名密钥时误发布。启用步骤：
@@ -260,7 +292,7 @@ Rust 测试覆盖语言标签解析、托盘文案、IPC Hello/空闲超时。de
 > SIGTERM 清理正常；daemon/CLI 隧道锁单测通过。GUI 已手工验证托盘、关闭到
 > 托盘、第二个实例唤起已有窗口、钥匙串保存/预填/删除、登录自启动文件和
 > 守护进程离线界面。三语切换、托盘文案同步、updater 特性构建和 deb 内容已
-> 校验；RPM 构建需在具备 `rpmbuild` 的发行版/容器中完成。
+> 校验；deb/rpm 均已构建，目标发行版安装验收仍建议执行。
 
 ## 从旧版本升级
 

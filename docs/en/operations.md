@@ -214,7 +214,11 @@ ssh root@server 'curl -s 127.0.0.1:1294/ | jq .'
 ## Desktop client UI (Linux, optional)
 
 The Tauri client (`rustvpn-clientd` plus `rustvpn-client-ui`) is independent of
-the `rustvpn-client` CLI and uses its own local Unix socket:
+the `rustvpn-client` CLI and uses its own local Unix socket. Install it with
+`packaging/linux/build-packages.sh` and the distribution package manager
+(`apt install ./dist/rustvpn-client_*.deb` or
+`dnf install ./dist/rustvpn-client-*.rpm`), then enable the daemon and add
+the desktop user to the `rustvpn` group.
 
 - The GUI runs unprivileged; `rustvpn-clientd` keeps only
   `CAP_NET_ADMIN`/`CAP_NET_RAW`.
@@ -230,8 +234,8 @@ the `rustvpn-client` CLI and uses its own local Unix socket:
   translations. Tray/autostart need a desktop session; the daemon is still
   started by systemd.
 - `packaging/linux/build-packages.sh` builds deb/rpm packages containing the
-  CLI, daemon, GUI, unit and desktop entry. The deb is verified on Ubuntu; the
-  rpm needs an `rpmbuild` environment.
+  CLI, daemon, GUI, unit and desktop entry. Both were built and inspected on
+  Ubuntu with `rpmbuild`; installation still deserves a target-distro check.
 - The daemon's `-hello-timeout` (5 s) and `-idle-timeout` (300 s) bound IPC
   handshakes and idle requests; event subscriptions stay open. The signed Tauri
   updater is an opt-in build feature and needs your own key and endpoint.

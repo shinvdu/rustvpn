@@ -205,7 +205,11 @@ ssh root@server 'curl -s 127.0.0.1:1294/ | jq .'
 ## Клиентский GUI (Linux, опционально)
 
 Tauri-клиент (`rustvpn-clientd` + `rustvpn-client-ui`) не зависит от CLI
-`rustvpn-client` и использует собственный локальный Unix socket:
+`rustvpn-client` и использует собственный локальный Unix socket. Установка:
+`packaging/linux/build-packages.sh`, затем пакетный менеджер
+(`apt install ./dist/rustvpn-client_*.deb` или
+`dnf install ./dist/rustvpn-client-*.rpm`), включите демон и добавьте
+пользователя в группу `rustvpn`.
 
 - GUI работает без привилегий; `rustvpn-clientd` сохраняет только
   `CAP_NET_ADMIN`/`CAP_NET_RAW`.
@@ -221,8 +225,8 @@ Tauri-клиент (`rustvpn-clientd` + `rustvpn-client-ui`) не зависит
   интерфейса/меню трея zh/en/ru. Трей и автозапуск требуют графической сессии;
   демон по-прежнему запускает systemd.
 - `packaging/linux/build-packages.sh` собирает deb/rpm с CLI, демоном, GUI,
-  модулем systemd и desktop-файлом. deb проверен на Ubuntu; для rpm нужен
-  `rpmbuild`.
+  модулем systemd и desktop-файлом. Оба пакета собраны и проверены на Ubuntu
+  с `rpmbuild`; установку всё равно стоит проверить в целевом дистрибутиве.
 - `-hello-timeout` (5 с) и `-idle-timeout` (300 с) демона ограничивают IPC
   рукопожатие и простой между запросами; подписки на события не закрываются.
   Подписанный Tauri updater — опциональная функция сборки, требующая своих

@@ -196,6 +196,16 @@ encrypted UDP packets. Adjust MTU according to the mode:
 Either raise the configured/interface MTU or lower the interior network's
 MTU. See [Configuration → MTU](configuration.md#mtu).
 
+## Optional: desktop GUI
+
+On Linux, `rustvpn-client-ui` plus `rustvpn-clientd` can replace the CLI for
+day-to-day use. The GUI does not read CLI flags; its profiles live in
+`~/.config/rustvpn/profiles/*.yaml` and require an IPv4 `address` (a full
+tunnel also needs `gateway` and IPv4 `dns`). The daemon is still started by
+systemd, and the desktop user must be in the `rustvpn` group. See the
+[desktop client guide](../client-ui.md) (in Chinese) for deb/rpm packages, UI
+and tray languages, keychain, and troubleshooting.
+
 ## Tests and benchmarks
 
 ```bash

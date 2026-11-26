@@ -170,6 +170,14 @@ sudo rustvpn-client \
 
 要么提高配置/接口 MTU，要么降低内部网络的 MTU。参见[配置 → MTU](configuration.md#mtu)。
 
+## 可选：桌面图形界面
+
+Linux 上可以用 `rustvpn-client-ui` + `rustvpn-clientd` 代替 CLI 的日常操作。
+GUI 不读取 CLI 参数，profile 放在 `~/.config/rustvpn/profiles/*.yaml`，并要求
+IPv4 `address`（全隧道还要 `gateway` 和 IPv4 `dns`）。daemon 仍需由 systemd
+启动，桌面用户需加入 `rustvpn` 组。deb/rpm 构建、界面语言、托盘、钥匙串和
+排障见[客户端桌面 UI](../client-ui.md)。
+
 ## 测试与基准
 
 ```bash

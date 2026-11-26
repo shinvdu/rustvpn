@@ -63,6 +63,9 @@ Tauri 客户端不读取 CLI 参数，而是使用
 - 必须有 IPv4 `address`；全隧道（`routes` 含 `default` 或 `0.0.0.0/0`）还必须提供 `gateway` 和至少一个 IPv4 `dns`。
 - 默认 `iface` 为 `rsvpn-gui`，避免与本机 `rustvpn-client` 的 `tap0/rsvpn0` 冲突。
 - 不支持 `up`/`down` 脚本；地址、路由、DNS 和 IPv6 防护由 `rustvpn-clientd` 内置管理。
+- 界面/托盘语言与登录自启动是 GUI 设置，不写入 profile；语言保存在 WebView
+  本地存储，自启动文件在 `~/.config/autostart/rustvpn-client.desktop`。
+- 更新源（Tauri updater）是构建时配置，位于 `tauri.conf.json`，不在 profile 中。
 - 完整字段、构建、systemd、迁移和排障见[客户端桌面 UI](../client-ui.md)。
 
 ## `rustvpn-verifier` 标志

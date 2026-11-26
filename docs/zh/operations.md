@@ -244,6 +244,15 @@ sudo install -m 0755 target/release/rustvpn-clientd /usr/local/bin/
 sudo install -m 0755 target/release/rustvpn-client-ui /usr/local/bin/
 ```
 
+也可以构建并安装发行包：
+
+```bash
+packaging/linux/build-packages.sh
+sudo apt install ./dist/rustvpn-client_*.deb   # rpm: sudo dnf install ./dist/*.rpm
+sudo systemctl enable --now rustvpn-clientd
+sudo usermod -aG rustvpn "$USER"
+```
+
 要点：
 
 - GUI 以普通用户运行；`rustvpn-clientd` 使用 `CAP_NET_ADMIN`/`CAP_NET_RAW` 和本地 Unix socket。
@@ -251,7 +260,7 @@ sudo install -m 0755 target/release/rustvpn-client-ui /usr/local/bin/
 - 首次握手成功后才安装路由/DNS，失败握手不会把主机默认路由指向未建立的隧道；全隧道会阻断 IPv6 默认路由以避免泄漏。
 - daemon 与 CLI 共用 `/run/rustvpn-client/tunnel.lock`，同一时刻只允许一个活动隧道。
 - GUI 支持托盘、关闭到托盘、单实例、登录自启动、系统钥匙串（Secret Service）和中/英/俄界面切换；托盘/自启动依赖用户桌面会话，daemon 仍需由 systemd 启动。
-- `packaging/linux/build-packages.sh` 可构建 deb/rpm（CLI + daemon + GUI + unit + desktop）；deb 已在 Ubuntu 验证，rpm 需 `rpmbuild` 环境。
+- `packaging/linux/build-packages.sh` 可构建 deb/rpm（CLI + daemon + GUI + unit + desktop）；两者均已在 Ubuntu + `rpmbuild` 构建并检查，目标发行版安装验收仍建议做。
 - daemon 的 `-hello-timeout`（默认 5s）和 `-idle-timeout`（默认 300s）限制 IPC 握手与请求空闲；事件订阅不中断。签名 Tauri updater 为可选构建特性，需要自备密钥/端点。
 - GUI 用户需加入 `rustvpn` 组；systemd unit、安装和迁移步骤见[客户端文档](../client-ui.md)。
 

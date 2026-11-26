@@ -56,7 +56,7 @@ RustVPN 是一个小型虚拟专用网守护进程，通过加密、认证的隧
 | [常见问题](faq.md) | 设计问题以及"何时该使用 X"的解答。 |
 | [设计](design.md) | 架构、数据路径、兼容性不变量、测试。 |
 | [性能](performance.md) | Go 侧优化与同机 Rust-vs-Go 结果。 |
-| [桌面客户端 UI（Linux，可选）](../client-ui.md) | Tauri GUI + clientd：构建、profile、路由/DNS/IPv6 防护、隧道锁与排障。 |
+| [桌面客户端 UI（Linux，可选）](../client-ui.md) | Tauri GUI + clientd：deb/rpm、三语界面/托盘、可选签名更新、profile、路由/DNS/IPv6 防护、隧道锁与排障。 |
 
 ## 状态与限制
 

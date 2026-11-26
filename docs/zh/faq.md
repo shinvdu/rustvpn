@@ -37,7 +37,14 @@ RustVPN 需要的是一种固定、最小化的隧道格式，而非通用传输
 
 ## 有图形界面吗？
 
-Linux 上有可选的桌面客户端（Tauri UI + `rustvpn-clientd`），它与 CLI 是两个独立程序、只共享库；GUI 不持有特权。它内置了静态地址/路由/DNS 管理：profile 必须有 `address`，全隧道还需 `gateway` 和 IPv4 `dns`；首次握手成功后才安装路由，全隧道会阻断 IPv6 默认路由以避免泄漏。daemon 与 CLI 通过隧道锁保证只有一个活动隧道。详见[客户端桌面 UI](../client-ui.md)。Windows/macOS 暂无 GUI。
+Linux 上有可选的桌面客户端（Tauri UI + `rustvpn-clientd`），它与 CLI 是两个独立程序、只共享库；GUI 不持有特权。它内置了静态地址/路由/DNS 管理：profile 必须有 `address`，全隧道还需 `gateway` 和 IPv4 `dns`；首次握手成功后才安装路由，全隧道会阻断 IPv6 默认路由以避免泄漏。daemon 与 CLI 通过隧道锁保证只有一个活动隧道。界面和托盘支持中文/English/Русский，并提供 deb/rpm 包。详见[客户端桌面 UI](../client-ui.md)。Windows/macOS 暂无 GUI。
+
+## 如何安装和升级桌面客户端？
+
+用 `packaging/linux/build-packages.sh` 构建 deb/rpm，安装后启用
+`rustvpn-clientd` 并把桌面用户加入 `rustvpn` 组。deb/rpm 版本用系统包管理器
+升级；Tauri updater 是可选构建特性，需要自备签名密钥与更新端点，Linux 上
+面向 AppImage 自更新，仓库不附带私钥或托管更新服务。
 
 ## 为什么不支持 Windows 或 macOS？
 

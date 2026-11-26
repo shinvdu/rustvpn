@@ -48,7 +48,8 @@
 - **统计端点没有认证。** 将其绑定到 `127.0.0.1`（或隧道地址），绝不要对外公开。
 - **管理端是高价值目标。** `rustvpn-admind` 可写 `peers.yaml`、查看客户端元数据并踢下线，但它**不持有 `CAP_NET_ADMIN`**，只通过本地控制 socket 操作数据面。默认只绑回环；远程访问应经 TLS 反代/VPN，并启用 `-cookie-secure`。管理端不提供脚本内容编辑/上传；启用控制面时 server **强制要求** `-script-dir`，并校验脚本路径、各级目录所有权/权限，且在每次执行前复验，防止管理端被攻破后升级为任意脚本执行。详见 [`admin-web-ui.md`](../admin-web-ui.md)。
 - **管理端 `/metrics` 与 `/healthz` 不鉴权。** 它们只应通过回环或受限网络访问；不要与管理端口一起直接暴露到公网。
-- **桌面客户端（可选）的网络泄漏边界。** GUI 的 `rustvpn-clientd` 只在**全隧道**（`routes` 含 `default`）时阻断 IPv6 默认路由并强制配置 IPv4 DNS；分流模式不会阻断 IPv6 或系统 DNS，可能泄漏。首次握手成功前不安装路由/DNS；daemon 与 CLI 通过隧道锁互斥。详见 [`client-ui.md`](../client-ui.md)。
+- **桌面客户端（可选）的网络泄漏边界。** GUI 的 `rustvpn-clientd` 只在**全隧道**（`routes` 含 `default`）时阻断 IPv6 默认路由并强制配置 IPv4 DNS；分流模式不会阻断 IPv6 或系统 DNS，可能泄漏。首次握手成功前不安装路由/DNS；daemon 与 CLI 通过隧道锁互斥。IPC 只监听本地 Unix socket，并发连接上限 16，并设置 Hello/空闲/写超时；事件订阅不受空闲超时影响。
+- **桌面客户端更新必须可验证。** Tauri updater 是可选特性，仅在构建时配置公钥和 HTTPS 端点后启用，并用签名验证更新包；仓库不附带私钥或更新服务。deb/rpm 安装应来自可信构建，并用包管理器升级。详见 [`client-ui.md`](../client-ui.md)。
 - **没有自动 MTU 调整。** MTU 配置错误会导致大帧被拒绝；这不是机密性问题，但可能看起来像故障。
 - **仅在 Linux 上测试。** 请在你能够审计和测试的平台上运行。
 
@@ -62,6 +63,7 @@
 - [ ] 防火墙仅允许 VPN 端口，最好限制为已知客户端地址。
 - [ ] 口令逐客户端唯一，并在有怀疑时轮换。
 - [ ] 使用你自行编译或已验证的构建（`cargo build --release --locked`），并跟踪依赖审计（`cargo audit`、`cargo deny`）。
+- [ ] 若分发 GUI 更新，使用自建 updater 签名密钥与 HTTPS 端点；私钥只在构建环境，deb/rpm 走受信任仓库或包管理器。
 - [ ] `peers.yaml` 的备份按凭据保护。
 
 ## 报告问题

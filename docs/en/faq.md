@@ -62,9 +62,19 @@ unprivileged. It manages static addresses, routes and DNS: a profile needs an
 IPv4 `address`, and a full tunnel also needs a `gateway` and IPv4 `dns`.
 Routes are installed only after the first successful handshake, and a full
 tunnel blocks the IPv6 default route to avoid leaks. The daemon and CLI share
-a tunnel lock so only one tunnel owns the host routes. See the
+a tunnel lock so only one tunnel owns the host routes. The UI and tray support
+zh/en/ru, and deb/rpm packages are provided. See the
 [desktop client guide](../client-ui.md) (currently in Chinese). Windows and
 macOS do not have a GUI yet.
+
+## How do I install and upgrade the desktop client?
+
+Build deb/rpm packages with `packaging/linux/build-packages.sh`, enable
+`rustvpn-clientd`, and add the desktop user to the `rustvpn` group. Upgrading a
+deb/rpm install goes through the system package manager. The Tauri updater is
+an opt-in build feature that needs your own signing key and update endpoint; on
+Linux it targets AppImage self-updates, and the repository ships neither a
+private key nor an update service.
 
 ## Why no Windows or macOS support?
 
