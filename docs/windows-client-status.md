@@ -4,7 +4,7 @@
 > 分支：`feature/client-ui`
 > 状态：M1（核心接入）、M2（服务 + 本地 IPC）、M3（网络配置）、M4（GUI 平台适配）
 > 已完成并提交；M5（MSI/WiX 打包、服务注册、组/DACL、Wintun、签名钩子、Windows CI）
-> 已在工作区实现并在 Windows 实机完成安装/升级/卸载验证，尚未提交；
+> 已完成并在 Windows 实机完成安装/升级/卸载验证，已提交；
 > M3 的真实路由/DNS/NRPT 冒烟与真实服务端 E2E 留待 M6
 > 相关文档：
 > - [Windows 安装/升级/卸载/签名](windows-install.md)
@@ -17,7 +17,7 @@
 
 ## 0. 一句话状态
 
-Windows 端已经完成 **开发环境 + Wintun/以太网垫片原型**，并完成了 **M1 核心接入**（`9bc1466`）、**M2 服务 + 本地 IPC**（`8cef993`）、**M3 网络配置**（`cac143a`，测试修正 `2fdd705`）、**M4 GUI 平台适配**（`7b73a82`）和 **M5 打包/安装**（工作区，未提交）：Windows 路径/ACL、Credential Manager、HKCU 自启动、Windows 语言、管道信息、发送口令前的服务端镜像/签名校验，以及 Windows 状态与错误提示；M5 增加未签名的 per-machine MSI/WiX、LocalSystem 延迟自动服务、失败恢复、`RustVPN` 组与成员、标准用户进程查询 DACL、Wintun DLL/许可证、版本映射、签名钩子和独立 Windows CI。
+Windows 端已经完成 **开发环境 + Wintun/以太网垫片原型**，并完成了 **M1 核心接入**（`9bc1466`）、**M2 服务 + 本地 IPC**（`8cef993`）、**M3 网络配置**（`cac143a`，测试修正 `2fdd705`）、**M4 GUI 平台适配**（`7b73a82`）和 **M5 打包/安装**（`cb39124`）：Windows 路径/ACL、Credential Manager、HKCU 自启动、Windows 语言、管道信息、发送口令前的服务端镜像/签名校验；M5 增加未签名的 per-machine MSI/WiX、LocalSystem 延迟自动服务、失败恢复、`RustVPN` 组与成员、标准用户进程查询 DACL、Wintun DLL/许可证、版本映射、签名钩子和独立 Windows CI。
 > 说明：M5 的 Windows 实机验证包括 MSI 静态检查（`msiexec /a` + MSI 表 + dark）、安装、服务/管道、标准用户与非成员访问、GUI RDP 启动、升级、卸载与 profile 保留；没有连接隧道、没有改默认路由/DNS 或现有 VPN/防火墙。真实 Windows 路由/DNS/NRPT 冒烟、休眠/切网、崩溃验收、真实服务端 E2E 与性能仍归 M6。
 
 ---
@@ -27,14 +27,14 @@ Windows 端已经完成 **开发环境 + Wintun/以太网垫片原型**，并完
 | 项 | 状态 |
 |---|---|
 | 代码分支 | `feature/client-ui` |
-| 最近提交 | `65a4bfa docs(windows): record M4 completion` |
-| M5 代码 | **工作区已实现，未提交**（MSI/服务/组/DACL/CI/文档） |
+| 最近提交 | `cb39124 feat(windows): add MSI installer and service registration`（M5） |
+| M5 代码 | 已提交（MSI/服务/组/DACL/CI/文档） |
 | M4 代码 | `7b73a82 feat(windows): adapt GUI paths, keyring, autostart and identity checks` |
 | M3 代码 | `cac143a feat(windows): add network guard and crash recovery` |
 | M2 代码 | `8cef993 feat(windows): add service, named-pipe IPC and tunnel lock` |
 | M1 代码 | `9bc1466 feat(windows): integrate Wintun shim into client core` |
 | 远端 | 领先 `origin/feature/client-ui`，**未推送** |
-| 主仓库剩余改动 | M5 工作区改动待复审/提交；M3 真实路由/DNS/NRPT、M6 E2E 留待后续 |
+| 主仓库剩余改动 | M5 已提交；M3 真实路由/DNS/NRPT、M6 E2E 留待后续 |
 | Windows 原型位置 | `prototypes/windows-shim/`，独立 crate，不加入 workspace |
 | Windows CI | `.github/workflows/windows-client.yml`（M5 客户端构建/MSI）与 `.github/workflows/windows-shim.yml`（原型）相互独立 |
 | 原型状态 | Phase 0 参考实现，不是生产代码 |
@@ -289,7 +289,7 @@ Windows 端已经完成 **开发环境 + Wintun/以太网垫片原型**，并完
   查询权限）。真实服务端 E2E（需要 M5 安装 Wintun DLL）、M3 的路由/DNS/
   NRPT/IPv6 实机验收、休眠/切网/崩溃恢复；归入 M6。
 
-### 2.10 M5 打包与安装（工作区，未提交）
+### 2.10 M5 打包与安装（已提交 `cb39124`）
 
 - **安装包选择**：使用独立 WiX 3.14 项目
   `packaging/windows/rustvpn-client.wxs` + `candle.exe`/`light.exe`，而不是
@@ -519,11 +519,10 @@ Windows 端已经完成 **开发环境 + Wintun/以太网垫片原型**，并完
 | M2 服务/IPC | Windows 服务 + 命名管道 + DACL + 锁 | ✅ 已提交 `8cef993`/`8132f24` | GUI 可连接/断开，无权限越界 |
 | M3 网络 | 路由/DNS/NRPT、防环、IPv6 阻断、清理 | 🟡 已提交；Windows 实机路由/DNS 验收待 M6 | 全隧道无泄漏，断开恢复 |
 | M4 GUI | 路径/钥匙串/自启/语言/状态/服务端身份 | ✅ 已提交 `7b73a82`，Windows RDP 实机验证 | 普通用户基础操作（真实服务端 E2E 归 M6） |
-| M5 安装 | MSI、服务安装、组/DACL、Wintun、签名钩子、Windows CI | ✅ 工作区实现；MSI 静态检查、安装/升级/卸载、标准用户/非成员、GUI RDP 已实测（未提交） | 干净 Win10/11 安装/升级/卸载；无证书构建标记为 unsigned |
+| M5 安装 | MSI、服务安装、组/DACL、Wintun、签名钩子、Windows CI | ✅ 已提交 `cb39124`；MSI 静态检查、安装/升级/卸载、标准用户/非成员、GUI RDP 已实测 | 干净 Win10/11 安装/升级/卸载；无证书构建标记为 unsigned |
 | M6 硬化 | E2E、休眠/切网、fuzz、CI、性能 | ⬜ 未开始 | 验收矩阵通过 |
 
-**当前状态：** M1–M4 已提交，M5 在工作区实现并完成 Windows 实机验证，
-**尚未提交**。M5 的 MSI 静态检查、安装、同版本升级、卸载、服务/组、
+**当前状态：** M1–M5 已提交。M5 的 MSI 静态检查、安装、同版本升级、卸载、服务/组、
 管理员与标准用户管道/进程校验、非成员拒绝、GUI RDP 启动、Wintun
 路径/哈希/许可证、无证书 unsigned 标记均通过；Linux fmt/clippy/test 与
 Windows 目标 check/clippy/test 通过。仍未执行：真实 Wintun 适配器/隧道、
