@@ -117,4 +117,7 @@ sudo systemctl enable --now rustvpn-clientd.service
 
 Build the GUI on Ubuntu 24.04 needs the Tauri dependencies:
 `libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev
-libxdo-dev libssl-dev`. See [`docs/client-ui.md`](../docs/client-ui.md).
+libxdo-dev libssl-dev libdbus-1-dev`. The tray uses
+`libayatana-appindicator3`; the optional keychain integration uses the desktop
+Secret Service (GNOME Keyring or KWallet). See
+[`docs/client-ui.md`](../docs/client-ui.md).

@@ -30,10 +30,15 @@ rustvpn-crypto / proto / net（现有数据面库）
 
 ## 构建依赖（Ubuntu 24.04）
 
+GUI crate 的 MSRV 为 **Rust 1.90**（Tauri 2.12 要求）；CLI/core 仍为 workspace
+的 1.85。CI 使用 stable。
+
 ```bash
 sudo apt install libwebkit2gtk-4.1-dev libgtk-3-dev \
     libayatana-appindicator3-dev librsvg2-dev libxdo-dev libssl-dev \
-    build-essential pkg-config
+    build-essential pkg-config libdbus-1-dev
+# 可选运行依赖：托盘提示与钥匙串
+sudo apt install libayatana-appindicator3-1 gnome-keyring
 ```
 
 ```bash
@@ -42,7 +47,9 @@ cargo build --release -p rustvpn-clientd        # 守护进程
 cargo build --release -p rustvpn-client-gui     # GUI（产物：rustvpn-client-ui）
 ```
 
-Tauri 前端是仓库内的静态 `ui/`，不需要 Node/npm。
+Tauri 前端是仓库内的静态 `ui/`，不需要 Node/npm；`ui/tauri-bridge.js`
+是已打包的 `@tauri-apps/api` 最小桥接（MIT/Apache-2.0，源文件在
+`ui/vendor/tauri-api/`）。
 
 ## 开发运行
 
@@ -87,6 +94,7 @@ ipv6: false                # 暂不支持
 
 - 口令**不写入 YAML**；每次连接由 GUI 在内存中传给守护进程，派生密钥后即释放。
 - profile 目录为 `0700`、文件为 `0600`；`proxy_auth` 属于凭据，不要共享这些文件。
+- 口令可选存入系统钥匙串（Secret Service）；钥匙串不可用或保存失败时不会阻塞连接，也不会回退到明文存储。
 - 守护进程会重新校验所有字段；地址/路由由内置 Linux 配置应用，不接受
   `up`/`down` 脚本。
 - GUI/daemon 配置必须有 `address`；全隧道（`routes` 含 `default` 或
@@ -122,6 +130,7 @@ sudo systemctl enable --now rustvpn-clientd
 - 守护进程以 `rustvpn` 用户运行，仅保留 `CAP_NET_ADMIN`/`CAP_NET_RAW`。
 - socket 为 `rustvpn:rustvpn 0660`；`SO_PEERCRED` 校验 uid，主/补充组包含
   `rustvpn` 的用户可连接。
+- GUI 的托盘/自启动/钥匙串都在用户桌面会话内；托盘不可用时关闭窗口会正常退出。
 - GUI 进程无 capability；即使 WebView 被攻破，也只能操作该本地控制接口。
 - CLI 与 daemon 共用 `flock` 隧道锁：root 使用 `/run/rustvpn-client/tunnel.lock`；
   非 root 优先使用运行目录（`$XDG_RUNTIME_DIR/rustvpn` 或 `/run/rustvpn-client`）。
@@ -135,7 +144,11 @@ sudo systemctl enable --now rustvpn-clientd
 - 连接 / 断开、指数退避重连、取消。
 - 状态、服务器、协议/模式、接口、时长。
 - 下行/上行速率与线路字节、TAP 载荷字节、60 秒 Canvas 曲线。
-- profile 新增/编辑/删除；口令每次输入。
+- profile 新增/编辑/删除；口令每次输入，可选保存到系统钥匙串（Linux Secret Service）。
+- 托盘菜单：打开主窗口、断开、退出；关闭窗口隐藏到托盘。
+- 单实例：重复启动会唤起已有窗口。
+- 登录自启动：设置页写入 `~/.config/autostart/rustvpn-client.desktop`；它只启动 GUI，`rustvpn-clientd` 仍需 `systemctl enable`。
+- 钥匙串条目为 `rustvpn-client` 服务 + profile 名；删除/重命名 profile 会清理旧条目。
 - 守护进程日志（SSE/事件流 + 2000 行环形缓冲）。
 - 守护进程离线时显示离线并自动重试订阅。
 
@@ -146,9 +159,11 @@ sudo systemctl enable --now rustvpn-clientd
   路由；更具体的 IPv6 链路路由仍可能存在。分流（无 `default` 路由）不会阻断
   IPv6 或系统 DNS，使用前应确认不会泄漏。
 - 全隧道必须配置 DNS；分流模式若 `dns` 为空，仍使用系统 DNS。
-- 托盘、开机自启、keychain、Tauri updater 尚未接入。
-- GUI 使用 `withGlobalTauri` 以便零构建调用命令；CSP 仍只允许本地资源，
-  后续可换成打包的 `@tauri-apps/api` 并关闭全局注入。
+- Tauri updater（签名分发）、i18n、deb/rpm 打包尚未接入。
+- 钥匙串依赖 Linux Secret Service（GNOME Keyring/KWallet）；服务不可用时
+  保存/读取会提示失败，但口令输入和连接不受影响。
+- GUI 使用仓库内打包的 `@tauri-apps/api`（`withGlobalTauri` 已关闭），
+  CSP 仍只允许本地资源。
 - 无 TOTP/多用户隔离；本机同组用户共享同一隧道控制权。
 
 ## 测试
@@ -170,7 +185,9 @@ cargo clippy --workspace --all-targets -- -D warnings
 > metric-50 默认路由、服务器 `/32` 防环路由、IPv6 blackhole、断开后的路由
 > 恢复均通过；GUI 连接/断开/错误状态与事件订阅正常；以 systemd 瞬时单元
 > （`User=rustvpn` + ambient `CAP_NET_ADMIN`/`CAP_NET_RAW`）运行时 TAP 创建与
-> SIGTERM 清理正常；daemon/CLI 隧道锁单测通过。
+> SIGTERM 清理正常；daemon/CLI 隧道锁单测通过。GUI 已手工验证托盘、关闭到
+> 托盘、第二个实例唤起已有窗口、钥匙串保存/预填/删除、登录自启动文件和
+> 守护进程离线界面。
 
 ## 从旧版本升级
 

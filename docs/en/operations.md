@@ -225,6 +225,9 @@ the `rustvpn-client` CLI and uses its own local Unix socket:
   tunnels do not block IPv6/DNS.
 - The daemon and CLI share `/run/rustvpn-client/tunnel.lock`, so only one
   tunnel can be active.
+- The GUI provides a tray, close-to-tray, single-instance, login autostart
+  and optional Secret Service keychain storage. Tray/autostart need a desktop
+  session; the daemon is still started by systemd.
 - Users running the GUI must be members of the `rustvpn` group. See the
   [client guide](../client-ui.md) (currently in Chinese) for the systemd unit,
   migration and troubleshooting details.

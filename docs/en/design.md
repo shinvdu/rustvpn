@@ -291,8 +291,9 @@ byte equality. See [Performance](performance.md).
   management.
 - The admin has no TOTP and does not auto-disable or rate-limit on quotas;
   config cannot be written while the server is offline.
-- The client GUI is Linux-only for now; tray, keychain, auto-update, IPv6 and
-  cross-platform support are not implemented yet
+- The client GUI is Linux-only for now; auto-update, i18n, deb/rpm packaging,
+  IPv6 and cross-platform support are not implemented yet (tray, single
+  instance, login autostart and keychain are available)
   ([`client-ui-plan.md`](../client-ui-plan.md)).
 
 Next: [Performance](performance.md).

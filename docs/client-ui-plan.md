@@ -11,8 +11,9 @@
 > （UDS JSON + SO_PEERCRED）、`rustvpn-clientd`、Tauri 2 `rustvpn-client-ui`
 > 已落地；CLI 改为复用 core 的会话代码，行为与参数不变。使用说明见
 > [`client-ui.md`](client-ui.md)。本阶段偏差：仅 Linux；未做 Windows/macOS、
-> 以太网垫片、托盘、keychain、自动更新；GUI 为无构建静态页面并启用
-> `withGlobalTauri`。已补齐首轮 review 的 P1：首次握手成功后才安装路由/DNS、
+> 以太网垫片、自动更新、i18n、deb/rpm 打包；GUI 为无构建静态页面，
+> 已内置托盘、单实例、登录自启动和系统钥匙串，并关闭 `withGlobalTauri`。
+> 已补齐首轮 review 的 P1：首次握手成功后才安装路由/DNS、
 > 远程地址只解析一次、全隧道 IPv6 blackhole、全隧道 DNS 必填且 `resolvectl`
 > 失败即拒绝连接、daemon/CLI `flock` 隧道锁、GUI 默认接口改为 `rsvpn-gui`
 > 并强化 profile 校验、修复重命名 profile 误删文件。已用本机 netns + 本地

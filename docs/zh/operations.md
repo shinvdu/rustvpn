@@ -250,6 +250,7 @@ sudo install -m 0755 target/release/rustvpn-client-ui /usr/local/bin/
 - GUI profile 必须有 IPv4 `address`；全隧道（`routes` 含 `default`）还必须同时提供 `gateway` 和 IPv4 `dns`。
 - 首次握手成功后才安装路由/DNS，失败握手不会把主机默认路由指向未建立的隧道；全隧道会阻断 IPv6 默认路由以避免泄漏。
 - daemon 与 CLI 共用 `/run/rustvpn-client/tunnel.lock`，同一时刻只允许一个活动隧道。
+- GUI 支持托盘、关闭到托盘、单实例、登录自启动和系统钥匙串（Secret Service）；托盘/自启动依赖用户桌面会话，daemon 仍需由 systemd 启动。
 - GUI 用户需加入 `rustvpn` 组；systemd unit、安装和迁移步骤见[客户端文档](../client-ui.md)。
 
 <a id="passphrase-rotation"></a>
