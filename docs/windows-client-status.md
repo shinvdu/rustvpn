@@ -1,6 +1,6 @@
 # Windows 客户端开发状态
 
-> 最后更新：2026-11-26
+> 最后更新：2026-11-27
 > 分支：`feature/client-ui`
 > 状态：Phase 0 原型已完成；正式 Windows 客户端尚未开始集成
 > 相关文档：
@@ -13,7 +13,7 @@
 
 ## 0. 一句话状态
 
-Windows 端已经完成 **开发环境 + Wintun/以太网垫片原型**，并通过了 Windows 实机烟测；但还没有接入 `rustvpn-net`、没有 Windows 服务/命名管道 IPC、没有路由/DNS、没有安装包。主仓库 P0 残留（P0-1/P0-2/P1-2）已提交为 `e8acf3b`，等待最终复审；复审通过后即可开始正式集成。
+Windows 端已经完成 **开发环境 + Wintun/以太网垫片原型**，并通过了 Windows 实机烟测；但还没有接入 `rustvpn-net`、没有 Windows 服务/命名管道 IPC、没有路由/DNS、没有安装包。主仓库 P0 残留（`e8acf3b`）和 P2/崩溃恢复修复（`b192d83`）已提交；最终针对性复审待完成，复审通过后即可开始正式集成。
 
 ---
 
@@ -22,11 +22,11 @@ Windows 端已经完成 **开发环境 + Wintun/以太网垫片原型**，并通
 | 项 | 状态 |
 |---|---|
 | 代码分支 | `feature/client-ui` |
-| 最近提交 | `e8acf3b fix(p0): close remaining client review findings` |
-| 前一个提交 | `fbcd4f1 feat(windows): add Phase 0 Wintun Ethernet shim prototype` |
-| 再前一个提交 | `c73bc81 feat(p0): adopt WireGuard-borrowed client hardening` |
-| 远端 | 领先 `origin/feature/client-ui` 3 个提交，**未推送** |
-| 主仓库剩余改动 | P0 残留（P0-1/P0-2/P1-2）已提交为 `e8acf3b`，待最终复审 |
+| 最近提交 | `b192d83 fix(p2): harden crash recovery, MTU validation and status` |
+| 前一个提交 | `e8acf3b fix(p0): close remaining client review findings` |
+| 再前一个提交 | `2022339 docs(windows): add status, research, and environment guides` |
+| 远端 | 领先 `origin/feature/client-ui` 6 个提交，**未推送** |
+| 主仓库剩余改动 | P0 残留、P2 和崩溃恢复修复均已提交；待最终针对性复审 |
 | Windows 原型位置 | `prototypes/windows-shim/`，独立 crate，不加入 workspace |
 | Windows CI | `.github/workflows/windows-shim.yml`，只测原型 |
 | 原型状态 | Phase 0 参考实现，不是生产代码 |
@@ -97,6 +97,18 @@ Windows 端已经完成 **开发环境 + Wintun/以太网垫片原型**，并通
 - P0-1/P0-2/P1-2 在 `docs/p0-decision-review.md` 标记为 CLOSED
 
 > 这些改动已提交为 `e8acf3b`，仍待最终复审；复审通过后再开始 M1。
+
+### 2.5 P2 与崩溃恢复修复（已提交 `b192d83`）
+
+- kill-switch 崩溃后 fail-closed，但保留可恢复路径
+- 每次主机名解析前重新打开临时 DNS 放行；握手成功后被完整规则替换
+- 修复崩溃重启后握手失败导致的 DNS 死锁
+- 重连后保留 `mss_applied`/`kill_switch_applied`
+- 服务端显式越界 MTU 改为拒绝，不再 clamp
+- 推导 TAP IP MTU <68 在触碰网络前拒绝
+- CLI keepalive 统一为 10/25/3600 秒
+- 服务端 `status --json` 文档拆分 common/client/server 字段
+- 218+ 测试通过；最终针对性复审仍待完成
 
 ---
 
@@ -228,7 +240,7 @@ Windows 端已经完成 **开发环境 + Wintun/以太网垫片原型**，并通
 | ARM64 | Wintun/Rust/Tauri 需另一套构建 | 先 x64，后续评估 |
 | 文档语言 | 新文档英文优先 | zh/ru 后续补，不能长期缺失 |
 | 原型与主代码漂移 | MTU/Mode 重复实现 | 集成时改用 `rustvpn-proto`；保留 golden test |
-| 主仓库 P0 残留已提交但未最终复审 | 最终复审仍可能要求调整接口 | 开始 M1 前做一次集中复审；M1 基于复审后的接口 |
+| P2/崩溃恢复修复已提交但未最终复审 | 最终复审仍可能要求调整行为 | 开始 M1 前做一次针对性复审；M1 基于复审后的接口 |
 
 ---
 
@@ -245,7 +257,7 @@ Windows 端已经完成 **开发环境 + Wintun/以太网垫片原型**，并通
 | M5 安装 | MSI、服务安装、签名、Wintun DLL | ⬜ 未开始 | 干净 Win10/11 安装/升级/卸载 |
 | M6 硬化 | E2E、休眠/切网、fuzz、CI、性能 | ⬜ 未开始 | 验收矩阵通过 |
 
-**当前阻塞：** 主仓库 P0 残留已提交为 `e8acf3b`，等待最终复审。复审通过前不开始 M1。
+**当前阻塞：** P0/P2 修复已提交（`e8acf3b`、`b192d83`），最终针对性复审未完成。复审通过前不开始 M1。
 
 ---
 
