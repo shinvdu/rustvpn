@@ -1,0 +1,70 @@
+name: windows-shim prototype
+
+# Isolated CI for prototypes/windows-shim only. It does not build the main
+# RustVPN workspace and does not touch any other workflow.
+#
+# NOTE: the real Wintun adapter smoke test (`--smoke-test`) is intentionally
+# NOT run here. It requires administrator rights, the signed Wintun driver and
+# an isolated host network; it remains a documented manual check (README).
+
+on:
+  push:
+    paths:
+      - "prototypes/windows-shim/**"
+      - "crates/rustvpn-proto/**"
+      - "crates/rustvpn-crypto/**"
+      - ".github/workflows/windows-shim.yml"
+  pull_request:
+    paths:
+      - "prototypes/windows-shim/**"
+      - "crates/rustvpn-proto/**"
+      - "crates/rustvpn-crypto/**"
+      - ".github/workflows/windows-shim.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    name: linux
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: prototypes/windows-shim
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Format
+        run: cargo fmt --check
+      - name: Test
+        run: cargo test --all-targets
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Self-test
+        run: cargo run -- --self-test
+
+  windows:
+    name: windows
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: prototypes/windows-shim
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Format
+        run: cargo fmt --check
+      - name: Build
+        run: cargo build --all-targets
+      - name: Test
+        run: cargo test --all-targets
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Self-test
+        run: cargo run -- --self-test
