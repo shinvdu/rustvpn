@@ -11,8 +11,13 @@
 > （UDS JSON + SO_PEERCRED）、`rustvpn-clientd`、Tauri 2 `rustvpn-client-ui`
 > 已落地；CLI 改为复用 core 的会话代码，行为与参数不变。使用说明见
 > [`client-ui.md`](client-ui.md)。本阶段偏差：仅 Linux；未做 Windows/macOS、
-> 以太网垫片、自动更新、i18n、deb/rpm 打包；GUI 为无构建静态页面，
-> 已内置托盘、单实例、登录自启动和系统钥匙串，并关闭 `withGlobalTauri`。
+> 以太网垫片；GUI 为无构建静态页面，已内置托盘、单实例、登录自启动、系统
+> 钥匙串、中/英/俄三语切换、可选签名 updater 和 deb/rpm 打包脚本，并关闭
+> `withGlobalTauri`。updater 默认关闭，需要自行配置签名密钥与更新端点，
+> Linux 上仅面向 AppImage 自更新；deb 与 rpm 均已在 Ubuntu + `rpmbuild`
+> 构建并检查内容，目标发行版安装验收仍建议做。CI 增加三语字典/占位符测试与 Xvfb + WebDriver
+> 无头 UI 冒烟测试（导航、语言切换、配置弹窗）；托盘/钥匙串仍需真实桌面
+> 会话手工验收。
 > 已补齐首轮 review 的 P1：首次握手成功后才安装路由/DNS、
 > 远程地址只解析一次、全隧道 IPv6 blackhole、全隧道 DNS 必填且 `resolvectl`
 > 失败即拒绝连接、daemon/CLI `flock` 隧道锁、GUI 默认接口改为 `rsvpn-gui`
@@ -480,7 +485,7 @@ ipv6: false
 - [ ] 口令不落日志、不写入 profile；keychain 访问失败时要求重输。
 - [ ] 路由/DNS 修改前保存原状态；崩溃重启时恢复；避免把用户锁在“无网络”状态。
 - [ ] WebView 只加载本地资源，严格 CSP，禁用远程导航、devtools（发布版）、`withGlobalTauri`。
-- [ ] 更新包签名验证（Tauri updater/minisign；Windows/macOS 平台签名）。
+- [x] 更新包签名验证（Linux 可选 Tauri updater；Windows/macOS 平台签名仍待实现）。
 - [ ] 依赖审计（`cargo deny`/`cargo audit`）；Wintun DLL 固定版本并校验哈希。
 - [ ] 隐私：日志不记录访问目的地；客户端 UI 只展示本地统计。
 

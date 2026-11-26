@@ -291,9 +291,11 @@ byte equality. See [Performance](performance.md).
   management.
 - The admin has no TOTP and does not auto-disable or rate-limit on quotas;
   config cannot be written while the server is offline.
-- The client GUI is Linux-only for now; auto-update, i18n, deb/rpm packaging,
-  IPv6 and cross-platform support are not implemented yet (tray, single
-  instance, login autostart and keychain are available)
+- The client GUI is Linux-only for now. Packaged deb/rpm installs, zh/en/ru UI
+  and tray translations, and an opt-in signed Tauri updater are available;
+  there is no bundled update key or update service, and rpm still has to be
+  built with `rpmbuild`. IPv6 tunnelling, Windows/macOS and mobile remain out
+  of scope (tray, single instance, login autostart and keychain are available)
   ([`client-ui-plan.md`](../client-ui-plan.md)).
 
 Next: [Performance](performance.md).

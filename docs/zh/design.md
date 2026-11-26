@@ -185,6 +185,6 @@ Poly1305 固定软件后端是经过测量的选择：在 Zen3 上，该 crate �
 - encless 路径仍会分配；一个基于缓冲池的 AONT/CnW 编码器是可行的。
 - 管理端只支持单实例（无进程锁，双实例会重复采样）；控制面仅本地 Unix socket，不支持跨机管理。
 - 管理端未实现 TOTP、配额自动限速/禁用；server 离线时不能写配置。
-- 客户端 GUI 仅有 Linux MVP；自动更新、i18n、deb/rpm 打包、IPv6 与跨平台尚未实现（托盘、单实例、登录自启动、keychain 已接入）（[`client-ui-plan.md`](../client-ui-plan.md)）。
+- 客户端 GUI 仅有 Linux MVP；已提供 deb/rpm 打包、中/英/俄界面与托盘文案、可选签名 Tauri updater，但仓库不附带更新私钥或更新服务，rpm 仍需在具备 `rpmbuild` 的环境构建。IPv6 隧道、Windows/macOS 与移动端仍未实现（托盘、单实例、登录自启动、keychain 已接入）（[`client-ui-plan.md`](../client-ui-plan.md)）。
 
 下一步：[性能](performance.md)。

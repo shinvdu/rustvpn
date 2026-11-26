@@ -225,9 +225,16 @@ the `rustvpn-client` CLI and uses its own local Unix socket:
   tunnels do not block IPv6/DNS.
 - The daemon and CLI share `/run/rustvpn-client/tunnel.lock`, so only one
   tunnel can be active.
-- The GUI provides a tray, close-to-tray, single-instance, login autostart
-  and optional Secret Service keychain storage. Tray/autostart need a desktop
-  session; the daemon is still started by systemd.
+- The GUI provides a tray, close-to-tray, single-instance, login autostart,
+  optional Secret Service keychain storage and zh/en/ru UI and tray
+  translations. Tray/autostart need a desktop session; the daemon is still
+  started by systemd.
+- `packaging/linux/build-packages.sh` builds deb/rpm packages containing the
+  CLI, daemon, GUI, unit and desktop entry. The deb is verified on Ubuntu; the
+  rpm needs an `rpmbuild` environment.
+- The daemon's `-hello-timeout` (5 s) and `-idle-timeout` (300 s) bound IPC
+  handshakes and idle requests; event subscriptions stay open. The signed Tauri
+  updater is an opt-in build feature and needs your own key and endpoint.
 - Users running the GUI must be members of the `rustvpn` group. See the
   [client guide](../client-ui.md) (currently in Chinese) for the systemd unit,
   migration and troubleshooting details.

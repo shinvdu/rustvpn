@@ -138,6 +138,26 @@ sudo systemctl enable --now rustvpn-clientd
   `RUSTVPN_TUNNEL_LOCK=/path` 覆盖。
 - CLI 仍可独立运行；同一时刻只有一个活动隧道。若同时部署 `rustvpn-client`
   服务，请给它也加 `RuntimeDirectory=rustvpn-client`，保证锁目录在 daemon 之前存在。
+- IPC 空闲超时：`-hello-timeout`（默认 5 秒）限制完成 Hello 前的等待，
+  `-idle-timeout`（默认 300 秒）限制已握手连接两次请求之间的空闲；事件订阅
+  不受空闲超时影响。设为 `0` 可关闭对应超时，systemd 模板已显式写出默认值。
+
+### deb / rpm 包
+
+正式包会同时安装 CLI、daemon、GUI、systemd unit、desktop 文件与图标，并创建
+`rustvpn` 系统用户/组：
+
+```bash
+packaging/linux/build-packages.sh          # deb + rpm
+packaging/linux/build-packages.sh deb      # 只构建 deb
+sudo apt install ./dist/rustvpn-client_*.deb
+sudo systemctl enable --now rustvpn-clientd
+sudo usermod -aG rustvpn "$USER"          # 重新登录后 GUI 才能访问 socket
+```
+
+构建依赖见 [`packaging/linux/README.md`](../packaging/linux/README.md)。RPM 需要
+`rpmbuild`；两种包均已检查文件与依赖，但仍应在目标发行版做安装/启动验收。
+包不会写入用户级 profile、自启动或钥匙串。
 
 ## 功能
 
@@ -149,8 +169,35 @@ sudo systemctl enable --now rustvpn-clientd
 - 单实例：重复启动会唤起已有窗口。
 - 登录自启动：设置页写入 `~/.config/autostart/rustvpn-client.desktop`；它只启动 GUI，`rustvpn-clientd` 仍需 `systemctl enable`。
 - 钥匙串条目为 `rustvpn-client` 服务 + profile 名；删除/重命名 profile 会清理旧条目。
+- 界面语言：中文 / English / Русский，设置页即时切换并同步托盘菜单；选择保存在本机。
+- 软件更新：设置页提供检查/安装入口，但仅在启用 `updater` 特性并配置签名公钥与更新端点后可用（见下文）。
 - 守护进程日志（SSE/事件流 + 2000 行环形缓冲）。
 - 守护进程离线时显示离线并自动重试订阅。
+
+### 可选：签名更新
+
+Tauri updater 默认关闭，避免在没有签名密钥时误发布。启用步骤：
+
+1. 生成/保管 updater 签名密钥，把公钥填入
+   `crates/rustvpn-client-gui/tauri.conf.json` 的 `plugins.updater.pubkey`；
+2. 在 `plugins.updater.endpoints` 填 HTTPS 更新端点（支持
+   `{{target}}`/`{{arch}}`/`{{current_version}}` 模板）：
+
+   ```json
+   "plugins": {
+     "updater": {
+       "pubkey": "RW...",
+       "endpoints": ["https://updates.example.com/{{target}}/{{arch}}/{{current_version}}"]
+     }
+   }
+   ```
+3. 用 `cargo build --release -p rustvpn-client-gui --features updater` 构建，
+   或运行 Tauri CLI 打包并设置 `TAURI_SIGNING_PRIVATE_KEY`（私钥只放构建环境）；
+4. 发布 `.sig` 与更新产物。更新包由公钥验证签名；私钥丢失将无法再发布可信更新。
+
+未启用该特性的普通构建里，“检查更新”按钮为禁用状态。Linux 上 Tauri
+updater 面向 AppImage 自更新；通过本仓库 deb/rpm 安装的副本应使用包管理器
+升级，不要依赖 updater 替换系统文件。
 
 ## 已知限制
 
@@ -159,7 +206,9 @@ sudo systemctl enable --now rustvpn-clientd
   路由；更具体的 IPv6 链路路由仍可能存在。分流（无 `default` 路由）不会阻断
   IPv6 或系统 DNS，使用前应确认不会泄漏。
 - 全隧道必须配置 DNS；分流模式若 `dns` 为空，仍使用系统 DNS。
-- Tauri updater（签名分发）、i18n、deb/rpm 打包尚未接入。
+- i18n 覆盖界面与托盘菜单；`rustvpn-clientd` 的错误文本和日志仍是英文诊断信息，便于检索与兼容。
+- Tauri updater 是可选特性：默认构建不含更新插件，需要自己的签名密钥与更新端点；仓库不提供私钥或托管更新服务。Linux 自更新面向 AppImage，deb/rpm 用户应走包管理器升级。
+- deb 与 rpm 均已在本机（Ubuntu + `rpmbuild`）构建并检查文件/依赖；仍建议在目标发行版（Fedora/openSUSE）做安装与启动验收。包不包含用户 profile、自启动或钥匙串条目。
 - 钥匙串依赖 Linux Secret Service（GNOME Keyring/KWallet）；服务不可用时
   保存/读取会提示失败，但口令输入和连接不受影响。
 - GUI 使用仓库内打包的 `@tauri-apps/api`（`withGlobalTauri` 已关闭），
@@ -170,8 +219,31 @@ sudo systemctl enable --now rustvpn-clientd
 
 ```bash
 cargo test -p rustvpn-client-core -p rustvpn-client-ipc -p rustvpn-clientd -p rustvpn-client-gui
+node --test crates/rustvpn-client-gui/ui-tests/i18n.test.js
+cargo check -p rustvpn-client-gui --features updater
+bash -n packaging/linux/build-packages.sh
 cargo clippy --workspace --all-targets -- -D warnings
 ```
+
+无头 UI 冒烟测试（CI 会跑；需要 `webkit2gtk-driver`、`xvfb` 和
+`cargo install tauri-driver`）：
+
+```bash
+cargo build --release -p rustvpn-client-gui
+xvfb-run -a -s "-screen 0 1280x900x24" dbus-run-session -- bash -c '
+  export GDK_BACKEND=x11 WEBKIT_DISABLE_COMPOSITING_MODE=1
+  tauri-driver --port 4444 & sleep 1
+  node crates/rustvpn-client-gui/ui-tests/webdriver-smoke.js \
+    target/release/rustvpn-client-ui
+  kill %1
+'
+```
+
+JS 测试会校验三语字典键一致、占位符保留、静态 HTML/动态 `t()` 文案全部有
+翻译；WebDriver 冒烟测试会实际点击导航、切换 zh/en/ru 并打开配置弹窗；
+Rust 测试覆盖语言标签解析、托盘文案、IPC Hello/空闲超时。deb 通过
+`dpkg-deb -I/-c` 校验文件与依赖；托盘/钥匙串/自启动仍需要真实桌面会话，列
+为手工验收项。
 
 端到端验证（本机 netns，未改动现网）：
 
@@ -187,7 +259,8 @@ cargo clippy --workspace --all-targets -- -D warnings
 > （`User=rustvpn` + ambient `CAP_NET_ADMIN`/`CAP_NET_RAW`）运行时 TAP 创建与
 > SIGTERM 清理正常；daemon/CLI 隧道锁单测通过。GUI 已手工验证托盘、关闭到
 > 托盘、第二个实例唤起已有窗口、钥匙串保存/预填/删除、登录自启动文件和
-> 守护进程离线界面。
+> 守护进程离线界面。三语切换、托盘文案同步、updater 特性构建和 deb 内容已
+> 校验；RPM 构建需在具备 `rpmbuild` 的发行版/容器中完成。
 
 ## 从旧版本升级
 
@@ -214,6 +287,8 @@ cargo clippy --workspace --all-targets -- -D warnings
 | 连接失败且主机断网 | 复查 daemon 日志；正常实现应在握手成功前不动路由。若日志显示 network setup 失败，检查网关/DNS |
 | IPv6 被阻断但隧道已断开 | 仅在没有活动 RustVPN 隧道时执行 `ip -6 route del blackhole default proto 66 metric 50` |
 | GUI 显示守护进程离线、`Permission denied` | 用户加入 `rustvpn` 组并重新登录；检查 socket `0660` 与 `/run/rustvpn-client` 目录权限 |
+| 检查更新按钮灰色 | 当前构建未启用 `updater` 特性或未配置公钥/端点；见“可选：签名更新” |
+| 托盘菜单仍是旧语言 | 托盘不可用或语言命令失败；查看启动日志，重启 GUI 后重试 |
 
 ## 回滚 / 卸载
 
