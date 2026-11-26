@@ -524,9 +524,12 @@ impl AdminBackend for ControlBackend {
         let _guard = self.config_write.lock().await;
         let paths = self.paths.clone();
         let name = name.to_string();
-        tokio::task::spawn_blocking(move || config_edit::restore(&paths, &name))
-            .await
-            .map_err(|error| ConfigError::Io(error.to_string()))??;
+        let script_dirs = self.script_dirs.clone();
+        tokio::task::spawn_blocking(move || {
+            config_edit::restore_checked(&paths, &name, &script_dirs)
+        })
+        .await
+        .map_err(|error| ConfigError::Io(error.to_string()))??;
         let paths = self.paths.clone();
         let loaded = tokio::task::spawn_blocking(move || config_edit::load(&paths))
             .await

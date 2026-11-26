@@ -430,7 +430,13 @@ pub fn list_backups(paths: &ConfigPaths) -> Result<Vec<BackupInfo>, ConfigError>
     Ok(out)
 }
 
-pub fn restore(paths: &ConfigPaths, name: &str) -> Result<(), ConfigError> {
+pub struct RestorePlan {
+    files: ConfigFiles,
+    enabled_raw: Option<String>,
+    disabled_raw: Option<String>,
+}
+
+pub fn plan_restore(paths: &ConfigPaths, name: &str) -> Result<RestorePlan, ConfigError> {
     if name.contains('/') || name.contains('\\') || name.contains("..") {
         return Err(ConfigError::Invalid("invalid backup name".into()));
     }
@@ -463,15 +469,43 @@ pub fn restore(paths: &ConfigPaths, name: &str) -> Result<(), ConfigError> {
         Some(raw) => raw.clone(),
         None => fs::read_to_string(&paths.disabled).unwrap_or_default(),
     };
-    let next = ConfigFiles {
+    let files = ConfigFiles {
         enabled: parse_map(&enabled_text, "peers.yaml")?,
         disabled: parse_map(&disabled_text, "peers.disabled.yaml")?,
     };
-    next.validate()?;
-    if let Some(raw) = enabled_raw {
+    files.validate()?;
+    Ok(RestorePlan {
+        files,
+        enabled_raw,
+        disabled_raw,
+    })
+}
+
+pub fn restore(paths: &ConfigPaths, name: &str) -> Result<(), ConfigError> {
+    let plan = plan_restore(paths, name)?;
+    write_restore(paths, &plan)
+}
+
+/// Restore a backup after checking that every script path stays inside the
+/// admin's allow-list.  The server applies its own ownership/permission
+/// checks on reload.
+pub fn restore_checked(
+    paths: &ConfigPaths,
+    name: &str,
+    allowed_dirs: &[PathBuf],
+) -> Result<(), ConfigError> {
+    let plan = plan_restore(paths, name)?;
+    for (name, peer) in plan.files.enabled.iter().chain(plan.files.disabled.iter()) {
+        validate_script_allowlist(name, peer, allowed_dirs)?;
+    }
+    write_restore(paths, &plan)
+}
+
+fn write_restore(paths: &ConfigPaths, plan: &RestorePlan) -> Result<(), ConfigError> {
+    if let Some(raw) = &plan.enabled_raw {
         write_atomic(&paths.enabled, raw.as_bytes())?;
     }
-    if let Some(raw) = disabled_raw {
+    if let Some(raw) = &plan.disabled_raw {
         write_atomic(&paths.disabled, raw.as_bytes())?;
     }
     Ok(())
@@ -658,5 +692,31 @@ mod tests {
         let loaded = load(&paths).unwrap();
         assert_eq!(loaded.files.enabled.len(), 1);
         assert!(loaded.files.disabled.is_empty());
+    }
+
+    #[test]
+    fn restore_checked_rejects_scripts_outside_allowlist() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = ConfigPaths {
+            enabled: dir.path().join("peers.yaml"),
+            disabled: dir.path().join("peers.disabled.yaml"),
+            backup_dir: dir.path().join("backups"),
+        };
+        std::fs::write(&paths.enabled, "").unwrap();
+        std::fs::create_dir_all(&paths.backup_dir).unwrap();
+        let allowed = dir.path().join("scripts");
+        std::fs::create_dir_all(&allowed).unwrap();
+
+        let mut files = ConfigFiles::default();
+        let mut entry = peer("alice", "tap0");
+        entry.up = "/outside/up.sh".into();
+        files.enabled.insert("alice".into(), entry);
+        let (enabled, _) = files.render().unwrap();
+        let name = "peers-20261126-000000.yaml";
+        std::fs::write(paths.backup_dir.join(name), enabled).unwrap();
+
+        let error = restore_checked(&paths, name, &[allowed]).unwrap_err();
+        assert!(error.to_string().contains("must be under"));
+        assert_eq!(std::fs::read_to_string(&paths.enabled).unwrap(), "");
     }
 }
