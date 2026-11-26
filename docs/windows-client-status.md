@@ -2,7 +2,7 @@
 
 > 最后更新：2026-11-27
 > 分支：`feature/client-ui`
-> 状态：M1（核心接入，已提交）与 M2（服务 + 本地 IPC，未提交）代码完成
+> 状态：M1（核心接入）与 M2（服务 + 本地 IPC）已完成并提交；M3 进行中
 > 相关文档：
 > - [Windows 客户端调研与方案](windows-client-research.md)
 > - [Windows 开发环境与依赖](windows-dev-environment.md)
@@ -13,7 +13,7 @@
 
 ## 0. 一句话状态
 
-Windows 端已经完成 **开发环境 + Wintun/以太网垫片原型**，并完成了 **M1 核心接入**（已提交 `9bc1466`）和 **M2 服务 + 本地 IPC**（本地未提交）：命名管道传输、DACL、客户端身份校验、Windows SCM 服务外壳、命名互斥量隧道锁，以及 `--console` 端到端 IPC 测试。路由/DNS/NRPT（M3）、GUI 平台适配（M4）、MSI/服务安装（M5）仍未开始。M2 的 Windows 目标交叉检查与 clippy 通过，Linux 上 console 端到端测试通过；Windows 实机上的同名测试与 SCM 启停验证仍需在 Windows 主机执行。
+Windows 端已经完成 **开发环境 + Wintun/以太网垫片原型**，并完成了 **M1 核心接入**（`9bc1466`）和 **M2 服务 + 本地 IPC**（`8cef993`）：命名管道传输、DACL、客户端身份校验、Windows SCM 服务外壳、命名互斥量隧道锁，以及 `--console` 端到端 IPC 测试。Windows 实机已跑通命名管道 E2E、DACL 与隧道锁测试；SCM 服务注册/启停属 M5。路由/DNS/NRPT（M3）、GUI 平台适配（M4）、MSI/服务安装（M5）仍未开始。
 
 ---
 
@@ -22,11 +22,11 @@ Windows 端已经完成 **开发环境 + Wintun/以太网垫片原型**，并完
 | 项 | 状态 |
 |---|---|
 | 代码分支 | `feature/client-ui` |
-| 最近提交 | `9bc1466 feat(windows): integrate Wintun shim into client core`（M1） |
-| M2 改动 | 工作区未提交（IPC 传输/安全、clientd 服务、隧道锁、文档） |
-| 前一个提交 | `8d31571 fix(kill-switch): recover DNS after partial narrow failure` |
+| 最近提交 | `8cef993 feat(windows): add service, named-pipe IPC and tunnel lock`（M2） |
+| 前一个提交 | `9bc1466 feat(windows): integrate Wintun shim into client core`（M1） |
+| M2 验证 | Windows 实机命名管道 E2E、DACL、隧道锁测试通过 |
 | 远端 | 领先 `origin/feature/client-ui`，**未推送** |
-| 主仓库剩余改动 | M2 完成后需复审与提交；Windows 实机测试待执行 |
+| 主仓库剩余改动 | M3 进行中；M2 已提交 |
 | Windows 原型位置 | `prototypes/windows-shim/`，独立 crate，不加入 workspace |
 | Windows CI | `.github/workflows/windows-shim.yml`，只测原型 |
 | 原型状态 | Phase 0 参考实现，不是生产代码 |
@@ -118,7 +118,7 @@ Windows 端已经完成 **开发环境 + Wintun/以太网垫片原型**，并完
 - `rustvpn-crypto::egd` 按平台 cfg
 - Windows 目标可编译；路由/DNS/NRPT 仍属 M3
 
-### 2.7 M2 服务 + 本地 IPC（本地未提交）
+### 2.7 M2 服务 + 本地 IPC（已提交 `8cef993`）
 
 - `rustvpn-client-ipc`：新增 `transport` 抽象（Unix socket / Windows 命名管道），
   帧格式、Hello、超时、事件订阅、`PROTOCOL_VERSION=2` 不变
@@ -146,9 +146,10 @@ Windows 端已经完成 **开发环境 + Wintun/以太网垫片原型**，并完
   - Linux：`cargo fmt --all`、`cargo clippy --workspace --all-targets -D warnings`、
     `cargo test --workspace`（含新增 console EXE 端到端测试）通过
   - Windows target：`cargo check` / `cargo clippy --all-targets`（`x86_64-pc-windows-msvc`）
-    对 `rustvpn-client-ipc`、`rustvpn-clientd`、`rustvpn-client-core` 通过；
-    链接/运行需 Windows 主机 MSVC
-  - 未执行：Windows 实机命名管道 E2E、SCM 启停、第二用户越权连接测试
+    对 `rustvpn-client-ipc`、`rustvpn-clientd`、`rustvpn-client-core` 通过
+  - Windows 实机：74 tests 通过（client-core 48、client-ipc 20+2、
+    clientd 3+1），含命名管道 E2E、DACL、命名互斥量锁
+  - 未执行：SCM 服务注册/启停（属 M5）、第二用户越权连接测试
 
 ---
 
@@ -164,11 +165,11 @@ Windows 端已经完成 **开发环境 + Wintun/以太网垫片原型**，并完
 | 项 | 状态 |
 |---|---|
 | Windows 服务 | 🟡 代码完成；SCM 启停实机验证、服务注册/失败恢复策略属 M5 |
-| 命名管道 / 帧 | ✅ 代码完成，Linux 端端到端测试通过；Windows 实机测试待跑 |
-| 管道 DACL | ✅ SYSTEM + Administrators + INTERACTIVE / `-pipe-group` 专用组 |
+| 命名管道 / 帧 | ✅ Linux 与 Windows 实机端到端测试通过 |
+| 管道 DACL | ✅ SYSTEM + Administrators + INTERACTIVE / `-pipe-group` 专用组；Windows 测试通过 |
 | 客户端身份校验 | ✅ PID + token 组校验；GUI 侧服务端签名校验属 M4 |
 | IPC v2 | ✅ 帧/Hello 不变 |
-| 隧道锁 | ✅ `Global\RustVPNTunnel`，崩溃由 OS 释放；实机测试待跑 |
+| 隧道锁 | ✅ `Global\RustVPNTunnel`，崩溃由 OS 释放；Windows 测试通过 |
 | 服务停止清理 | 🟡 与 Linux 共用 shutdown 路径；Windows 路由/DNS/NRPT/防火墙清理属 M3 |
 | 多用户/会话策略 | ⬜ M5 安装器创建 `RustVPN` 组并加用户；当前默认 INTERACTIVE |
 
