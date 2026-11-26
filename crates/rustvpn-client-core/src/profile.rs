@@ -354,10 +354,26 @@ mod tests {
             assert!(error.contains("Windows minimum 576"), "{error}");
         }
 
-        // The plain padded-mode floor already derives a usable TAP IP MTU.
+        // The padded-mode floor derives a usable TAP IP MTU on Linux (noise
+        // 120 -> inner 81).  Windows requires at least 576, so the same wire
+        // MTU is rejected there and 615 (noise -> inner 576) is the success
+        // case.  The Linux-only 119 check stays below the mode floor.
         spec.noise = true;
         spec.mtu = 120;
+        #[cfg(not(windows))]
         assert!(ValidatedProfile::new(&spec).is_ok());
+        #[cfg(windows)]
+        {
+            let error = ValidatedProfile::new(&spec).err().unwrap().to_string();
+            assert!(error.contains("Windows minimum 576"), "{error}");
+
+            // noise 615 -> max_payload 590 -> interface IP MTU 576 exactly.
+            spec.mtu = 615;
+            assert!(ValidatedProfile::new(&spec).is_ok());
+            spec.mtu = 614;
+            let error = ValidatedProfile::new(&spec).err().unwrap().to_string();
+            assert!(error.contains("Windows minimum 576"), "{error}");
+        }
         spec.mtu = 119;
         assert!(ValidatedProfile::new(&spec).is_err());
     }
