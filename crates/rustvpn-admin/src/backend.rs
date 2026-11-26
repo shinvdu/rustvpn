@@ -85,15 +85,7 @@ impl ControlBackend {
 
     async fn call(&self, request: Request) -> Result<Response, String> {
         let path = self.control_path.clone();
-        let timeout = match &request {
-            // The server waits up to 5s for a kick and may parse a full config
-            // on reload; do not undercut those operations with a 3s client
-            // timeout that reports failure while the action succeeds.
-            Request::Kick { .. } | Request::Reload | Request::ValidateConfig { .. } => {
-                Duration::from_secs(10)
-            }
-            _ => Duration::from_secs(3),
-        };
+        let timeout = request_timeout(&request);
         let result = tokio::time::timeout(timeout, call_once(path, &request)).await;
         match result {
             Ok(Ok(response)) => {
@@ -374,6 +366,18 @@ impl ControlBackend {
                 )],
             ),
         }
+    }
+}
+
+fn request_timeout(request: &Request) -> Duration {
+    match request {
+        // The server waits up to 5s for a kick and may parse a full config on
+        // reload; do not undercut those operations with a 3s client timeout
+        // that reports failure while the action succeeds.
+        Request::Kick { .. } | Request::Reload | Request::ValidateConfig { .. } => {
+            Duration::from_secs(10)
+        }
+        _ => Duration::from_secs(3),
     }
 }
 
@@ -696,5 +700,163 @@ impl From<ctl::KickReport> for KickReport {
             session_id: value.session_id,
             addr: value.addr,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{AdminBackend, ApplyRequest, ConfigError, EventLog};
+    use crate::store::Store;
+    use rustvpn_control::{read_frame, write_frame};
+    use std::path::Path;
+    use tokio::net::UnixListener;
+
+    fn spawn_fake_control(path: &Path, valid: bool, kick_error: bool) {
+        let listener = UnixListener::bind(path).unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    continue;
+                };
+                tokio::spawn(async move {
+                    let Ok(Some(Request::Hello { version })) =
+                        read_frame::<_, Request>(&mut stream).await
+                    else {
+                        return;
+                    };
+                    let hello = Response::Hello {
+                        version,
+                        server_version: "test".into(),
+                        server_instance: 1,
+                    };
+                    if write_frame(&mut stream, &hello).await.is_err() {
+                        return;
+                    }
+                    loop {
+                        let Ok(Some(request)) = read_frame::<_, Request>(&mut stream).await else {
+                            break;
+                        };
+                        let response = match request {
+                            Request::ValidateConfig { .. } => Response::ConfigValidation {
+                                valid,
+                                errors: if valid {
+                                    Vec::new()
+                                } else {
+                                    vec!["test policy rejection".into()]
+                                },
+                            },
+                            Request::Kick { .. } if kick_error => Response::Error {
+                                message: "peer is not online".into(),
+                            },
+                            _ => Response::Error {
+                                message: "unsupported in test".into(),
+                            },
+                        };
+                        if write_frame(&mut stream, &response).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+    }
+
+    fn test_backend(dir: &Path, control: std::path::PathBuf) -> Arc<ControlBackend> {
+        let paths = ConfigPaths {
+            enabled: dir.join("peers.yaml"),
+            disabled: dir.join("peers.disabled.yaml"),
+            backup_dir: dir.join("backups"),
+        };
+        std::fs::write(&paths.enabled, "").unwrap();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let history = History::spawn(store.clone());
+        ControlBackend::new(
+            paths,
+            control,
+            "127.0.0.1:8080".into(),
+            history,
+            Arc::new(EventLog::new(10)),
+            store,
+            Vec::new(),
+        )
+    }
+
+    fn apply_request() -> ApplyRequest {
+        ApplyRequest {
+            enabled_yaml: String::new(),
+            disabled_yaml: String::new(),
+            expected_etag: config_edit::etag("", ""),
+            comment: String::new(),
+        }
+    }
+
+    #[test]
+    fn request_timeouts_match_server_limits() {
+        assert_eq!(request_timeout(&Request::Status), Duration::from_secs(3));
+        assert_eq!(request_timeout(&Request::Sessions), Duration::from_secs(3));
+        assert_eq!(
+            request_timeout(&Request::Kick {
+                id: "00".repeat(16),
+                reason: "test".into()
+            }),
+            Duration::from_secs(10)
+        );
+        assert_eq!(request_timeout(&Request::Reload), Duration::from_secs(10));
+        assert_eq!(
+            request_timeout(&Request::ValidateConfig {
+                enabled_yaml: String::new()
+            }),
+            Duration::from_secs(10)
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_refuses_to_write_without_control_plane() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = test_backend(dir.path(), dir.path().join("missing.sock"));
+        let error = backend.apply_config(apply_request()).await.unwrap_err();
+        assert!(matches!(error, ConfigError::Io(_)));
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("peers.yaml")).unwrap(),
+            ""
+        );
+        assert!(!dir.path().join("backups").exists());
+    }
+
+    #[tokio::test]
+    async fn apply_does_not_write_when_preflight_rejects() {
+        let dir = tempfile::tempdir().unwrap();
+        let control = dir.path().join("control.sock");
+        spawn_fake_control(&control, false, false);
+        let backend = test_backend(dir.path(), control);
+        let error = backend.apply_config(apply_request()).await.unwrap_err();
+        assert!(matches!(error, ConfigError::Invalid(_)));
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("peers.yaml")).unwrap(),
+            ""
+        );
+        assert!(!dir.path().join("backups").exists());
+    }
+
+    #[tokio::test]
+    async fn valid_preflight_is_accepted() {
+        let dir = tempfile::tempdir().unwrap();
+        let control = dir.path().join("control.sock");
+        spawn_fake_control(&control, true, false);
+        let backend = test_backend(dir.path(), control);
+        backend.prevalidate_config("").await.unwrap();
+        assert!(backend.is_online());
+    }
+
+    #[tokio::test]
+    async fn remote_business_error_keeps_the_control_plane_online() {
+        let dir = tempfile::tempdir().unwrap();
+        let control = dir.path().join("control.sock");
+        spawn_fake_control(&control, true, true);
+        let backend = test_backend(dir.path(), control);
+        let error = backend.kick([0u8; 16], "test".into()).await.unwrap_err();
+        assert!(error.contains("peer is not online"));
+        assert!(backend.is_online());
     }
 }
