@@ -30,9 +30,9 @@ Windows 端已经完成 **开发环境 + Wintun/以太网垫片原型**，并完
 | 项 | 状态 |
 |---|---|
 | 代码分支 | `feature/client-ui` |
-| 最近提交 | `06a092b fix(windows): harden Win10 network probing and add E2E harness`（M6 代码） |
+| 最近提交 | `2dd3b66 fix(windows): make disconnect teardown deterministic`（候选修复，未 VM 验证） |
 | M5 代码 | 已提交（MSI/服务/组/DACL/CI/文档） |
-| M6 代码 | 已提交（分流 E2E 修复、fuzz、手动 E2E 工作流）；断开/崩溃/全隧道验收被主机离线阻塞 |
+| M6 代码 | 已提交（分流 E2E 修复、fuzz、手动 E2E 工作流、teardown 重排候选修复）；断开/崩溃/全隧道验收被主机离线阻塞 |
 | M4 代码 | `7b73a82 feat(windows): adapt GUI paths, keyring, autostart and identity checks` |
 | M3 代码 | `cac143a feat(windows): add network guard and crash recovery` |
 | M2 代码 | `8cef993 feat(windows): add service, named-pipe IPC and tunnel lock` |
@@ -457,7 +457,7 @@ PowerShell IPC 客户端驱动 `Connect/Status/Disconnect`；未修改现有 VPN
   join peer 任务，任务仍持有 `Arc<Tap>`，`drop(tap)` 未必真正关闭会话/适配器。两
   条路径都需在一次性 VM 中用二分法验证（先只关闭适配器、不删地址；再只删
   地址、不关闭适配器）。
-- **已实现的修复（当前工作区，未提交；未在 Windows 验证，禁止物理机重试）：**
+- **已提交的候选修复（`2dd3b66`；未在 Windows 验证，禁止物理机重试）：**
   - **根因假设（按可能性排序）：** (a) 关闭适配器前显式
     `Remove-NetIPAddress` 删除 Wintun 上唯一的 profile 地址（并触发隐式
     connected 路由拆除），与仍打开的 NDIS 会话冲突；(b) shim 专用阻塞读线程
@@ -680,19 +680,19 @@ PowerShell IPC 客户端驱动 `Connect/Status/Disconnect`；未修改现有 VPN
 | M3 网络 | 路由/DNS/NRPT、防环、IPv6 阻断、清理 | 🟡 已提交；Windows 实机路由/DNS 验收待 M6 | 全隧道无泄漏，断开恢复 |
 | M4 GUI | 路径/钥匙串/自启/语言/状态/服务端身份 | ✅ 已提交 `7b73a82`，Windows RDP 实机验证 | 普通用户基础操作（真实服务端 E2E 归 M6） |
 | M5 安装 | MSI、服务安装、组/DACL、Wintun、签名钩子、Windows CI | ✅ 已提交 `cb39124`；MSI 静态检查、安装/升级/卸载、标准用户/非成员、GUI RDP 已实测 | 干净 Win10/11 安装/升级/卸载；无证书构建标记为 unsigned |
-| M6 硬化 | E2E、休眠/切网、fuzz、CI、性能 | 🟡 `06a092b`：分流 E2E、5 个实机 bug 修复、fuzz、手动 CI；**断开路径 2/2 复现致 Windows 主机网络栈失联**。工作区已有 teardown 重排修复（未提交），断开/崩溃清理、全隧道、性能仍被阻塞 | 按 2.11 矩阵在一次性 VM 验收断开修复 |
+| M6 硬化 | E2E、休眠/切网、fuzz、CI、性能 | 🟡 `06a092b`+`2dd3b66`：分流 E2E、5 个实机 bug 修复、fuzz、手动 CI、teardown 重排**候选修复**；**断开路径 2/2 复现致 Windows 主机网络栈失联**，修复未在 Windows VM 验证，断开/崩溃清理、全隧道、性能仍被阻塞 | 按 2.11 矩阵在一次性 VM 验收断开修复 |
 
-**当前状态：** M1–M5 已提交，M6 代码已提交为 `06a092b`。分流隧道 E2E（plain/UDP）
-两次通过，修复了 4 个 Windows 10 实机契约 bug 和 1 个 fuzz 发现的移位溢出，新增
-垫片 fuzz 与手动 E2E 工作流。**关键阻塞：** 发送 `Disconnect` 后 Windows 主机
-两次（2/2）从网络失联；第一次的事件日志显示无 Kernel-Power 41、无睡眠支持、
-约 2 小时后由 `winlogon.exe` 干净关机并重启。修复前断连顺序在 Wintun 适配器
-仍打开时执行 `Remove-NetRoute`/`Remove-NetIPAddress`，且 peer 任务未 join、
-close 后仍有 `Get-Net*` 查询，是主要嫌疑。**当前工作区已实现 teardown 重排**
-（stop reader → join peer 任务 → 删路由/DNS/NRPT 保留地址 → 关闭适配器 → 不再
-查询，见 2.11），但**未提交、未在 Windows 验证**；M6 未完成项（断开/崩溃清理、
-全隧道 DNS/NRPT/IPv6、休眠/切网、性能）须先在一次性 VM 中按 2.11 的矩阵补测，
-再决定 M6 是否签收。**在 VM 通过前禁止在物理机再次连接/断开。**
+**当前状态：** M1–M5 已提交，M6 代码已提交为 `06a092b`，teardown 候选修复为 `2dd3b66`。
+分流隧道 E2E（plain/UDP）两次通过，修复了 4 个 Windows 10 实机契约 bug 和 1 个
+fuzz 发现的移位溢出，新增垫片 fuzz 与手动 E2E 工作流。**关键阻塞：** 发送
+`Disconnect` 后 Windows 主机两次（2/2）从网络失联；第一次的事件日志显示无
+Kernel-Power 41、无睡眠支持，约 2 小时后由 `winlogon.exe` 干净关机并重启。
+修复前断连顺序在 Wintun 适配器仍打开时执行 `Remove-NetRoute`/`Remove-NetIPAddress`，
+且 peer 任务未 join、close 后仍有 `Get-Net*` 查询，是主要嫌疑。**已提交候选
+teardown 重排**（stop reader → join peer 任务 → 删路由/DNS/NRPT 保留地址 →
+关闭适配器 → 不再查询，见 2.11），但**未在 Windows 验证**；M6 未完成项
+（断开/崩溃清理、全隧道 DNS/NRPT/IPv6、休眠/切网、性能）须先在一次性 VM 中
+按 2.11 的矩阵补测，再决定 M6 是否签收。**在 VM 通过前禁止在物理机再次连接/断开。**
 
 ---
 
