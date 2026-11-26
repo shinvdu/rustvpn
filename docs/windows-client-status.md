@@ -6,8 +6,9 @@
 > 已完成并提交；M5（MSI/WiX 打包、服务注册、组/DACL、Wintun、签名钩子、Windows CI）
 > 已完成并在 Windows 实机完成安装/升级/卸载验证，已提交；
 > M6（真实 E2E、硬化、fuzz、CI）进行中：分流隧道 E2E、路由/DNS 观察、5 个
-> Windows 实机 bug 修复与垫片 fuzz 已完成；断开/崩溃清理、全隧道/DNS/NRPT/
-> IPv6 与性能因 Windows 主机在断开阶段离线而未完成
+> Windows 实机 bug 修复与垫片 fuzz 已完成；但断开路径两次复现导致 Windows
+> 主机网络栈失联，断开/崩溃清理、全隧道/DNS/NRPT/IPv6 与性能被阻塞，
+> 必须先在一次性 VM 中修复并验证
 > 相关文档：
 > - [Windows 安装/升级/卸载/签名](windows-install.md)
 > - [Windows 客户端调研与方案](windows-client-research.md)
@@ -398,9 +399,11 @@ PowerShell IPC 客户端驱动 `Connect/Status/Disconnect`；未修改现有 VPN
 
 - MSI 安装、服务运行、命名管道 + Hello v2 + `Status`；`verify-client-access.ps1`
   通过。
-- 握手成功，状态 `connected`；`ping 10.99.0.1` 3/4（首包 ARP 解析超时），
+- 握手成功，状态 `connected`；两次实机运行均通过连通性检查。第二次使用仅
+  调用原生 `route`/`netsh` 的轻量 harness：`ping 10.99.0.1` 4/4、
   `ping 10.99.1.1` 4/4；从 Windows 对 `10.99.0.1:22` 建立 TCP 并读到
-  `SSH-2.0-OpenSSH_...` 横幅，证明隧道双向载荷。
+  `SSH-2.0-OpenSSH_...` 横幅，证明隧道双向载荷。（第一次运行的首包在 ARP
+  解析时超时，随后正常。）
 - 路由：默认路由始终只有原物理默认路由（原接口, `<lan-gateway>`, metric 0）；
   Wintun 上 `10.99.0.2/24`、`10.99.0.0/24` 直连、`10.99.1.0/24 via 10.99.0.1`
   metric 50；防环 `<linux-host>/32` 走原接口 metric 1；无默认路由接管。
@@ -430,22 +433,53 @@ PowerShell IPC 客户端驱动 `Connect/Status/Disconnect`；未修改现有 VPN
    `DestinationPrefix=null` 的本机地址行；已移除该参数并只保留真正的路由行。
 5. 上述 fuzz 发现的 `/0` 移位溢出。
 
-**未完成 / 阻塞**
+**关键阻塞：Windows 断开路径可复现导致主机网络失联**
 
-- **断开清理与崩溃恢复未完成**：在发送 `Disconnect` 的同一阶段，Windows 主机
-  突然从网络消失（ARP/SSH/RDP 均不可达，Wake-on-LAN 无响应）。断开前最后的
-  客户端状态是 `connected`、分流路由/DNS/默认路由均正确；服务端随后记录
-  `peer removed (Timeout)`，没有收到干净的会话结束。因此 `netstate.json`
-  很可能仍在磁盘上，按设计会在下一次服务启动时（owner 已死亡）自动清理；
-  但本里程碑未能实测断开/崩溃后的路由/DNS/适配器清理。
-- 全隧道（默认路由 + per-interface DNS + NRPT + IPv6 阻断）、DNS 解析、
-  休眠/切网、性能（吞吐/CPU/延迟）均未执行：全隧道可能切断 RDP/SSH，
-  本次主机离线后也无法在干净 VM 中继续。
-- Windows 主机恢复后必须人工完成：检查主机状态；删除
+- 2026-11-27 第一次 E2E：发送 `Disconnect` 后 Windows 主机从网络消失
+  （ARP/SSH/RDP 均不可达）。主机在约 05:13 后无任何 System 事件；
+  07:08:05 `winlogon.exe` 代表 SYSTEM 发起**干净关机**（1074，Reason
+  0x500ff），07:08:48 Kernel-Power 109，07:26:26 重新开机。无 Kernel-Power
+  41（非意外断电），且 `powercfg /a` 显示 S3/休眠均不可用，因此**不是睡眠**，
+  而是 OS/网络栈挂起后由人工干净关机/重启。
+- 2026-11-27 主机恢复后重跑：分流 E2E 再次通过；随后仅发送
+  `Disconnect`（harness 只使用 `route`/`netsh` 原生命令，断开期间没有
+  WMI/快照调用），Windows 主机**第二次**立即失联（ARP/SSH 均不可达），
+  服务端记录 `peer removed (Timeout)`。两次 2/2 复现，可排除 harness 的
+  WMI 快照是触发因素。
+- 断开前状态完全正确（`connected`、分流路由、无默认路由接管）；因此问题
+  集中在 daemon 的断开清理/Wintun 拆除路径，而非隧道数据面。第一次故障后
+  的 `clientd.log` 已经包含 `tunnel stopped` 和 `disconnected`：这发生在
+  `guard.remove()`、`drop(tap)` 和 engine 的 idle 状态之后，说明断开逻辑
+  至少跑到了结尾；因此挂起不一定在 `Remove-NetRoute`/`Remove-NetIPAddress`，
+  也可能（甚至更可能）是 **Wintun 适配器关闭/NDIS 异步拆除** 触发的网络栈
+  死锁。当前代码在 `guard.remove()` 之后才 `drop(tap)`
+  （`crates/rustvpn-client-core/src/engine.rs` 约 819–835 行），清理会在
+  Wintun 适配器仍打开时删路由/地址；两条路径都需在一次性 VM 中用二分法
+  验证（先只关闭适配器、不删地址；再只删地址、不关闭适配器）。
+- **第三嫌疑：断开后的 OS 网络查询。** 两次失联都发生在断开完成后紧接着
+  执行 `Get-Net*`/`netsh` 检查时；第二次 harness 已排除重 WMI 快照，但仍
+  调用了 `netsh interface ipv4 show ...`。若 Wintun/NDIS 拆除是异步的，
+  紧随其后的任何网络配置查询都可能撞上未完成的 teardown 而死锁。GUI 正常
+  断开只读 IPC 状态，不会做这些查询，因此产品路径可能不受影响；必须在 VM
+  中区分。
+- **下一步取证/VM 二分矩阵：** 主机恢复后先读
+  `C:\ProgramData\RustVPN\clientd.log` 最后几行和 System 事件
+  （1074/109/41/42、NDIS/Wintun/网络）：若日志停在 `disconnected` /
+  `tunnel stopped`，说明 daemon 清理与 `drop(tap)` 已返回，挂起在之后的
+  teardown 或查询。VM 中按以下顺序测：(1) connect+disconnect 后**不做任何
+  OS 查询**，等待 120s 并 ping；(2) 同样流程，断开后延迟 60s 再查询；
+  (3) 只删除地址不关闭适配器；(4) 只关闭适配器不显式删除地址；
+  (5) 保留适配器句柄、断开时只清路由/状态。记录哪种组合能不触发挂起。
+  **未修复、未验证，禁止在可用主机上再次断开。**
+- 由于断开本身会切断主机网络，断开清理、崩溃恢复和后续卸载均无法在当前
+  主机上安全完成；全隧道/DNS/NRPT/IPv6、休眠/切网、性能同样未执行。
+- 主机再次恢复后必须人工完成：检查 System 事件（1074/109/41/42）确认关机
+  原因；**不要再次点击连接/断开**，直到在一次性 VM 中验证修复；删除
   `D:\temp\rustvpn-m6`（含临时测试口令和脚本）；用
-  `msiexec /x ... /qn` 卸载测试 MSI（当前仍安装，且 daemon 已被替换为
-  含上述修复的重建二进制）；确认 `netstate.json`/临时路由已清理；
-  在一次性 VM 中补做全隧道与断开/崩溃验收。
+  `msiexec /x {94FAB11C-141C-478E-A5B8-16D17C926075} /qn` 卸载测试 MSI
+  （当前仍安装，daemon 已被替换为包含上述 4 个修复的重建二进制，但不含
+  后续 `/0` fuzz 加固）；确认 `netstate.json`/临时路由已清理；在一次性
+  VM 中补做断开/崩溃/全隧道验收。
 
 ---
 
@@ -517,16 +551,16 @@ PowerShell IPC 客户端驱动 `Connect/Status/Disconnect`；未修改现有 VPN
 
 | 项 | 说明 |
 |---|---|
-| Windows 实机 E2E | 🟡 分流 plain/UDP 已实测：握手、ping、TCP 双向；noise/encless 未实测 |
-| 基本连通 | 🟡 ping 网关与新增分流路由、TCP 横幅已实测；DNS 解析、大包未实测 |
+| Windows 实机 E2E | 🟡 分流 plain/UDP 两次通过（第二次 ping 4/4、TCP 横幅）；noise/encless 未实测 |
+| 基本连通 | 🟡 ping 网关与新增分流路由、TCP 双向已实测；DNS 解析、大包未实测 |
 | 模式覆盖 | ⬜ plain 已测；noise、encless（TCP）、UDP/TCP 外层未实测 |
-| 断线恢复 | ⬜ 超时、重连、切网、休眠唤醒未实测（主机在断开阶段离线） |
-| 路由/DNS 清理 | ⏸ 连接态已核对；断开/崩溃/服务重启后的清理未实测（阻塞） |
+| 断线恢复 | ⛔ 断开路径 2/2 复现导致 Windows 主机网络栈失联；超时/重连/切网/休眠未测 |
+| 路由/DNS 清理 | ⛔ 连接态正确；断开清理会触发主机失联，无法验收，需 VM 修复 |
 | kill-switch | ⛔ Windows 明确不支持；profile/guard 拒绝 |
 | 安装测试 | 🟡 MSI 安装 + 真实隧道已实测；升级/卸载在 M5 已实测；干净 VM 待补 |
 | 安全测试 | 🟡 `verify-client-access`、非成员拒绝、口令不落盘、DLL 哈希已测；假服务端/签名固定未补 |
 | 垫片 fuzz | ✅ 7 个确定性 fuzz 测试；发现并修复 `/0` 广播移位溢出 |
-| 性能 | ⬜ 未测（主机离线；需在一次性 VM 中做吞吐/CPU/延迟） |
+| 性能 | ⬜ 未测（断开会致主机失联；需在一次性 VM 中做吞吐/CPU/延迟） |
 
 ---
 
@@ -595,13 +629,16 @@ PowerShell IPC 客户端驱动 `Connect/Status/Disconnect`；未修改现有 VPN
 | M3 网络 | 路由/DNS/NRPT、防环、IPv6 阻断、清理 | 🟡 已提交；Windows 实机路由/DNS 验收待 M6 | 全隧道无泄漏，断开恢复 |
 | M4 GUI | 路径/钥匙串/自启/语言/状态/服务端身份 | ✅ 已提交 `7b73a82`，Windows RDP 实机验证 | 普通用户基础操作（真实服务端 E2E 归 M6） |
 | M5 安装 | MSI、服务安装、组/DACL、Wintun、签名钩子、Windows CI | ✅ 已提交 `cb39124`；MSI 静态检查、安装/升级/卸载、标准用户/非成员、GUI RDP 已实测 | 干净 Win10/11 安装/升级/卸载；无证书构建标记为 unsigned |
-| M6 硬化 | E2E、休眠/切网、fuzz、CI、性能 | 🟡 代码已提交 `06a092b`：分流 E2E、5 个实机 bug 修复、fuzz、手动 CI 完成；断开/崩溃清理、全隧道、性能被主机离线阻塞 | 验收矩阵通过 |
+| M6 硬化 | E2E、休眠/切网、fuzz、CI、性能 | 🟡 代码已提交 `06a092b`：分流 E2E、5 个实机 bug 修复、fuzz、手动 CI 完成；**断开路径 2/2 复现致 Windows 主机网络栈失联**，断开/崩溃清理、全隧道、性能被阻塞 | 修复断开清理并在一次性 VM 验收 |
 
 **当前状态：** M1–M5 已提交，M6 代码已提交为 `06a092b`。分流隧道 E2E（plain/UDP）
-已通过，修复了 5 个 Windows 10 实机契约 bug 和 1 个 fuzz 发现的移位溢出，新增
-垫片 fuzz 与手动 E2E 工作流。M6 未完成项（断开/崩溃清理、全隧道 DNS/NRPT/IPv6、
-休眠/切网、性能）受 Windows 主机在断开阶段离线阻塞；恢复后须先在一次性环境
-补测，再决定 M6 是否签收。
+两次通过，修复了 4 个 Windows 10 实机契约 bug 和 1 个 fuzz 发现的移位溢出，新增
+垫片 fuzz 与手动 E2E 工作流。**关键阻塞：** 发送 `Disconnect` 后 Windows 主机
+两次（2/2）从网络失联；第一次的事件日志显示无 Kernel-Power 41、无睡眠支持、
+约 2 小时后由 `winlogon.exe` 干净关机并重启。断连清理顺序（Wintun 适配器仍
+打开时执行 `Remove-NetRoute`/`Remove-NetIPAddress`）是主要嫌疑，尚未修复/验证。
+M6 未完成项（断开/崩溃清理、全隧道 DNS/NRPT/IPv6、休眠/切网、性能）须先在
+一次性 VM 中补测，再决定 M6 是否签收。
 
 ---
 
@@ -645,14 +682,18 @@ PowerShell IPC 客户端驱动 `Connect/Status/Disconnect`；未修改现有 VPN
      RDP 会话启动；随后同版本升级、卸载与 profile 保留。
    - 不连接隧道、不改默认路由/DNS/现有 VPN/防火墙；无证书时确认
      `UNSIGNED.txt` 且 `signtool verify /pa` 失败。
-6. M6 在 Windows 实机验证：握手后地址/默认路由/DNS/NRPT/IPv6 规则；断开与
-   崩溃后的恢复；不要在生产默认路由上直接测全隧道。分流 E2E 已通过；断开/
-   崩溃/全隧道仍未完成（Windows 主机在 2026-11-27 断开阶段离线）。主机恢复
-   后先检查 `%ProgramData%\RustVPN\netstate.json` 与临时路由，再在一次性
-   VM 中补做全隧道，避免切断 RDP/SSH。
+6. M6 在 Windows 实机验证：分流 E2E 两次通过；但**断开路径 2/2 复现导致
+   Windows 主机网络栈失联**（断开前状态正确，日志已到 `disconnected`）。
+   在一次性 VM 中按“只关闭适配器 / 只删地址”二分定位并修复前，禁止在
+   可用主机上再次连接/断开。主机恢复后先读
+   `C:\ProgramData\RustVPN\clientd.log` 最后几行和 System 事件
+   （1074/109/41/42、NDIS/网络），确认挂起发生在清理命令还是 Wintun 关闭。
+   随后检查 `%ProgramData%\RustVPN\netstate.json` 与临时路由；全隧道也只
+   能在一次性 VM 中测试，避免切断 RDP/SSH。
 7. 所有 Windows 网络测试只使用独立测试子网和临时适配器；不碰现有
    VPN/路由/防火墙。2026-11-27 的测试还留下 `D:\temp\rustvpn-m6` 和已安装
-   的测试 MSI，人工须删除临时口令/脚本并卸载 MSI。
+   的测试 MSI（ProductCode `{94FAB11C-141C-478E-A5B8-16D17C926075}`），
+   人工须删除临时口令/脚本并卸载 MSI。
 8. 每完成一个里程碑，更新本文件的“已完成/未开始/隐患”和提交记录。
 
 ---

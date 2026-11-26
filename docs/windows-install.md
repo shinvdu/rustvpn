@@ -384,10 +384,18 @@ existing `windows-shim.yml` prototype workflow is separate.
 ## 11. Known gaps (M6)
 
 - A real split-tunnel E2E (plain/UDP, installed MSI/service, handshake, ping,
-  bidirectional TCP, route/DNS/IPv6 observation) passed. Disconnect cleanup,
-  crash recovery, full-tunnel DNS/NRPT/IPv6, resume/network-switch and
-  performance are still unverified. The acceptance host went offline during
-  the disconnect phase; see the status document.
+  bidirectional TCP, route/DNS/IPv6 observation) passed twice.
+- **Critical:** sending `Disconnect` made the Windows 10 acceptance host lose
+  all network connectivity on 2 out of 2 attempts (ARP/SSH/RDP unreachable).
+  The first outage had no Kernel-Power 41 and no sleep state was available;
+  the host was later cleanly shut down and rebooted. The daemon log reached
+  `tunnel stopped`/`disconnected` before the loss, so the cleanup commands
+  (removing routes/address while the Wintun adapter is still open), the
+  Wintun/NDIS adapter teardown, and an immediate post-disconnect OS network
+  query (WMI/netsh) are all suspects. Do not use connect/disconnect on a host you cannot physically
+  recover until this is fixed and verified in a disposable VM. Disconnect
+  cleanup, crash recovery, full-tunnel DNS/NRPT/IPv6, resume/network-switch and
+  performance remain unverified; see the status document.
 - If a test host was left with this build installed, uninstall the test MSI and
   delete any temporary credential/profile directories after verifying the
   network state file has been cleaned.
