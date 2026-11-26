@@ -1,15 +1,21 @@
 //! Minimal, replaceable Wintun adapter wrapper (Windows only).
 //!
-//! This module only knows how to create/open the adapter, apply the M1 test
-//! configuration, start a session and move IP packets.  The Ethernet shim
-//! lives in [`crate::shim`]; swapping this file for the `tun` crate or a
-//! service-owned adapter must not affect it.
+//! This module only knows how to create/open the adapter, apply the interface
+//! MTU (and, for the smoke test, an address), start a session and move IP
+//! packets.  The Ethernet shim lives in [`crate::shim`]; swapping this file for
+//! the `tun` crate or a service-owned adapter must not affect it.
 //!
-//! Safety: M1 adapters are addressed only in `10.88.0.0/24` with a prefix of
-//! at least /24, use a deterministic per-name GUID, and are configured with
-//! **no gateway, route, DNS, NRPT or firewall rule**.  Nothing here touches
-//! existing adapters, the default route or DNS.  The DLL must be absolute and
-//! SHA-256 pinned.
+//! Milestone M3 split: the adapter is created/opened with the derived
+//! interface MTU only.  Its profile address/prefix is applied by the client
+//! core network guard **after** the handshake succeeds, together with routes,
+//! DNS, NRPT and the IPv6 block, so a failed handshake cannot add on-link
+//! routes or DNS before the tunnel exists.  This module therefore never
+//! touches the default route, global DNS, NRPT or firewall rules itself.  The
+//! DLL must be absolute and SHA-256 pinned.
+//!
+//! [`WintunAdapter::apply_address`] remains available for the isolated smoke
+//! test and for callers that own the adapter lifecycle; the daemon does not
+//! call it at open time.
 
 use std::ffi::OsStr;
 use std::io;
@@ -69,8 +75,8 @@ impl AdapterConfig {
         }
     }
 
-    /// Enforce the isolated-subnet, MTU, ring, name and DLL-path policy before
-    /// any adapter or network state is touched.
+    /// Enforce the address, MTU, ring, name and DLL-path policy before any
+    /// adapter or network state is touched.
     pub fn validate(&self) -> Result<(), String> {
         safety::validate_adapter_name(&self.name)?;
         safety::validate_adapter_address(self.address, self.prefix_len)?;
@@ -117,12 +123,11 @@ pub struct WintunAdapter {
 }
 
 impl WintunAdapter {
-    /// Load `wintun.dll`, create or open the M1 test adapter, apply the test
-    /// address/MTU, bring it up and start a session.
+    /// Load `wintun.dll`, create or open the adapter, apply the derived
+    /// interface MTU, bring it up and start a session.  The profile address is
+    /// applied separately (after the handshake, by the network guard).
     pub fn open_or_create(cfg: &AdapterConfig) -> Result<Self, String> {
         cfg.validate()?;
-        let mask = prefix_to_mask(cfg.prefix_len)
-            .ok_or_else(|| format!("invalid prefix length {}", cfg.prefix_len))?;
 
         // Absolute path + pinned SHA-256 before any code is loaded.
         verify::verify_wintun_dll(&cfg.wintun_file, &cfg.wintun_sha256)
@@ -156,20 +161,15 @@ impl WintunAdapter {
         };
 
         let name = adapter.get_name().unwrap_or_else(|_| cfg.name.clone());
-        // M1: only the test address/prefix and interface MTU are configured.
-        // No gateway, default route, DNS or firewall rule is installed.
-        adapter
-            .set_network_addresses_tuple(
-                IpAddr::V4(cfg.address),
-                IpAddr::V4(mask),
-                None, // never install a default gateway
-            )
-            .map_err(|e| {
-                format!(
-                    "set address {}/{} on {:?}: {e}",
-                    cfg.address, cfg.prefix_len, name
-                )
-            })?;
+        // M3: only the derived interface MTU is configured here.  The profile
+        // address, routes, DNS/NRPT and IPv6 block are installed by the client
+        // core network guard after the handshake, so a failed handshake cannot
+        // add an on-link route or change the resolver.
+        notes.push(format!(
+            "adapter {:?} opened with MTU {}; address {}/{} and network state are applied after \
+             the handshake",
+            name, cfg.mtu, cfg.address, cfg.prefix_len
+        ));
 
         let (enabled, detail) = enable_interface(&name);
         if !enabled {
@@ -229,6 +229,23 @@ impl WintunAdapter {
 
     pub fn address(&self) -> Ipv4Addr {
         self.address
+    }
+
+    /// Apply an address/prefix to the adapter.
+    ///
+    /// The daemon does **not** call this at open time: the client core network
+    /// guard installs the profile address after the handshake.  The smoke test
+    /// uses it to exercise the OS data plane in the isolated test subnet.
+    pub fn apply_address(&self, address: Ipv4Addr, prefix_len: u8) -> Result<(), String> {
+        let adapter = self
+            .adapter
+            .as_ref()
+            .ok_or_else(|| "adapter already closed".to_string())?;
+        let mask = prefix_to_mask(prefix_len)
+            .ok_or_else(|| format!("invalid prefix length {prefix_len}"))?;
+        adapter
+            .set_network_addresses_tuple(IpAddr::V4(address), IpAddr::V4(mask), None)
+            .map_err(|e| format!("set address {address}/{prefix_len} on {:?}: {e}", self.name))
     }
 
     pub fn notes(&self) -> &[String] {

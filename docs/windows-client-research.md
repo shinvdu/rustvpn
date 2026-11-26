@@ -261,8 +261,9 @@ Wintun 适配器 MTU 设置为 `ip_mtu`。Windows 应在 `ip_mtu < 576` 时拒�
   退出码结束，便于 M5 的失败恢复策略识别。
 - 服务日志：stderr + `%ProgramData%\RustVPN\clientd.log`；可用
   `RUSTVPN_CLIENTD_LOG` 覆盖路径。Event Log 集成留到 M5。
-- Linux 的 kill-switch marker/firewall 启动清理逻辑保持不变；Windows 在
-  M3 实现防火墙/NRPT 前不做该类清理。
+- Linux 的 kill-switch marker/firewall 启动清理逻辑保持不变；Windows 的
+  路由/DNS/NRPT/防火墙状态由 M3 的 `cleanup_stale_network()` 在 Engine
+  启动路径清理（详见第 6 节）。
 
 ### 5.2 命名管道
 
@@ -323,43 +324,103 @@ Wintun 适配器 MTU 设置为 `ip_mtu`。Windows 应在 `ip_mtu < 576` 时拒�
 
 ---
 
-## 6. Windows 路由、DNS 与恢复
+## 6. Windows 路由、DNS 与恢复（M3 实装设计）
 
-### 6.1 防环
+> 本节记录 `netcfg/windows.rs` + `netcfg/winplan.rs` 的实际实现；Linux 代码与
+> 行为不变。所有命令使用绝对路径 `powershell.exe`，不启动 `cmd.exe`、不依赖
+> PATH；参数只来自类型化 IP/索引/metric 与经过校验的接口名，并做 PowerShell
+> 单引号转义。
 
-- 解析远端地址后，先添加远端 IP `/32` 主机路由，走原默认网关/接口。
-- 再安装指向 Wintun 的路由。
-- 绝不能先装默认路由再解析域名。
+### 6.1 配置时机
 
-### 6.2 默认路由与分流
+- Wintun 适配器在 `Tap::open` 时只创建/打开、启用、设置**派生接口 MTU**
+  （`max_payload(wire)-14`，绝不是 wire budget），不设置地址/网关/DNS。
+- 首次握手成功后，`NetworkGuard::install` 才安装地址、防环路由、默认/分流
+  路由、DNS/NRPT 与 IPv6 阻断。失败握手不会提前改主机路由/DNS。
+- 地址通过 `New-NetIPAddress -PolicyStore ActiveStore` 写入；安装前后都用
+  `Get-NetIPAddress` 校验，接口 MTU 用 `Get-NetAdapter MtuSize` 和
+  `Get-NetIPInterface NlMtu` 双重校验。若已有其他接口上的同子网路由，
+  在添加地址前拒绝，避免静默抢占 LAN 子网。
 
-- 保存原始默认路由（网关、接口、metric）。
-- 添加指向 Wintun 的默认路由（或 profile 指定的路由）。
-- 断开时只删除自己添加的条目，不删除用户的原始路由。
-- 建议使用 IP Helper API（`CreateIpForwardEntry2`）或 `netsh` 的封装；
-  `netsh` 输出会本地化，不要依赖 stderr 文本判断成功与否。
+### 6.2 防环
 
-### 6.3 DNS
+- 需要安装任何隧道路由时，先用 `Find-NetRoute -RemoteIPAddress <outer>
+  -AddressFamily IPv4` 读取外层端点当前实际使用的接口与下一跳。
+- 若该路径已经是 Wintun 接口，直接拒绝（会形成递归）。
+- 添加 `<outer>/32` 主机路由（metric 1）到原接口/下一跳，**再**安装默认或
+  分流路由；`/32` 比任何隧道路由更具体。
+- 若 `/32` 已存在且完全一致：不拥有时不删除、只复用；若已记录为 owned 则
+  幂等。若同目标但接口/下一跳不同则失败关闭。
 
-- 全隧道：设置 Wintun 的 DNS；建议同时添加 NRPT 规则强制 DNS 走隧道，
-  断开时删除。
-- 分流：保留系统 DNS，除非 profile 明确指定。
-- 保存每个接口的原始 DNS 配置，断开恢复。
+### 6.3 默认路由与分流
 
-### 6.4 IPv6
+- Wintun 是 L3，OS 路由使用 on-link `NextHop=0.0.0.0`；profile 网关只作为
+  Ethernet 垫片的合成 ARP 下一跳。把网关当 OS 下一跳会让 Windows 尝试 ARP
+  一个 Wintun 无法应答的地址，数据面会断。
+- 全隧道：`Set-NetIPInterface -InterfaceMetric 1`（记录原 metric 与
+  AutomaticMetric），`New-NetRoute 0.0.0.0/0 -RouteMetric 0`。原默认路由保留，
+  不删除、不修改；清理时只删自己添加的项并恢复接口 metric。
+- 分流：每条 profile 路由通过 Wintun，metric 50；接口 metric 不变。
+- 冲突规则：同 `DestinationPrefix` 在任何其他接口上已存在 → 失败关闭；
+  同接口上已有非 owned 的同目标路由 → 失败；完全一致的 owned 路由 → 幂等。
+  Wintun 自己的 connected 子网（address/prefix 的网络地址）被跳过。
+- 多个默认路由：对每个 connected 接口计算 effective metric =
+  `InterfaceMetric + RouteMetric`；若存在 ≤1 的其他默认路由，就拒绝安装
+  （不宣称已接管全隧道）。断开的接口不计入。
 
-- 首版不承载 IPv6。
-- 全隧道连接期间建议用 Windows 防火墙出站规则阻断 IPv6，断开时删除。
-- 至少要明确告警“IPv6 流量不会进入隧道”，不能静默泄漏。
+### 6.4 DNS / NRPT
 
-### 6.5 崩溃恢复
+- 全隧道：`Get-DnsClientServerAddress` 记录 Wintun 原 DNS，
+  `Set-DnsClientServerAddress` 设置 profile DNS；再用
+  `Add-DnsClientNrptRule -Namespace '.' -NameServers <profile DNS>` 强制
+  所有 DNS 走隧道。NRPT 用固定 DisplayName `RustVPN tunnel DNS (<iface>)`
+  记录，清理时按 DisplayName 查找并删除（也处理崩溃后没有 Name 记录的
+  情况）。
+- 分流：仅当 profile 显式配置 `dns` 时设置 Wintun 的 per-interface DNS，
+  **不添加 NRPT**，系统 DNS 行为不变。
+- `-no-host-dns`：完全跳过 DNS/NRPT（由调用方/容器管理）。
+- 清理只在当前 Wintun DNS 仍等于我们设置的值时恢复旧值；若用户/其他程序
+  已改动则跳过，避免覆盖。
 
-- 把本次添加的路由/DNS/NRPT/防火墙规则写入
-  `%ProgramData%\RustVPN\netstate.json`，ACL 限制为 SYSTEM/Administrators。
-- 服务启动时读取并清理残留，再允许新连接。
-- 卸载时清理服务、适配器、防火墙规则；用户 profile 和钥匙串保留。
+### 6.5 IPv6
 
----
+- MVP 不承载 IPv6。全隧道安装出站防火墙规则
+  `New-NetFirewallRule -Direction Outbound -Action Block -Protocol Any
+  -RemoteAddress @('2000::/3','fc00::/7')`。
+  - 被阻断：全局单播（`2000::/3`，含公网/文档/大部分可路由前缀）与
+    ULA（`fc00::/7`）。
+  - 保留：loopback、`fe80::/10` 链路本地、`ff00::/8` 组播（ND/MLD 需要）。
+  - 不阻断 IPv4，也不影响 IPv4 外层端点。
+- 分流 profile 不安装该规则；IPv6 仍不承载，但没有静默全阻断。
+- IPv6 外层端点（`remote`/`proxy` 解析为 IPv6）在 Windows 直接拒绝，因为
+  全隧道会阻断 IPv6 且 M3 未实现 IPv6 防环。
+
+### 6.6 崩溃恢复与清理
+
+- 状态文件 `%ProgramData%\RustVPN\netstate.json`，可通过
+  `RUSTVPN_STATE_DIR` 覆盖（仅绝对路径）；目录/文件 DACL 为
+  `D:P(A;;FA;;;SY)(A;;FA;;;BA)`（SYSTEM + Administrators）。
+- 内容：PID + 进程创建时间、接口、Wintun 索引、地址、路由（dest/ifindex/
+  next-hop/metric/kind）、接口 metric 原值、DNS 原值/应用值、NRPT
+  DisplayName、IPv6 防火墙规则名。
+- 每完成一个可回滚操作就原子写状态（临时文件 + rename）。删除路由前重新
+  `Get-NetRoute` 核对完整四元组，并用 `Get-NetAdapter` 校验接口名，检测
+  Windows 接口索引复用（索引被其他适配器复用时跳过该接口上的路由/地址/
+  DNS/metric）；DNS 只在仍等于应用值时恢复；metric 只在仍是设置值时恢复；
+  NRPT/防火墙按唯一名称/DisplayName 删除。
+- daemon 启动（Engine 启动路径）读取状态：owner 仍存活则跳过；已死亡则只
+  清理记录项并删除状态文件。正常断开/停止清理后删除状态文件。
+- 清理顺序：NRPT → DNS → 路由（先隧道、后防环）→ 地址 → 接口 metric →
+  IPv6 防火墙规则（最后，保持 IPv6 保护直到其他状态已恢复）。
+
+### 6.7 kill-switch / MSS 范围决策
+
+- **kill-switch：Windows 明确不支持。** 用 Windows Filtering Platform 做到
+  fail-closed 且崩溃后可恢复的复杂度与风险超出 M3；profile 校验和 guard
+  都会拒绝 `kill_switch: true`，不会静默 fail-open。Linux nftables 实现不变。
+- **MSS clamp：Windows 推迟。** 没有安全、稳定的系统级 API；连接时告警，
+  状态里 `mss_applied=false`。v1 仍依赖双方一致的数值 wire MTU。
+- 因此不声称 Windows 与 Linux 功能完全等价。
 
 ## 7. GUI 适配
 
@@ -472,6 +533,9 @@ Wintun 适配器 MTU 设置为 `ip_mtu`。Windows 应在 `ip_mtu < 576` 时拒�
 
 **验收：** 全隧道不泄漏、断开恢复原路由/DNS、崩溃重启后自动恢复。
 
+M3 已按第 6 节实现；kill-switch 明确拒绝、MSS 推迟。Windows 实机验收
+（真实 Wintun + PowerShell）仍待执行。
+
 ### Phase 5：打包、签名与硬化（1–2 周）
 
 - MSI/WiX、服务安装/升级/卸载。
@@ -540,7 +604,7 @@ Wintun 适配器 MTU 设置为 `ip_mtu`。Windows 应在 `ip_mtu < 576` 时拒�
 - `crates/rustvpn-net/src/tap.rs`：TAP 门面与 Linux 实现
 - `crates/rustvpn-net/src/peer.rs`：TAP ↔ 隧道数据泵
 - `crates/rustvpn-client-core/src/engine.rs`：重连与网络配置安装时机
-- `crates/rustvpn-client-core/src/netcfg.rs`：Linux 路由/DNS
+- `crates/rustvpn-client-core/src/netcfg/`：Linux 与 Windows 路由/DNS（`linux.rs` / `windows.rs` / `winplan.rs`）
 - `crates/rustvpn-client-core/src/lock.rs`：隧道锁
 - `crates/rustvpn-client-ipc`：IPC 帧与客户端
 - `crates/rustvpn-clientd/src/main.rs`：Unix socket 服务端

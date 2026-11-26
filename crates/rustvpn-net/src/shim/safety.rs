@@ -1,11 +1,14 @@
-//! Safety envelope for the M1 Windows Wintun adapter.
+//! Safety envelope for the Windows Wintun adapter.
 //!
-//! M1 is still a test-milestone implementation: the adapter may only be
-//! created/configured inside the isolated `10.88.0.0/24` test subnet, with a
-//! prefix no shorter than the subnet itself.  Production addresses, routes,
-//! DNS and NRPT configuration stay disabled until the M3 review.  Every check
-//! lives here (pure, no Windows dependency) so the adapter layer and its tests
-//! share one definition.
+//! M3 accepts the profile's real tunnel address (the address is applied by the
+//! client core network guard after the handshake).  The adapter still refuses
+//! addresses that cannot safely identify a tunnel interface: unspecified,
+//! loopback, link-local, multicast/broadcast, prefix `/0`, and (for prefixes
+//! shorter than /31) the network/broadcast address itself.  The isolated
+//! `10.88.0.0/24` subnet remains the policy for manual smoke tests only.
+//!
+//! Every check lives here (pure, no Windows dependency) so the adapter layer
+//! and its tests share one definition.
 
 use std::io;
 use std::net::Ipv4Addr;
@@ -13,11 +16,9 @@ use std::path::{Component, Path, PathBuf};
 
 use super::ipv4::in_same_subnet;
 
-/// The dedicated, isolated test subnet. Never change this to a real
-/// production subnet: assigning a short prefix creates on-link routes that can
-/// blackhole traffic.
+/// The dedicated, isolated test subnet used by the manual smoke test.
 pub const TEST_SUBNET: Ipv4Addr = Ipv4Addr::new(10, 88, 0, 0);
-/// Prefix length of [`TEST_SUBNET`]. Adapter prefixes must not be shorter.
+/// Prefix length of [`TEST_SUBNET`] for the manual smoke test.
 pub const TEST_SUBNET_PREFIX: u8 = 24;
 /// Windows clients should refuse an interface IP MTU below the classic IPv4
 /// minimum (RFC 791 requires every host to accept 576-byte datagrams).
@@ -40,27 +41,37 @@ pub fn in_test_subnet(ip: Ipv4Addr) -> bool {
     in_same_subnet(ip, TEST_SUBNET, TEST_SUBNET_PREFIX)
 }
 
-/// Whether an adapter address/prefix combination is inside the isolated test
-/// policy: `10.88.0.0/24` with a prefix of /24../32.
+/// Whether an adapter address/prefix can safely identify a tunnel interface.
+///
+/// M3 intentionally accepts production addresses; the profile validator and
+/// the network guard enforce routing/DNS safety.  Prefix `/0` is rejected
+/// because assigning it would create a host-wide on-link route.
 pub fn validate_adapter_address(address: Ipv4Addr, prefix_len: u8) -> Result<(), String> {
-    if !(TEST_SUBNET_PREFIX..=32).contains(&prefix_len) {
+    if prefix_len == 0 || prefix_len > 32 {
         return Err(format!(
-            "prefix length /{prefix_len} is outside the isolated test policy: it must be \
-             /{TEST_SUBNET_PREFIX}../32 so the on-link route cannot cover more than \
-             {TEST_SUBNET}/{TEST_SUBNET_PREFIX}"
+            "prefix length /{prefix_len} cannot identify a tunnel interface (use /1../32)"
         ));
     }
-    if !in_test_subnet(address) {
+    if address.is_unspecified()
+        || address.is_loopback()
+        || address.is_link_local()
+        || address.is_multicast()
+        || address == Ipv4Addr::BROADCAST
+    {
         return Err(format!(
-            "address {address} is outside the isolated test subnet \
-             {TEST_SUBNET}/{TEST_SUBNET_PREFIX}; refusing to configure the adapter"
+            "address {address} is not a usable unicast tunnel address"
         ));
     }
-    let last = address.octets()[3];
-    if address.is_unspecified() || address == Ipv4Addr::BROADCAST || last == 0 || last == 255 {
-        return Err(format!(
-            "address {address} is the test subnet network or broadcast address"
-        ));
+    if prefix_len <= 30 {
+        let mask = u32::MAX << (32 - u32::from(prefix_len));
+        let raw = u32::from(address);
+        let network = raw & mask;
+        let broadcast = network | !mask;
+        if raw == network || raw == broadcast {
+            return Err(format!(
+                "address {address} is the /{prefix_len} network or broadcast address"
+            ));
+        }
     }
     Ok(())
 }
@@ -217,21 +228,36 @@ mod tests {
     use super::*;
 
     #[test]
-    fn address_and_prefix_are_confined_to_the_test_subnet() {
+    fn address_and_prefix_are_validated_for_a_tunnel_interface() {
+        // Production tunnel addresses are accepted in M3.
         let good = Ipv4Addr::new(10, 88, 0, 2);
-        assert!(validate_adapter_address(good, 24).is_ok());
-        assert!(validate_adapter_address(good, 32).is_ok());
-        assert!(validate_adapter_address(good, 28).is_ok());
+        for prefix in [1, 8, 16, 23, 24, 28, 31, 32] {
+            assert!(validate_adapter_address(good, prefix).is_ok(), "/{prefix}");
+        }
+        assert!(validate_adapter_address(Ipv4Addr::new(192, 168, 1, 2), 24).is_ok());
+        assert!(validate_adapter_address(Ipv4Addr::new(203, 0, 113, 2), 24).is_ok());
 
-        assert!(validate_adapter_address(good, 8).is_err());
-        assert!(validate_adapter_address(good, 1).is_err());
-        assert!(validate_adapter_address(good, 23).is_err());
+        // A /0 on-link route would blackhole the host; /33 is invalid.
+        assert!(validate_adapter_address(good, 0).is_err());
         assert!(validate_adapter_address(good, 33).is_err());
 
-        assert!(validate_adapter_address(Ipv4Addr::new(192, 168, 1, 2), 24).is_err());
-        assert!(validate_adapter_address(Ipv4Addr::new(10, 89, 0, 2), 24).is_err());
+        // Network/broadcast addresses are rejected for prefixes shorter than
+        // /31; a /31 and /32 can legitimately use those last octets.
         assert!(validate_adapter_address(Ipv4Addr::new(10, 88, 0, 0), 24).is_err());
         assert!(validate_adapter_address(Ipv4Addr::new(10, 88, 0, 255), 24).is_err());
+        assert!(validate_adapter_address(Ipv4Addr::new(10, 0, 0, 0), 31).is_ok());
+        assert!(validate_adapter_address(Ipv4Addr::new(192, 168, 1, 255), 32).is_ok());
+
+        // Non-unicast / unusable addresses.
+        for bad in [
+            Ipv4Addr::UNSPECIFIED,
+            Ipv4Addr::LOCALHOST,
+            Ipv4Addr::new(169, 254, 1, 1),
+            Ipv4Addr::new(224, 0, 0, 1),
+            Ipv4Addr::BROADCAST,
+        ] {
+            assert!(validate_adapter_address(bad, 24).is_err(), "{bad}");
+        }
     }
 
     #[test]

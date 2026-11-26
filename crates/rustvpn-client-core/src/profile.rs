@@ -69,7 +69,21 @@ impl ValidatedProfile {
         }
         // Reject an unusable derived TAP IP MTU (Linux `ip link set mtu`
         // refuses values below 68) before any network state is touched.
-        crate::mtu::from_wire(self_mode(spec), spec.mtu).map_err(|error| anyhow!("{error:#}"))?;
+        let wire = crate::mtu::from_wire(self_mode(spec), spec.mtu)
+            .map_err(|error| anyhow!("{error:#}"))?;
+        // Windows adapters (Wintun) additionally refuse an interface IP MTU
+        // below the classic IPv4 minimum; reject it here, before TAP creation.
+        #[cfg(windows)]
+        if wire.inner_ip_mtu < 576 {
+            bail!(
+                "wire MTU {} derives interface IP MTU {}, below the Windows minimum 576; \
+                 raise the wire MTU (and the matching server MTU) before connecting",
+                spec.mtu,
+                wire.inner_ip_mtu
+            );
+        }
+        #[cfg(not(windows))]
+        let _ = wire;
         if spec.timeout == 0 {
             bail!("timeout must be positive");
         }
@@ -174,6 +188,16 @@ impl ValidatedProfile {
             bail!(
                 "kill_switch requires a full-tunnel profile (routes must contain default); \
                  split-tunnel profiles cannot enable the kill switch"
+            );
+        }
+        // A Windows kill switch would have to be fail-closed and recoverable;
+        // it is deferred, so reject the profile instead of leaving the host
+        // fail-open while the UI claims otherwise.
+        #[cfg(windows)]
+        if spec.kill_switch {
+            bail!(
+                "kill_switch is not implemented on Windows; disable it in the profile \
+                 (the Windows full-tunnel guard still blocks IPv6 egress)"
             );
         }
 
@@ -322,7 +346,13 @@ mod tests {
         assert!(error.contains("at least 83"), "{error}");
 
         spec.mtu = 83;
+        #[cfg(not(windows))]
         assert!(ValidatedProfile::new(&spec).is_ok());
+        #[cfg(windows)]
+        {
+            let error = ValidatedProfile::new(&spec).err().unwrap().to_string();
+            assert!(error.contains("Windows minimum 576"), "{error}");
+        }
 
         // The plain padded-mode floor already derives a usable TAP IP MTU.
         spec.noise = true;
@@ -396,10 +426,14 @@ mod tests {
             // ... and permits the full-tunnel-only kill switch.
             spec.dns = vec!["10.88.0.1".into()];
             spec.kill_switch = true;
+            #[cfg(not(windows))]
             assert!(
                 ValidatedProfile::new(&spec).is_ok(),
                 "route {route:?} was not treated as a default route"
             );
+            // Windows rejects the deferred kill switch explicitly.
+            #[cfg(windows)]
+            assert!(ValidatedProfile::new(&spec).is_err(), "route {route:?}");
         }
 
         // A split-tunnel prefix is not a default route.
@@ -414,7 +448,10 @@ mod tests {
     fn rejects_split_tunnel_kill_switch() {
         let mut spec = base();
         spec.kill_switch = true;
+        #[cfg(not(windows))]
         assert!(ValidatedProfile::new(&spec).is_ok());
+        #[cfg(windows)]
+        assert!(ValidatedProfile::new(&spec).is_err());
 
         let mut spec = base();
         spec.routes = vec!["10.88.0.0/24".into()];

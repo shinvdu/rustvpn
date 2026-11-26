@@ -16,29 +16,9 @@ use rustvpn_net::config::is_default_route;
 use tokio::process::Command;
 
 use crate::firewall;
+use crate::netcfg::NetOptions;
 
 const ROUTE_METRIC: u32 = 50;
-
-/// Optional nftables features applied together with the address/route setup.
-#[derive(Clone, Debug, Default)]
-pub struct FirewallOptions {
-    /// Clamp IPv4 TCP MSS to this value on the tunnel interface.
-    pub mss_v4: Option<usize>,
-    /// Clamp IPv6 TCP MSS to this value on the tunnel interface.
-    pub mss_v6: Option<usize>,
-    /// Install the full-tunnel kill switch (requires `outer`).
-    pub kill_switch: bool,
-    /// Per-daemon table-name scope (see [`firewall::instance_scope`]).
-    pub scope: String,
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct NetOptions {
-    pub firewall: FirewallOptions,
-    /// Skip `resolvectl`; useful inside a network namespace or container
-    /// where DNS is managed by the caller.
-    pub no_host_dns: bool,
-}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DefaultRouteLite {

@@ -24,9 +24,7 @@ use crate::lock::TunnelLock;
 use crate::mtu;
 #[cfg(unix)]
 use crate::mtu::OuterFamily;
-use crate::netcfg::NetworkGuard;
-#[cfg(unix)]
-use crate::netcfg::{FirewallOptions, NetOptions};
+use crate::netcfg::{FirewallOptions, NetOptions, NetworkGuard};
 use crate::profile::ValidatedProfile;
 use crate::session::{resolve_endpoints, start_session, Endpoints, Session, SessionEnd};
 
@@ -89,6 +87,38 @@ impl Engine {
         events: broadcast::Sender<Event>,
         options: EngineOptions,
     ) {
+        // Windows crash recovery: a previous daemon that died while connected
+        // leaves routes/DNS/NRPT/firewall entries recorded in
+        // %ProgramData%\RustVPN\netstate.json.  Remove only those entries before
+        // accepting commands.  A live owner (another daemon) is left alone.
+        #[cfg(windows)]
+        match crate::netcfg::cleanup_stale_network().await {
+            Ok(report) if report.skipped_live_owner => emit_log(
+                &events,
+                "warn",
+                "another RustVPN client still owns Windows network state; \
+                 crash recovery was skipped",
+            ),
+            Ok(report) if !report.actions.is_empty() || !report.errors.is_empty() => {
+                for action in &report.actions {
+                    emit_log(&events, "info", format!("crash recovery: {action}"));
+                }
+                for error in &report.errors {
+                    emit_log(
+                        &events,
+                        "warn",
+                        format!("crash recovery left state for the next retry: {error}"),
+                    );
+                }
+            }
+            Ok(_) => {}
+            Err(error) => emit_log(
+                &events,
+                "warn",
+                format!("cannot inspect crash-recovery network state: {error:#}"),
+            ),
+        }
+
         let mut current: Option<(CancellationToken, JoinHandle<()>)> = None;
         loop {
             tokio::select! {
@@ -113,6 +143,16 @@ impl Engine {
                             // kill-switch table (no connection guard to remove).
                             #[cfg(unix)]
                             crate::firewall::cleanup_stale(&options.firewall_scope).await;
+                            // A crashed Windows daemon may have left state even
+                            // when the engine is idle (no guard to remove).
+                            #[cfg(windows)]
+                            if let Err(error) = crate::netcfg::cleanup_owned_network().await {
+                                emit_log(
+                                    &events,
+                                    "warn",
+                                    format!("cannot clean Windows network state: {error:#}"),
+                                );
+                            }
                             let _ = events.send(Event::State(EngineStatus {
                                 state: "idle".into(),
                                 ..EngineStatus::default()
@@ -133,6 +173,18 @@ impl Engine {
                     current = None;
                 }
             }
+        }
+
+        // Final retry for a normal stop: a cleanup that failed during
+        // guard.remove() keeps its state file; retry it now that no connection
+        // is active.  Only this process's recorded state is touched.
+        #[cfg(windows)]
+        if let Err(error) = crate::netcfg::cleanup_owned_network().await {
+            emit_log(
+                &events,
+                "warn",
+                format!("cannot finish Windows network cleanup: {error:#}"),
+            );
         }
     }
 }
@@ -283,13 +335,13 @@ async fn run_connection(
         }
     };
 
-    // The Windows M1 client does not implement the nftables/firewall kill
-    // switch.  Refuse an opt-in kill-switch profile instead of silently
-    // leaving the host fail-open while the profile claims otherwise.
+    // The Windows client does not implement a fail-closed kill switch yet.
+    // Refuse an opt-in kill-switch profile instead of silently leaving the host
+    // fail-open while the profile claims otherwise.
     if cfg!(not(unix)) && spec.kill_switch {
-        let message = "kill_switch is not implemented in the Windows M1 client; \
-                       refusing to connect rather than silently leaving the host fail-open \
-                       (deferred to M3)";
+        let message = "kill_switch is not implemented on Windows; refusing to connect \
+                       rather than silently leaving the host fail-open (deferred; the \
+                       Windows guard still blocks IPv6 for full-tunnel profiles)";
         emit_error(&events, &spec, message.to_string());
         emit_log(&events, "error", message);
         return;
@@ -499,17 +551,17 @@ async fn run_connection(
             &events,
             "info",
             format!(
-                "Windows Wintun adapter {} configured with test address {} and interface MTU {}; \
-                 gateway/DNS/routes/NRPT are not installed in M1 (deferred to M3)",
-                spec.iface, spec.address, link_mtu
+                "Windows Wintun adapter {} opened with interface MTU {}; address, routes, DNS, \
+                 NRPT and the IPv6 block are installed after the handshake succeeds",
+                spec.iface, link_mtu
             ),
         );
         if spec.mss_clamp {
             emit_log(
                 &events,
                 "warn",
-                "MSS clamping is not implemented on Windows M1; TCP segmentation relies on the \
-                 configured wire-MTU contract (deferred to M3)",
+                "TCP MSS clamping is not implemented on Windows; the tunnel relies on the \
+                 configured wire-MTU contract and mss_applied will be false",
             );
         }
     }
@@ -586,7 +638,6 @@ async fn run_connection(
             Attempt::Succeeded(mut session) => {
                 let mut connected_status =
                     base_status(&validated, resolved, applied_from_guard(guard.as_ref()));
-                #[cfg(unix)]
                 if guard.is_none() {
                     let outer = endpoints.as_ref().and_then(Endpoints::outer);
                     let net_options = NetOptions {
@@ -604,6 +655,7 @@ async fn run_connection(
                             connected_status.kill_switch_applied =
                                 Some(installed.kill_switch_applied());
                             guard = Some(installed);
+                            #[cfg(unix)]
                             if bootstrap.active() {
                                 if spec.kill_switch {
                                     // apply_kill_switch replaced the preserved
@@ -635,6 +687,24 @@ async fn run_connection(
                                     spec.routes.len()
                                 ),
                             );
+                            #[cfg(windows)]
+                            emit_log(
+                                &events,
+                                "info",
+                                if spec
+                                    .routes
+                                    .iter()
+                                    .any(|route| rustvpn_net::config::is_default_route(route))
+                                {
+                                    "Windows full tunnel: default route via Wintun, per-interface \
+                                     DNS + NRPT, and global/ULA IPv6 egress blocked for this \
+                                     connection (removed on disconnect)"
+                                } else {
+                                    "Windows split tunnel: profile routes via Wintun only; system \
+                                     DNS and IPv6 behaviour are left as configured unless the \
+                                     profile specifies DNS"
+                                },
+                            );
                         }
                         Err(error) => {
                             session.close(&stats_state);
@@ -645,17 +715,6 @@ async fn run_connection(
                             return;
                         }
                     }
-                }
-                if !cfg!(unix) && guard.is_none() {
-                    // M1 deliberately does not install routes, DNS, NRPT or
-                    // firewall rules.  The Wintun adapter itself only carries
-                    // the isolated test address/MTU; full network setup is M3.
-                    emit_log(
-                        &events,
-                        "warn",
-                        "Windows M1: no default/split routes, DNS or NRPT were installed; \
-                         only the isolated Wintun test adapter is configured (deferred to M3)",
-                    );
                 }
 
                 attempt = 0;

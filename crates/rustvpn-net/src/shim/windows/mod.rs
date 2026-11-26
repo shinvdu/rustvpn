@@ -1,10 +1,9 @@
 //! Windows Wintun (L3) device behind the platform-neutral [`crate::tap::Tap`].
 //!
-//! This is the M1 milestone: one adapter, the Ethernet shim from
-//! [`crate::shim`], and an async bridge.  It deliberately does **not** install
-//! routes, DNS, NRPT or firewall rules (M3) and does not run as a service
-//! (M2).  All adapters are confined to the isolated `10.88.0.0/24` test
-//! subnet.
+//! One adapter, the Ethernet shim from [`crate::shim`], and an async bridge.
+//! The adapter itself only applies the derived interface MTU; its profile
+//! address and all routes/DNS/NRPT/firewall state are installed by the client
+//! core network guard after the handshake (M3).  The service/IPC layer is M2.
 
 pub mod adapter;
 pub mod verify;
@@ -153,7 +152,7 @@ fn resolve_wintun_sha256(cfg: &TapConfig) -> Result<[u8; 32], String> {
 
 #[cfg(test)]
 mod smoke {
-    //! Manual M1 acceptance test.
+    //! Manual adapter acceptance test (M1 smoke, still valid for M3).
     //!
     //! Run from an **elevated** PowerShell on the Windows host:
     //!
@@ -165,9 +164,11 @@ mod smoke {
     //! ```
     //!
     //! It creates `RustVPN-M1-Smoke` at `10.88.0.2/24` with interface MTU
-    //! 1500, verifies that no default route/other route/interface changed,
-    //! drops it, and verifies removal and route restoration.  It never touches
-    //! another adapter, the default route, DNS or the firewall.
+    //! 1500 (the address is applied explicitly through
+    //! [`WintunAdapter::apply_address`], mirroring what the network guard does
+    //! after the handshake), verifies that no default route/other route or
+    //! interface changed, drops it, and verifies removal and route restoration.
+    //! It never touches another adapter, the default route, DNS or the firewall.
 
     use super::adapter::{AdapterConfig, WintunAdapter};
     use crate::shim::safety;
@@ -295,6 +296,9 @@ mod smoke {
 
         let cfg = AdapterConfig::new(ADAPTER, dll, ADDRESS, PREFIX, INNER_MTU);
         let adapter = WintunAdapter::open_or_create(&cfg).expect("create M1 adapter");
+        adapter
+            .apply_address(ADDRESS, PREFIX)
+            .expect("apply the isolated test address");
         let index = adapter.index();
         assert!(adapter.created(), "the smoke adapter must be newly created");
         assert_eq!(adapter.mtu().unwrap(), INNER_MTU, "interface MTU");
