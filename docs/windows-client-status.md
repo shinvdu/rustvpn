@@ -3,7 +3,7 @@
 > **最后更新：** 2026-11-27
 > **分支：** `feature/client-ui`
 > **HEAD：** 以 `git log -1` 为准
-> **同步状态：** 以 `git status` 为准；当前未推送
+> **同步状态：** 以 `git status` 为准
 > **工作区：** 仅有文档改动，无代码改动
 > **问题索引：** `docs/windows-client-dev/windows-client-issues.xlsx`（仅本地）
 > **问题详情：** `docs/windows-client-dev/issues/WIN-<NNN>-<slug>.md`（仅本地）
@@ -37,7 +37,7 @@
 | M3 网络配置 | `cac143a`, `06a092b` | 完成 | 地址/路由/DNS/NRPT/IPv6 防护、防环路路由、ACL 受限的 netstate、崩溃清理。真实 Windows 契约缺陷已修复，分流隧道路由在 M6 中验证。 |
 | M4 GUI 适配 | `7b73a82` | 完成 | 配置 ACL、Credential Manager、HKCU 自启动、区域设置、命名管道信息、密码前守护进程身份校验。RDP 验证通过。 |
 | M5 打包 | `cb39124` | 完成 | MSI、LocalSystem 服务、RustVPN 组、进程查询 DACL、Wintun 固定、签名钩子。安装、同版本升级、卸载以及标准用户访问均已验证。 |
-| M6 加固 + E2E | `06a092b` … `7f05a3e` | 基本完成 | 分流/全隧道 plain+noise、DNS/NRPT、IPv6 阻断、断连修复、rekey/重连、链路抖动、强杀恢复、fuzz、iperf3。受条件阻塞的项列于下文。 |
+| M6 加固 + E2E | `06a092b` … `ffe9657` | 基本完成 | 分流/全隧道 plain+noise、DNS/NRPT、IPv6 阻断、断连修复、rekey/重连、链路抖动、强杀恢复、fuzz、iperf3；VPS 全隧道互联网出口通过；Windows CI 已真实运行并通过。受条件阻塞的项列于下文。 |
 
 ## 3. 已在 Windows 上验证
 
@@ -49,6 +49,8 @@
 - **重连与链路抖动：** 服务器中断后经重连恢复；网卡断开 12 秒保持会话，断开 30 秒超时并重连且路由恢复。
 - **崩溃恢复：** 两次强制终止守护进程后，SCM 重启并执行启动时路由/netstate 清理；默认路由两次均正确。
 - **性能：** 分流隧道 iperf3 约 174 Mbit/s（虚拟机→服务器）与 150 Mbit/s（反向），平均延迟 4.9 ms；反向出现重传（WIN-013）。
+- **互联网出口：** 全隧道经临时 VPS NAT 验证；`ifconfig.me` 返回 VPS 公网 IP，`example.com` HTTP 200，1 MiB 下载完整；VPS TAP/NAT/防火墙已清理。
+- **Windows CI：** `windows-client` workflow 已真实运行并通过（format/check/clippy/test/MSI/inspect/upload），commit `ffe9657`，run 45995988463。
 - **Fuzz：** 7 个确定性 shim fuzz 测试；`rustvpn-net` 报告 118 个通过测试。
 - **打包：** MSI 静态检查、真实安装、服务/组状态、标准用户管道访问、非成员拒绝、同版本升级、卸载并保留配置。
 
@@ -65,9 +67,8 @@
 | 问题 | 事项 | 阻塞原因 |
 |---|---|---|
 | WIN-016 | 睡眠/休眠恢复 | 虚拟机未提供可用的挂起；稍后使用一次性物理硬件 |
-| WIN-017 | 经全隧道访问互联网出口 | 无专用于隧道测试子网的 NAT 环境 |
-| WIN-018 | Windows CI 首次真实运行 | 分支未推送；未注册自托管的高权限 Windows runner |
 | WIN-019 | Authenticode 签名 | 无可用 EV/OV 证书或私钥；未签名构建已明确标记 |
+| WIN-018（剩余） | 自托管 Windows E2E workflow | `windows-client-e2e.yml` 需要已注册的高权限 self-hosted runner；当前 runner 数 0，且 workflow 仅在 `feature/client-ui` |
 
 ## 6. 已知不支持或延期
 
@@ -106,9 +107,9 @@
 1. 追踪实时状态路径并修复 WIN-012（`last_handshake_unix`），附带回归测试。
 2. 抓取反向 iperf3 流量，评估 MSS/路径影响以处理 WIN-013。
 3. 批量化或替换重度依赖 PowerShell 的启动清理，以缩短 WIN-014 的窗口。
-4. 构建一次性 NAT 环境并验证子网外出口（WIN-017）。
-5. 在一次性物理硬件上验证睡眠/恢复（WIN-016）。
-6. 推送分支并运行客户端 CI；为 E2E 注册受保护的自托管 runner（WIN-018）。
+4. 在一次性物理硬件上验证睡眠/恢复（WIN-016）。
+5. 为自托管 Windows E2E 注册受保护 runner，并让 workflow 进入默认分支（WIN-018 剩余项）。
+6. 条件成熟时提供 Authenticode 证书并验证签名安装包（WIN-019）。
 7. 获取 EV/OV 证书，签名 GUI/守护进程/MSI，并固定发布者身份（WIN-019）。
 8. 仅在具备足够容量的外层路径可用后，再重新评估 encless/TCP（WIN-015）。
 
