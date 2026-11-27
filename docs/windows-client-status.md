@@ -5,10 +5,11 @@
 > 状态：M1（核心接入）、M2（服务 + 本地 IPC）、M3（网络配置）、M4（GUI 平台适配）
 > 已完成并提交；M5（MSI/WiX 打包、服务注册、组/DACL、Wintun、签名钩子、Windows CI）
 > 已完成并在 Windows 实机完成安装/升级/卸载验证，已提交；
-> M6（真实 E2E、硬化、fuzz、CI）进行中：分流隧道 E2E、路由/DNS 观察、5 个
-> Windows 实机 bug 修复与垫片 fuzz 已完成；但断开路径两次复现导致 Windows
-> 主机网络栈失联，断开/崩溃清理、全隧道/DNS/NRPT/IPv6 与性能被阻塞，
-> 必须先在一次性 VM 中修复并验证
+> M6（真实 E2E、硬化、fuzz、CI）进行中：分流 E2E、Disconnect 问题、5 个
+> Windows 实机 bug 修复与垫片 fuzz 已完成。Disconnect 根因是 daemon 内
+> `Get-NetRoute | Remove-NetRoute -PolicyStore` 路由删除会扩大删除并导致主机
+> 断网；已改为直接 `Remove-NetRoute` 并延迟到下次连接/启动清理，物理机验证通过。
+> 全隧道/DNS/NRPT/IPv6、休眠/切网与性能仍未验收
 > 相关文档：
 > - [Windows 安装/升级/卸载/签名](windows-install.md)
 > - [Windows 客户端调研与方案](windows-client-research.md)
@@ -30,15 +31,15 @@ Windows 端已经完成 **开发环境 + Wintun/以太网垫片原型**，并完
 | 项 | 状态 |
 |---|---|
 | 代码分支 | `feature/client-ui` |
-| 最近提交 | `bb573e4 fix(windows): harden teardown ownership and recovery`（已物理机实测，Disconnect 仍挂起） |
+| 最近提交 | `f4cc06e fix(windows): defer host-route cleanup and delete routes directly`（Disconnect 物理机验证通过） |
 | M5 代码 | 已提交（MSI/服务/组/DACL/CI/文档） |
-| M6 代码 | 已提交（分流 E2E 修复、fuzz、手动 E2E 工作流、teardown 重排）；`bb573e4` 已实测仍未修复 Disconnect 挂起；断开/崩溃/全隧道验收被阻塞 |
+| M6 代码 | 已提交（分流 E2E、fuzz、手动 E2E 工作流、直接路由删除与延迟清理）；Disconnect >130s 存活、下次启动清理 >145s 存活；全隧道/DNS/NRPT/IPv6、休眠/切网、性能待验收 |
 | M4 代码 | `7b73a82 feat(windows): adapt GUI paths, keyring, autostart and identity checks` |
 | M3 代码 | `cac143a feat(windows): add network guard and crash recovery` |
 | M2 代码 | `8cef993 feat(windows): add service, named-pipe IPC and tunnel lock` |
 | M1 代码 | `9bc1466 feat(windows): integrate Wintun shim into client core` |
 | 远端 | 领先 `origin/feature/client-ui`，**未推送** |
-| 主仓库剩余改动 | M5、M6 代码已提交；M6 断开/崩溃/全隧道/性能验收待主机恢复 |
+| 主仓库剩余改动 | M5、M6 代码已提交；M6 全隧道/DNS/NRPT/IPv6、休眠/切网、性能待验收 |
 | Windows 原型位置 | `prototypes/windows-shim/`，独立 crate，不加入 workspace |
 | Windows CI | `.github/workflows/windows-client.yml`（M5 客户端构建/MSI）与 `.github/workflows/windows-shim.yml`（原型）相互独立 |
 | 原型状态 | Phase 0 参考实现，不是生产代码 |
@@ -745,25 +746,25 @@ PowerShell IPC 客户端驱动 `Connect/Status/Disconnect`；未修改现有 VPN
 | M3 网络 | 路由/DNS/NRPT、防环、IPv6 阻断、清理 | 🟡 已提交；Windows 实机路由/DNS 验收待 M6 | 全隧道无泄漏，断开恢复 |
 | M4 GUI | 路径/钥匙串/自启/语言/状态/服务端身份 | ✅ 已提交 `7b73a82`，Windows RDP 实机验证 | 普通用户基础操作（真实服务端 E2E 归 M6） |
 | M5 安装 | MSI、服务安装、组/DACL、Wintun、签名钩子、Windows CI | ✅ 已提交 `cb39124`；MSI 静态检查、安装/升级/卸载、标准用户/非成员、GUI RDP 已实测 | 干净 Win10/11 安装/升级/卸载；无证书构建标记为 unsigned |
-| M6 硬化 | E2E、休眠/切网、fuzz、CI、性能 | 🟡 `06a092b`+`2dd3b66`+`bb573e4`：分流 E2E、5 个实机 bug 修复、fuzz、手动 CI、teardown 重排；**物理机实测 Disconnect 仍导致主机网络栈失联（3/3）**，断开/崩溃清理、全隧道、性能仍被阻塞 | 在一次性 VM 二分 Wintun close vs 路由/DNS 变更 |
+| M6 硬化 | E2E、休眠/切网、fuzz、CI、性能 | 🟡 `f4cc06e`：分流 E2E、Disconnect 根因修复（直接路由删除 + 延迟清理，物理机验证通过）、5 个实机 bug 修复、fuzz、手动 CI；全隧道/DNS/NRPT/IPv6、休眠/切网、性能待验收 | 全隧道无泄漏、断开恢复、性能基线 |
 
-**当前状态：** M1–M5 已提交，M6 代码已提交为 `06a092b`，teardown 候选修复为
-`2dd3b66`/`bb573e4`。**2026-11-27 物理机用 `bb573e4` 实测：connect/ping/TCP
-通过，Disconnect 仍第三次导致主机网络栈失联，候选修复不足。**
-分流隧道 E2E（plain/UDP）两次通过，修复了 4 个 Windows 10 实机契约 bug 和 1 个
-fuzz 发现的移位溢出，新增垫片 fuzz 与手动 E2E 工作流。**关键阻塞：** 发送
-`Disconnect` 后 Windows 主机两次（2/2）从网络失联；第一次的事件日志显示无
-Kernel-Power 41、无睡眠支持，约 2 小时后由 `winlogon.exe` 干净关机并重启。
-修复前断连顺序在 Wintun 适配器仍打开时执行 `Remove-NetRoute`/`Remove-NetIPAddress`，
-且 peer 任务未 join、close 后仍有 `Get-Net*` 查询，是主要嫌疑。已提交候选
-teardown 重排（stop reader → join peer 任务 → 删路由/DNS/NRPT → 关闭适配器 →
-不再查询），**当前工作区另有复审 P1/P2 修复**：`created` 标志决定地址由适配器
-关闭删除还是 close 后显式删除、状态文件仅在 close 后清除、install 失败回滚推迟到
-数据面停止后、previous-state 只在打开适配器前清理/失败即拒绝、PeerHandle
-cancel-on-drop、ShimPump 取消 recv 后复用 receiver、IPC 暴露 `disconnecting`。
-全部**未在 Windows 验证**；M6 未完成项（断开/崩溃清理、全隧道 DNS/NRPT/IPv6、
-休眠/切网、性能）须先在一次性 VM 中按 2.11 的矩阵补测，再决定 M6 是否签收。
-**在 VM 通过前禁止在物理机再次连接/断开。**
+**当前状态：** M1–M6 代码已提交，Disconnect 根因修复为 `f4cc06e` 并已物理机验证：
+
+- 根因是 daemon 内 `Get-NetRoute | Remove-NetRoute -PolicyStore ActiveStore`
+  pipeline 在路由已消失/过滤为空时可能扩大删除范围，导致整机路由被删、约
+  13–16 秒后网络失联。
+- 修复改为直接 `Remove-NetRoute -DestinationPrefix ... -InterfaceIndex ...
+  -NextHop ... -RouteMetric ... -Confirm:$false`，无 pipeline/无 `-PolicyStore`。
+- 正常 Disconnect 保留防环 `/32` + `netstate.json`，关闭 Wintun 适配器后立即
+  发布 idle；下次 Connect/daemon 启动在无适配器时直接清理并清状态。
+- 物理验证：Disconnect 后主机存活 >130s；下次启动清理后存活 >145s；默认路由
+  `192.168.110.1` 未变，防环/netstate 正确清除。
+- OpenVPN 调研确认 Windows 客户端应优先使用 IP Helper
+  `DeleteIpForwardEntry2`/`route.exe`，而不是 PowerShell/WMI 路由；当前直接
+  cmdlet 是已验证的过渡实现，后续可替换为 Win32 API。
+
+剩余 M6：全隧道默认路由、DNS/NRPT、IPv6 阻断的实机验收；休眠/切网；崩溃/
+强杀清理；性能基线；Windows CI 实际运行。
 
 ---
 
