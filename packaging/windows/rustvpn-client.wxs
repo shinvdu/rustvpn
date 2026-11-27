@@ -118,7 +118,7 @@
             <!--
               Stop="both" stops the old service before files are replaced and
               during uninstall; Start="install" starts it after the install
-              sequence; Remove="uninstall" deletes the SCM entry last.
+              sequence; DeleteServices removes the SCM entry before RemoveFiles/--cleanup.
             -->
             <ServiceControl Id="RustVPNDaemonControl"
                             Name="rustvpn-clientd"

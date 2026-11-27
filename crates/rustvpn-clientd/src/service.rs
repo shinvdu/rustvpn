@@ -75,7 +75,7 @@ fn service_main(_arguments: Vec<OsString>) {
 
     if let Err(error) = status.set_service_status(service_status(
         ServiceState::StartPending,
-        ServiceControlAccept::empty(),
+        ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN,
         ServiceExitCode::NO_ERROR,
         1,
     )) {
@@ -117,12 +117,13 @@ fn service_main(_arguments: Vec<OsString>) {
         }
     };
 
+    let shutdown_check = shutdown.clone();
     let result = runtime.block_on(async {
         let mut run_future = Box::pin(run(config, shutdown));
         tokio::select! {
             result = &mut run_future => result,
             ready = &mut ready_rx => {
-                if ready.is_ok() {
+                if ready.is_ok() && !shutdown_check.is_cancelled() {
                     if let Err(error) = status.set_service_status(service_status(
                         ServiceState::Running,
                         ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN,

@@ -13,8 +13,9 @@
 //!
 //! * the outer endpoint gets a `/32` anti-loop route through the **original**
 //!   path before any tunnel default route is added;
-//! * pre-existing routes are never overwritten; an identical route that is not
-//!   recorded as RustVPN-owned is reused but never deleted;
+//! * pre-existing routes are never overwritten; identical host routes that are
+//!   not recorded as RustVPN-owned are reused but never deleted, while identical
+//!   default/split tunnel routes are adopted into the state file for teardown;
 //! * a conflicting route fails the whole install, which then rolls back;
 //! * cleanup removes only entries recorded in the state file and verifies they
 //!   still exist exactly as recorded;
@@ -25,6 +26,7 @@ use std::future::Future;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::pin::Pin;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
 use ipnet::IpNet;
@@ -216,9 +218,15 @@ pub fn script_for(command: &WinCommand) -> String {
             ps_quote(name)
         ),
         WinCommand::GetIpv4Addresses(ifindex) => format!(
-            "Get-NetIPAddress -AddressFamily IPv4 -InterfaceIndex {ifindex} \
-             -PolicyStore ActiveStore -ErrorAction Stop | \
-             Select-Object IPAddress,PrefixLength | ConvertTo-Json -Compress"
+            // A freshly opened Wintun adapter may have no IPv4 address yet;
+            // Get-NetIPAddress returns ObjectNotFound in that case.  Treat it
+            // as an empty list, not a fatal PowerShell error.
+            "$rows = @(); \
+             try {{ $rows = @(Get-NetIPAddress -AddressFamily IPv4 -InterfaceIndex {ifindex} \
+                 -PolicyStore ActiveStore -ErrorAction Stop | \
+                 Select-Object IPAddress,PrefixLength) }} \
+             catch {{ if ($_.CategoryInfo.Category -ne 'ObjectNotFound') {{ throw }} }}; \
+             $rows | ConvertTo-Json -Compress; exit 0"
         ),
         WinCommand::FindRouteTo(ip) => format!(
             // Windows 10's Find-NetRoute has no -AddressFamily parameter
@@ -1220,6 +1228,55 @@ async fn install_inner(
     Ok(())
 }
 
+async fn wait_for_address(
+    runner: &dyn WinRunner,
+    ifindex: u32,
+    wanted: &AddressEntry,
+    iface: &str,
+) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut last_error = None;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            let detail = last_error
+                .as_deref()
+                .unwrap_or("address is not present after the query");
+            bail!(
+                "address {}/{} was not visible on {:?} after New-NetIPAddress: {detail}",
+                wanted.address,
+                wanted.prefix_len,
+                iface
+            );
+        }
+        let query = tokio::time::timeout(
+            remaining,
+            runner.run(&WinCommand::GetIpv4Addresses(ifindex)),
+        )
+        .await;
+        match query {
+            Ok(Ok(text)) => match parse_addresses(&text) {
+                Ok(entries) if entries.contains(wanted) => return Ok(()),
+                Ok(_) => {}
+                Err(error) => last_error = Some(format!("{error:#}")),
+            },
+            Ok(Err(error)) => last_error = Some(format!("{error:#}")),
+            Err(_) => {
+                return Err(anyhow!(
+                    "address query for {}/{} on {:?} timed out",
+                    wanted.address,
+                    wanted.prefix_len,
+                    iface
+                ))
+            }
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if !remaining.is_zero() {
+            tokio::time::sleep(Duration::from_millis(250).min(remaining)).await;
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn install_steps(
     ctx: &InstallContext<'_>,
@@ -1315,17 +1372,7 @@ async fn install_steps(
                 prefix_len: plan.prefix_len,
             });
             ctx.store.save(state)?;
-            let after = parse_addresses(
-                &run_text(ctx.runner, &WinCommand::GetIpv4Addresses(adapter_index)).await?,
-            )?;
-            if !after.contains(&wanted) {
-                bail!(
-                    "address {}/{} was not visible on {:?} after New-NetIPAddress",
-                    plan.address,
-                    plan.prefix_len,
-                    spec.iface
-                );
-            }
+            wait_for_address(ctx.runner, adapter_index, &wanted, &spec.iface).await?;
         }
     }
     if state.address.is_some() {
@@ -2553,6 +2600,9 @@ mod tests {
                     }
                     WinCommand::ListAdapters => Ok(adapters_json(&self.adapters.lock().unwrap())),
                     WinCommand::GetIpv4Addresses(_) => {
+                        if self.should_fail("get-addresses") {
+                            bail!("injected get-addresses failure");
+                        }
                         Ok(addresses_json(&self.addresses.lock().unwrap()))
                     }
                     WinCommand::FindRouteTo(_) => self
@@ -3733,6 +3783,32 @@ mod tests {
         // Identity-based NRPT/firewall cleanup is still safe and proceeds.
         assert!(system.nrpt.lock().unwrap().is_empty());
         assert!(system.firewall.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn cleanup_keeps_state_when_address_query_fails() {
+        let system = FakeSystem::new();
+        let store = TempStore::new("address-query-failure");
+        let probe = Probe { alive: false };
+        let _state = install_with(
+            ctx(&system, &store, &probe),
+            &full_spec(),
+            Some("203.0.113.10:1194".parse().unwrap()),
+            1500,
+            NetOptions::default(),
+        )
+        .await
+        .unwrap();
+        system.fail_on("get-addresses");
+        let report = cleanup_owned_with(&system, &store, &OWNER).await.unwrap();
+        assert!(
+            !report.ok(),
+            "a query failure must not look clean: {report:?}"
+        );
+        assert!(
+            store.load().unwrap().is_some(),
+            "netstate must be kept when the address query fails"
+        );
     }
 
     #[tokio::test]

@@ -81,19 +81,21 @@ if ($skip -contains $User) {
 if ($User -match '["\r\n]') {
     if (-not (Test-Group $group)) {
         & $net localgroup $group /add /comment:"RustVPN client users" *>> $log
+        if (-not (Test-Group $group)) {
+            Write-Log 'refusing an invalid user name and cannot create the RustVPN group; service will fail closed'
+            exit 0
+        }
     }
     Write-Log 'refusing a user name containing quotes or newlines; group left present for the service'
     exit 0
 }
 
-$created = $false
 if (-not (Test-Group $group)) {
     & $net localgroup $group /add /comment:"RustVPN client users" *>> $log
     if ($LASTEXITCODE -ne 0 -or -not (Test-Group $group)) {
         Write-Log 'cannot create the RustVPN group (domain policy?); service will fail closed until the group exists'
         exit 0
     }
-    $created = $true
     Write-Log 'created local group RustVPN'
 }
 
@@ -110,13 +112,5 @@ if (Test-Member $members $User) {
     exit 0
 }
 
-Write-Log "failed to add '$User' to $group"
-if ($created) {
-    & $net localgroup $group /delete *>> $log
-    if (Test-Group $group) {
-        Write-Log 'could not roll back the RustVPN group; add users manually with net localgroup'
-    } else {
-        Write-Log 'rolled back the RustVPN group; service remains fail-closed until the group exists'
-    }
-}
+Write-Log "failed to add '$User' to $group; kept the group so the service can start (add the account manually and re-login)"
 exit 0

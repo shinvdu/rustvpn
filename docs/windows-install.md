@@ -139,7 +139,7 @@ if it is no longer wanted.
 Before sending a passphrase, the GUI resolves the pipe server PID and verifies
 its image path/Authenticode publisher. A LocalSystem process is not openable
 by a standard user by default, so at startup the daemon applies a process DACL
-that grants **only** `PROCESS_QUERY_LIMITED_INFORMATION` (0x1000) to the same
+that grants `PROCESS_QUERY_LIMITED_INFORMATION | READ_CONTROL` (0x21000) to the same
 pipe audience. SYSTEM/Administrators retain full access; no memory, handle or
 terminate rights are exposed. This does not weaken the M4 identity policy: an
 image outside `Program Files\RustVPN` still needs a valid RustVPN signature,
@@ -155,7 +155,7 @@ powershell -NoProfile -ExecutionPolicy Bypass `
 Success prints the server image and:
 
 ```text
-RESULT: OK (pipe, process query, installed image and Hello v2 all verified)
+RESULT: OK (pipe, process query, installed image, admin/SYSTEM owner and Hello v2 all verified)
 ```
 
 Run it as a non-member (or after removing the account from `RustVPN`) to
@@ -257,7 +257,7 @@ The script signs the executables before packaging and the MSI after linking,
 then verifies each artifact with `signtool verify /pa`. If no certificate is
 configured it does **not** pretend to sign:
 
-- `signtool verify /pa` must confirm the file is unsigned;
+- `Get-AuthenticodeSignature` must confirm the file is `NotSigned`;
 - `dist\windows\UNSIGNED.txt` is written;
 - Product comments, `docs\SIGNING.txt` and `BUILD-INFO.txt` say
   "Unsigned development build".
@@ -333,13 +333,14 @@ msiexec /x .\RustVPN-0.2.0-beta.1-x64.msi /qn /l*v uninstall.log
 
 The MSI:
 
-1. sends a stop to `rustvpn-clientd` and waits (the daemon removes its
-   transient routes/DNS/NRPT/IPv6 rules as on a normal stop);
-2. runs the uninstall-only `--cleanup` helper before files are removed, which
-   clears the deferred anti-loop route and `netstate.json` left by the normal
-   stop;
-3. removes the service registration and `Program Files\RustVPN`;
-4. removes the Start Menu/desktop shortcuts and the MSI registry values.
+1. sends a stop to `rustvpn-clientd` and waits; the normal stop removes
+   non-route state (NRPT/DNS/metric/IPv6), while routes/address are deferred;
+2. deletes the service registration (`DeleteServices`);
+3. runs the uninstall-only `--cleanup` helper before files are removed; it
+   waits for the service's StopPending window, then clears the deferred
+   anti-loop route and `netstate.json`;
+4. removes `Program Files\RustVPN`;
+5. removes the Start Menu/desktop shortcuts and the MSI registry values.
 
 Preserved by design:
 
@@ -404,7 +405,7 @@ This performs `msiexec /a` extraction, checks the payload, and queries the
 | --- | --- |
 | Install stops with WebView2 message | Install the Evergreen runtime, then retry. |
 | GUI: "service is not installed or not running" | `Get-Service rustvpn-clientd`; check `%ProgramData%\RustVPN\clientd.log`; `Start-Service rustvpn-clientd`. |
-| GUI/CLI: access denied on the pipe | Add the account to `RustVPN` and log off/on. If the installer rolled the group back, the group may not exist. |
+| GUI/CLI: access denied on the pipe | Add the account to `RustVPN` and log off/on. If the installer could not create the group, the service fails closed and the install rolls back; inspect `%TEMP%\RustVPN-setup-group.log`. |
 | Daemon log: cannot load Wintun / hash mismatch | Reinstall; verify the DLL hash and that the file is `C:\Program Files\RustVPN\wintun.dll`. |
 | Service fails to start after upgrade | Read `%ProgramData%\RustVPN\clientd.log` and Event Viewer; the failure policy retries three times. Check that the previous service stopped. |
 | MSI upgrade blocked | A newer ProductVersion is installed; uninstall it or build with an explicit higher `-MsiVersion`. |

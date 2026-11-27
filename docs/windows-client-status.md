@@ -1,10 +1,10 @@
 # Windows 客户端开发状态
 
-> **最后更新：** 2026-11-27
+> **最后更新：** 2026-11-28
 > **分支：** `feature/client-ui`
 > **HEAD：** 以 `git log -1` 为准
 > **同步状态：** 以 `git status` 为准
-> **工作区：** 以 `git status` 为准；2026-11-27 复审修复已提交
+> **工作区：** 以 `git status` 为准；2026-11-28 第三轮复审修复已提交
 > **问题索引：** `docs/windows-client-dev/windows-client-issues.xlsx`（仅本地）
 > **问题详情：** `docs/windows-client-dev/issues/WIN-<NNN>-<slug>.md`（仅本地）
 
@@ -38,23 +38,23 @@
 | M3 网络配置 | `cac143a`, `06a092b` | 完成 | 地址/路由/DNS/NRPT/IPv6 防护、防环路路由、ACL 受限的 netstate、崩溃清理。真实 Windows 契约缺陷已修复，分流隧道路由在 M6 中验证。 |
 | M4 GUI 适配 | `7b73a82` | 完成 | 配置 ACL、Credential Manager、HKCU 自启动、区域设置、命名管道信息、密码前守护进程身份校验。RDP 验证通过。 |
 | M5 打包 | `cb39124` | 完成 | MSI、LocalSystem 服务、RustVPN 组、进程查询 DACL、Wintun 固定、签名钩子。安装、同版本升级、卸载以及标准用户访问均已验证。 |
-| M6 加固 + E2E | `06a092b` … `ffe9657` | 基本完成 | 分流/全隧道 plain+noise、DNS/NRPT、IPv6 阻断、断连修复、rekey/重连、链路抖动、强杀恢复、fuzz、iperf3；VPS 全隧道互联网出口通过；Windows CI 已真实运行并通过。2026-11-27 两轮代码复审新增登记 WIN-025…050，其中 25 项已修复（跨用户守护进程冒充、状态/事件通道校验、既有 Wintun 清理、pipe 抢占与 IPC 资源上限等）；WIN-045 仍待 Windows 安全/并发 E2E。受条件阻塞的项列于下文。 |
+| M6 加固 + E2E | `06a092b` … `ffe9657` | 基本完成 | 分流/全隧道 plain+noise、DNS/NRPT、IPv6 阻断、断连修复、rekey/重连、链路抖动、强杀恢复、fuzz、iperf3；VPS 全隧道互联网出口通过；Windows CI 已真实运行并通过。2026-11-27/28 三轮代码复审与 Windows 实机验证新增登记 WIN-025…052；其中 27 项已修复（跨用户守护进程冒充、状态/事件通道校验、既有 Wintun 清理、pipe 抢占、IPC 资源上限、空地址查询与卸载 cleanup 竞态等）；WIN-013/014/045 仍待专项。受条件阻塞的项列于下文。 |
 
 ## 3. 已在 Windows 上验证
 
 - **分流隧道（Windows 10 物理机）：** 握手、对两个测试地址 ping 4/4、通过隧道取得 TCP SSH banner、默认路由未被接管。
-- **全隧道（Windows 11 虚拟机，plain 与 noise）：** 默认路由切换到 Wintun，防环路 `/32` 保留底层路径，NRPT `.` 经隧道 DNS 解析，IPv6 `2000::/3` 与 `fc00::/7` 被阻断。
+- **全隧道（Windows 11 虚拟机，plain 与 noise）：** 默认路由切换到 Wintun，防环路 `/32` 保留底层路径，NRPT `.` 经隧道 DNS 解析，IPv6 `2000::/3` 与 `fc00::/7` 被阻断。2026-11-28 复验再次 connected，ping `10.200.0.1` 3/4，`last_handshake_unix` 非 null。
 - **断开连接：** 采用直接 cmdlet 修复后，物理机存活 >130 秒；下一次守护进程启动清理了防环路路由/netstate 并存活 >145 秒；原始默认路由保持不变。
 - **服务重启：** 无 Wintun 适配器时的直接启动清理成功；当规则已不存在时，防火墙/NRPT 清理具备幂等性。
 - **Rekey：** 60 秒 rekey 测试在 140 秒内产生两次 rehandshake，ping 成功 68/69，状态无抖动。
 - **重连与链路抖动：** 服务器中断后经重连恢复；网卡断开 12 秒保持会话，断开 30 秒超时并重连且路由恢复。
-- **崩溃恢复：** 两次强制终止守护进程后，SCM 重启并执行启动时路由/netstate 清理；默认路由两次均正确。
-- **性能：** 分流隧道 iperf3 约 174 Mbit/s（虚拟机→服务器）与 150 Mbit/s（反向），平均延迟 4.9 ms；反向出现重传（WIN-013）。
+- **崩溃恢复：** 两次强制终止守护进程后，SCM 重启并执行启动时路由/netstate 清理；默认路由两次均正确。2026-11-28 VM：SCM 5.25 秒重启，netstate 12.34 秒后消失，物理默认路由保持（WIN-014 窗口仍约 12 秒）。
+- **性能：** 2026-11-28 VM split 隧道 forward iperf3 8 秒约 264 Mbit/s；此前反向约 150 Mbit/s 且出现重传（WIN-013），本次反向受测试环境限制未完成。
 - **互联网出口：** 全隧道经临时 VPS NAT 验证；`ifconfig.me` 返回 VPS 公网 IP，`example.com` HTTP 200，1 MiB 下载完整；VPS TAP/NAT/防火墙已清理。
 - **Windows CI：** `windows-client` workflow 已真实运行并通过（format/check/clippy/test/MSI/inspect/upload），commit `ffe9657`，run 45995988463。
 - **自签 Authenticode：** `CN=RustVPN Development` 证书签名 GUI/daemon/MSI；导入 CER 到 VM Root + TrustedPublisher 后，`signtool verify /pa` 与 `Get-AuthenticodeSignature` 均为 Valid，服务/管道与 GUI 服务端身份校验通过。
 - **Fuzz：** 7 个确定性 shim fuzz 测试；`rustvpn-net` 报告 118 个通过测试。
-- **打包：** MSI 静态检查、真实安装、服务/组状态、标准用户管道访问、非成员拒绝、同版本升级、卸载并保留配置。
+- **打包：** MSI 静态检查、真实安装、服务/组状态、标准用户管道访问、非成员拒绝、同版本升级、卸载并保留配置。2026-11-28 在 VM 重新验证：automatic 服务、owner SID `S-1-5-32-544` probe、Wintun smoke、split/full tunnel、`--cleanup` 等待 StopPending 约 15 秒后清空 netstate/anti-loop。
 
 ## 4. 未决排查
 
@@ -62,7 +62,7 @@
 |---|---|---|
 | WIN-013 | 反向 iperf3 约 150 Mbit/s，出现 193 次重传 | 抓包、与 MSS clamp 对比、检查 Wintun RX/队列计数器 |
 | WIN-014 | 崩溃清理需约 10-15 秒才允许重连 | 替换或批量执行重度依赖 PowerShell 的启动清理；发布清理进度 |
-| WIN-027（剩余） | 服务被显式停止后，普通用户仍可抢占 global pipe | 已加 60×2s bind 重试；后续可再做端点不可预测化 |
+| WIN-027（剩余） | 服务被显式停止后，普通用户仍可抢占 global pipe | 已加 30×2s bind 重试；console 生产管道 guard 已在 VM 验证拒绝 |
 | WIN-045 | Windows 安全/并发 E2E 缺口 | 在自托管 runner 增加跨用户、假 pipe、既有 adapter、并发 shutdown 回归 |
 
 ## 5. 受条件阻塞
@@ -97,7 +97,7 @@
 ## 8. 安全与可运维约束
 
 - 绝不在状态文档、Excel 索引或问题文件中存储密码、私钥、验证器密钥、真实主机凭据或隧道密钥。使用通用的测试主机描述。
-- 守护进程以 LocalSystem 运行。其命名管道使用显式受保护的 DACL 与对等令牌校验；进程访问仅限查询权限。
+- 守护进程以 LocalSystem 运行。其命名管道使用显式受保护的 DACL 与对等令牌校验；GUI 可读取进程 owner/镜像，进程访问不授予内存、句柄复制或终止权限。
 - 生产分发必须使用已签名的 MSI。未签名的开发构建在 `UNSIGNED.txt`、Product comments 和 `docs\SIGNING.txt` 中标记。
 - Windows 没有 kill switch；不要声称具备与 Linux 等价的 fail-closed 行为。
 - 仅在一次性虚拟机/主机及专用测试子网上运行连接/断开、路由、DNS、NRPT、IPv6 和崩溃测试。

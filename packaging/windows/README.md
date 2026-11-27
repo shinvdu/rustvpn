@@ -133,7 +133,8 @@ keeps the created group (empty if necessary) so the fail-closed service can
 start; add the account manually and re-login. There is no INTERACTIVE fallback.
 
 At startup the daemon also applies a process DACL that grants
-`PROCESS_QUERY_LIMITED_INFORMATION` (0x1000) to the same pipe audience. The M4
+`PROCESS_QUERY_LIMITED_INFORMATION | READ_CONTROL` (0x21000) to the same pipe
+audience. The M4
 GUI resolves the pipe server's image path with `QueryFullProcessImageNameW` and
 checks its Authenticode publisher before sending a passphrase. Without this
 grant a standard user cannot open a LocalSystem service process and the GUI
@@ -175,7 +176,7 @@ Never commit certificates, private keys or passwords. The build reads:
 | `RUSTVPN_SIGNTOOL` | explicit `signtool.exe` |
 
 The build signs the GUI and daemon before packaging and the MSI after linking,
-then verifies each file with `signtool verify /pa`. If no certificate is
+then verifies each signed file with `signtool verify /pa`. If no certificate is
 configured it verifies that the artifacts really are unsigned, writes
 `UNSIGNED.txt` and records `Unsigned development build` in the Product
 comments, `docs\SIGNING.txt` and `BUILD-INFO.txt`. It never labels an unsigned
@@ -265,7 +266,7 @@ The standard-user probe is `verify-client-access.ps1` from this directory. Run
 it as the test account (it is not installed by the MSI) and expect:
 
 ```text
-RESULT: OK (pipe, process query, installed image and Hello v2 all verified)
+RESULT: OK (pipe, process query, installed image, admin/SYSTEM owner and Hello v2 all verified)
 ```
 
 ## Manual tunnel E2E

@@ -4,7 +4,7 @@
 #   1. the named-pipe DACL accepts the account (RustVPN group membership),
 #   2. the daemon process allows PROCESS_QUERY_LIMITED_INFORMATION + READ_CONTROL,
 #   3. QueryFullProcessImageNameW resolves the installed daemon image,
-#   4. the process owner SID is LocalSystem (the service account),
+#   4. the process owner SID is SYSTEM or Administrators (the service creator),
 #   5. a protocol-v2 Hello round-trip succeeds.
 #
 # The GUI performs steps 2-3 before sending a passphrase; this script is the
@@ -78,7 +78,7 @@ try {
     # rights (M5/M6).
     $process = [RustVPNPipeProbe]::OpenProcess(0x21000, $false, $serverPid)
     if ($process -eq [IntPtr]::Zero) {
-        throw "OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION) failed: $([Runtime.InteropServices.Marshal]::GetLastWin32Error())"
+        throw "OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION|READ_CONTROL) failed: $([Runtime.InteropServices.Marshal]::GetLastWin32Error())"
     }
     try {
         $buffer = New-Object System.Text.StringBuilder 32768
@@ -113,8 +113,8 @@ try {
     }
     Write-Host "server image: $image"
     Write-Host "server owner SID: $ownerSid"
-    if ($ownerSid -ne 'S-1-5-18') {
-        throw "server owner SID is $ownerSid, expected LocalSystem S-1-5-18"
+    if ($ownerSid -notin @('S-1-5-18', 'S-1-5-32-544')) {
+        throw "server owner SID is $ownerSid, expected SYSTEM or Administrators"
     }
     Write-Host ("process query completed after {0:N3}s" -f ([DateTime]::UtcNow - $connectedAt).TotalSeconds)
 
@@ -162,7 +162,7 @@ try {
     if ($parsed.op -ne 'hello' -or $parsed.version -ne 2) {
         throw "unexpected Hello response"
     }
-    Write-Host 'RESULT: OK (pipe, process query, installed image, SYSTEM owner and Hello v2 all verified)'
+    Write-Host 'RESULT: OK (pipe, process query, installed image, admin/SYSTEM owner and Hello v2 all verified)'
     exit 0
 } catch {
     Write-Host "RESULT: FAIL - $($_.Exception.Message)"

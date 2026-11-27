@@ -154,9 +154,11 @@ pub fn pipe_sddl(group_sid: Option<&str>, daemon_user: Option<&str>) -> String {
 /// the SCM needs to stop and restart the service.
 ///
 /// This does **not** weaken the GUI's identity policy: it only makes the
-/// read-only image query possible, and still exposes no memory, handle
-/// duplication or terminate rights to ordinary users.  INTERACTIVE is never
-/// granted; without a dedicated group only the daemon's own account can query.
+/// read-only image query and process-owner read possible, and still exposes
+/// no memory, handle duplication or terminate rights to ordinary users.
+/// INTERACTIVE is never granted; without a dedicated group only the daemon's
+/// own account can query.  A service process's owner may be SYSTEM or
+/// Administrators; an elevated console daemon is not covered by this branch.
 pub fn process_sddl(group_sid: Option<&str>, daemon_user: Option<&str>) -> String {
     // READ_CONTROL is needed to inspect the process owner; it does not expose
     // memory, handles or terminate rights.
@@ -739,7 +741,15 @@ mod tests {
         let own = process_user_sid_string(std::process::id()).expect("own process SID");
         assert_eq!(own, current);
         let owner = process_owner_sid_string(std::process::id()).expect("own process owner");
-        assert_eq!(owner, current);
+        // An elevated process is commonly owned by Administrators rather than
+        // the interactive user; a non-elevated console daemon is owned by the
+        // user, and a service is owned by SYSTEM/Administrators.
+        assert!(
+            owner.eq_ignore_ascii_case(&current)
+                || owner.eq_ignore_ascii_case("S-1-5-18")
+                || owner.eq_ignore_ascii_case("S-1-5-32-544"),
+            "unexpected process owner {owner}"
+        );
         assert!(owner.starts_with("S-1-"));
     }
 

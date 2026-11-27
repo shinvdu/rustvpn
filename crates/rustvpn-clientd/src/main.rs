@@ -498,23 +498,34 @@ fn run_cleanup() -> Result<()> {
         .enable_all()
         .build()
         .context("create cleanup runtime")?;
-    let report = runtime.block_on(rustvpn_client_core::netcfg::cleanup_stale_network())?;
-    for action in &report.actions {
-        println!("cleanup: {action}");
+    // MSI uninstall can schedule this immediately after StopServices; the
+    // service may still be in StopPending for a few seconds.  Never delete a
+    // live owner's routes, but wait for its normal shutdown before deciding
+    // the cleanup cannot proceed.
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let report = runtime.block_on(rustvpn_client_core::netcfg::cleanup_stale_network())?;
+        for action in &report.actions {
+            println!("cleanup: {action}");
+        }
+        for error in &report.errors {
+            eprintln!("cleanup warning: {error}");
+        }
+        if report.skipped_live_owner {
+            if std::time::Instant::now() >= deadline {
+                bail!("cleanup skipped: another live RustVPN owner still owns network state");
+            }
+            std::thread::sleep(Duration::from_millis(250));
+            continue;
+        }
+        if !report.errors.is_empty() {
+            bail!(
+                "cleanup left {} error(s); state kept for the next start",
+                report.errors.len()
+            );
+        }
+        return Ok(());
     }
-    for error in &report.errors {
-        eprintln!("cleanup warning: {error}");
-    }
-    if report.skipped_live_owner {
-        eprintln!("cleanup skipped: another live RustVPN owner still owns network state");
-    }
-    if !report.errors.is_empty() {
-        bail!(
-            "cleanup left {} error(s); state kept for the next start",
-            report.errors.len()
-        );
-    }
-    Ok(())
 }
 
 async fn run(mut config: RunConfig, shutdown: CancellationToken) -> Result<()> {

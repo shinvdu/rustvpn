@@ -180,6 +180,12 @@ $output = if ($OutputDir) {
     Join-Path $repo 'dist\windows'
 }
 New-Item -ItemType Directory -Force -Path $output | Out-Null
+# The release directory is a build output, not an archive.  Remove this
+# package's generated files so a stale MSI/wixpdb cannot be uploaded without a
+# checksum or inspected instead of the current build.
+Get-ChildItem -LiteralPath $output -File -ErrorAction SilentlyContinue |
+    Where-Object { $_.Name -match '^(RustVPN-.*\.msi|.*\.wixpdb|SHA256SUMS\.txt|BUILD-INFO\.txt|UNSIGNED\.txt)$' } |
+    Remove-Item -Force -ErrorAction SilentlyContinue
 $work = Join-Path $repo 'target\windows-msi'
 $stage = Join-Path $work 'stage'
 $wixobj = Join-Path $work 'wixobj'
@@ -387,12 +393,15 @@ $info = @(
 ) -join [Environment]::NewLine
 Set-Content -LiteralPath (Join-Path $output 'BUILD-INFO.txt') -Value $info -Encoding ASCII
 
-# Only checksum files that actually exist in the release directory.  The staged
-# executables are embedded in the MSI and are not separate release assets.
-$checksums = foreach ($file in Get-ChildItem -LiteralPath $output -File |
-        Where-Object { $_.Name -ne 'SHA256SUMS.txt' } | Sort-Object Name) {
-    $hash = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
-    "$hash  $($file.Name)"
+# Checksum only this build's release assets.  The output directory may contain
+# earlier builds and a .wixpdb; neither is uploaded with this release.
+$checksumFiles = @($msi, (Join-Path $output 'BUILD-INFO.txt'))
+if (Test-Path -LiteralPath (Join-Path $output 'UNSIGNED.txt')) {
+    $checksumFiles += (Join-Path $output 'UNSIGNED.txt')
+}
+$checksums = foreach ($file in $checksumFiles | Sort-Object) {
+    $hash = (Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash.ToLowerInvariant()
+    "$hash  $([IO.Path]::GetFileName($file))"
 }
 Set-Content -LiteralPath (Join-Path $output 'SHA256SUMS.txt') -Value $checksums -Encoding ASCII
 

@@ -65,7 +65,7 @@ function Find-SignTool {
     throw 'signtool.exe was not found. Set RUSTVPN_SIGNTOOL or install the Windows SDK signing tools.'
 }
 
-$signToolPath = Find-SignTool -Explicit $SignTool
+$signToolPath = $null
 $missing = @($Files | Where-Object { -not (Test-Path -LiteralPath $_) })
 if ($missing.Count -gt 0) {
     throw "cannot sign missing file(s): $($missing -join ', ')"
@@ -142,6 +142,7 @@ if (-not $configured) {
 # A PFX password must never appear in the signtool argv (visible to process
 # telemetry).  Import it into CurrentUser/My with a SecureString, sign by
 # thumbprint, then remove the temporary certificate.
+$signToolPath = Find-SignTool -Explicit $SignTool
 $importedThumb = $null
 if ($configured -and $thumb -eq '') {
     if (-not (Test-Path -LiteralPath $PfxFile)) {

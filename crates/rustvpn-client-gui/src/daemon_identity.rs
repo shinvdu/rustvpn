@@ -169,7 +169,14 @@ pub fn check_daemon_user(
     if server_user.eq_ignore_ascii_case(current_user) {
         return Ok(());
     }
-    if trusted_installed && server_user.eq_ignore_ascii_case("S-1-5-18") {
+    // An elevated process can be owned by Administrators rather than the
+    // interactive user; a service created by SCM can likewise surface as
+    // SYSTEM or Administrators.  Both are admin-only creators, so accepting
+    // them is safe only for the installed image.
+    if trusted_installed
+        && (server_user.eq_ignore_ascii_case("S-1-5-18")
+            || server_user.eq_ignore_ascii_case("S-1-5-32-544"))
+    {
         return Ok(());
     }
     Err(format!(
@@ -297,7 +304,9 @@ mod tests {
     fn server_user_must_match_or_be_system_for_installed_service() {
         assert!(check_daemon_user("S-1-5-21-1", "S-1-5-21-1", false).is_ok());
         assert!(check_daemon_user("S-1-5-18", "S-1-5-21-1", true).is_ok());
+        assert!(check_daemon_user("S-1-5-32-544", "S-1-5-21-1", true).is_ok());
         assert!(check_daemon_user("S-1-5-18", "S-1-5-21-1", false).is_err());
+        assert!(check_daemon_user("S-1-5-32-544", "S-1-5-21-1", false).is_err());
         assert!(check_daemon_user("S-1-5-21-2", "S-1-5-21-1", true).is_err());
     }
 }

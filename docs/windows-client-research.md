@@ -302,10 +302,10 @@ Wintun 适配器 MTU 设置为 `ip_mtu`。Windows 应在 `ip_mtu < 576` 时拒�
   （同一个 0x4 位），所以被允许的同用户进程仍能创建额外实例。
 - 服务端身份校验（GUI 使用所有 IPC 命令前）已在 M4/M6 实现：IPC 提供
   `Client::server_pid()`，GUI 用 `QueryFullProcessImageNameW` 读镜像路径、
-  `WinVerifyTrust` 校验 Authenticode、并读取服务端 token user SID；只接受
-  安装目录内且属于 SYSTEM 的服务，或与 GUI 同用户的 console/portable
-  daemon，其余拒绝。status/logs/events 也先完成同一校验。console 模式禁止
-  绑定生产管道，首次实例标志减少启动前的抢占窗口。
+  `WinVerifyTrust` 校验 Authenticode、并读取服务端 **process owner SID**；
+  只接受安装目录内且 owner 为 SYSTEM 或 Administrators 的服务，或与 GUI
+  同用户的 console/portable daemon，其余拒绝。status/logs/events 也先完成
+  同一校验。console 模式禁止绑定生产管道，首次实例标志减少启动前的抢占窗口。
 - 控制台管道的 `Local\`/`Global\` 与多用户策略：请勿在共享机上以普通
   用户长期运行；生产以服务 + 专用组为准。
 

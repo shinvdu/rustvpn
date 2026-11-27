@@ -33,7 +33,18 @@ $extract = Join-Path $work 'payload'
 $darkOut = Join-Path $work 'dark'
 # An explicit ExtractDir is caller-owned; only clear the subdirectories this
 # script fills, so stale payload files cannot make a missing-file check pass.
-Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $extract, $darkOut
+foreach ($dir in @($extract, $darkOut)) {
+    if (Test-Path -LiteralPath $dir) {
+        Remove-Item -Recurse -Force -LiteralPath $dir -ErrorAction Stop
+    }
+    if (Test-Path -LiteralPath $dir) {
+        throw "cannot remove stale inspection directory $dir"
+    }
+}
+$msiLog = Join-Path $work 'admin-install.log'
+if (Test-Path -LiteralPath $msiLog) {
+    Remove-Item -LiteralPath $msiLog -Force -ErrorAction Stop
+}
 New-Item -ItemType Directory -Force -Path $extract, $darkOut | Out-Null
 
 function Write-Step([string]$Message) { Write-Host "==> $Message" }

@@ -6,6 +6,7 @@
 
 use std::future::Future;
 use std::net::Ipv4Addr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -64,6 +65,8 @@ struct MtuInfo {
     mss_v6: Option<usize>,
 }
 
+type CurrentConnection = (CancellationToken, JoinHandle<()>, Arc<AtomicBool>);
+
 pub struct Engine;
 
 impl Engine {
@@ -119,7 +122,7 @@ impl Engine {
             ),
         }
 
-        let mut current: Option<(CancellationToken, JoinHandle<()>)> = None;
+        let mut current: Option<CurrentConnection> = None;
         // True once a connection task has completed, i.e. the Wintun adapter
         // may just have been closed.  Windows must not issue a network query
         // immediately after that close; a failed cleanup is retried on the
@@ -132,19 +135,22 @@ impl Engine {
                     match cmd {
                         Some(Command::Connect { profile, password }) => {
                             #[cfg(windows)]
-                            if current.is_some() {
+                            if stop_current(&mut current).await {
                                 connection_closed = true;
                             }
+                            #[cfg(not(windows))]
                             stop_current(&mut current).await;
                             let cancel = CancellationToken::new();
+                            let adapter_opened = Arc::new(AtomicBool::new(false));
                             let handle = tokio::spawn(run_connection(
                                 *profile,
                                 password,
                                 cancel.clone(),
                                 events.clone(),
                                 options.clone(),
+                                adapter_opened.clone(),
                             ));
-                            current = Some((cancel, handle));
+                            current = Some((cancel, handle, adapter_opened));
                         }
                         Some(Command::Disconnect) => {
                             // The IPC acknowledgement is sent as soon as the
@@ -156,12 +162,11 @@ impl Engine {
                                 ..EngineStatus::default()
                             }));
                             #[cfg(windows)]
-                            let was_active = current.is_some();
-                            stop_current(&mut current).await;
-                            #[cfg(windows)]
-                            if was_active {
+                            if stop_current(&mut current).await {
                                 connection_closed = true;
                             }
+                            #[cfg(not(windows))]
+                            stop_current(&mut current).await;
                             // An explicit disconnect restores connectivity even
                             // when the daemon is idle with a crash-preserved
                             // kill-switch table (no connection guard to remove).
@@ -222,24 +227,28 @@ impl Engine {
                         }
                         Some(Command::Shutdown) | None => {
                             #[cfg(windows)]
-                            if current.is_some() {
+                            if stop_current(&mut current).await {
                                 connection_closed = true;
                             }
+                            #[cfg(not(windows))]
                             stop_current(&mut current).await;
                             break;
                         }
                     }
                 }
                 _ = async {
-                    if let Some((_, handle)) = current.as_mut() {
+                    if let Some((_, handle, _)) = current.as_mut() {
                         let _ = handle.await;
                     }
                 }, if current.is_some() => {
-                    current = None;
                     #[cfg(windows)]
+                    if current
+                        .as_ref()
+                        .is_some_and(|(_, _, opened)| opened.load(Ordering::SeqCst))
                     {
                         connection_closed = true;
                     }
+                    current = None;
                 }
             }
         }
@@ -278,10 +287,13 @@ impl Engine {
     }
 }
 
-async fn stop_current(current: &mut Option<(CancellationToken, JoinHandle<()>)>) {
-    if let Some((cancel, handle)) = current.take() {
+async fn stop_current(current: &mut Option<CurrentConnection>) -> bool {
+    if let Some((cancel, handle, opened)) = current.take() {
         cancel.cancel();
         let _ = handle.await;
+        opened.load(Ordering::SeqCst)
+    } else {
+        false
     }
 }
 
@@ -517,6 +529,7 @@ async fn run_connection(
     cancel: CancellationToken,
     events: broadcast::Sender<Event>,
     options: EngineOptions,
+    adapter_opened: Arc<AtomicBool>,
 ) {
     // Publish `connecting` before validation/key derivation and any network
     // change so the UI never falls back to a stale idle state.
@@ -751,6 +764,7 @@ async fn run_connection(
             return;
         }
     };
+    adapter_opened.store(true, Ordering::SeqCst);
     emit_log(&events, "info", format!("TAP {} opened", spec.iface));
     #[cfg(unix)]
     if let Err(error) = crate::netcfg::bring_link_up(&spec.iface, link_mtu).await {
