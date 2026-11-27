@@ -1,122 +1,121 @@
-# Windows Client Development Status
+# Windows 客户端开发状态
 
-> **Last updated:** 2026-11-27
-> **Branch:** `feature/client-ui`
-> **HEAD:** `d6466c5 docs(windows): record M6 hardening acceptance`
-> **Sync:** 3 commits ahead of `origin/feature/client-ui`; not pushed
-> **Working tree:** documentation changes only, no code changes
-> **Issue index:** `docs/windows-client-dev/windows-client-issues.xlsx` (local-only)
-> **Issue details:** `docs/windows-client-dev/issues/WIN-<NNN>-<slug>.md` (local-only)
+> **最后更新：** 2026-11-27
+> **分支：** `feature/client-ui`
+> **HEAD：** `96fbf93 docs(windows): simplify status and index issues locally`
+> **同步状态：** 领先 `origin/feature/client-ui` 4 个提交；尚未推送
+> **工作区：** 仅有文档改动，无代码改动
+> **问题索引：** `docs/windows-client-dev/windows-client-issues.xlsx`（仅本地）
+> **问题详情：** `docs/windows-client-dev/issues/WIN-<NNN>-<slug>.md`（仅本地）
 
-**State:** M1-M5 are complete and M6 code is complete with most acceptance done. The
-remaining items are condition-blocked or bounded investigations, not missing M6
-implementation.
+**总体状态：** M1-M5 已完成，M6 代码完成且大部分验收已完成。剩余项均为受条件阻塞或范围受限的排查，而非缺少 M6 实现。
 
-Related docs: [Windows install/signing](windows-install.md) ·
-[Windows research](windows-client-research.md) ·
-[Development environment](windows-dev-environment.md) ·
-[P0 decisions](p0-decision-review.md) · [Desktop UI](client-ui.md)
+相关文档：[Windows 安装/签名](windows-install.md) ·
+[Windows 调研](windows-client-research.md) ·
+[开发环境](windows-dev-environment.md) ·
+[P0 决策](p0-decision-review.md) · [桌面 UI](client-ui.md)
 
 ---
 
-## 1. Snapshot
+## 1. 快照
 
-| Item | State |
+| 项目 | 状态 |
 |---|---|
-| Milestones | M1-M5 complete and committed; M6 code complete, acceptance mostly done |
-| Windows targets | Windows 10/11 x64; ARM64 deferred |
-| Installer | Per-machine MSI/WiX, unsigned development build; signing hooks ready |
-| Service | LocalSystem `rustvpn-clientd`, delayed auto-start, failure recovery |
-| Transport | Wintun L3 + in-process Ethernet shim; IPv4 only |
-| Validation hosts | Windows 10 physical host (split tunnel), Windows 11 VM (full tunnel and hardening) |
+| 里程碑 | M1-M5 已完成并提交；M6 代码完成，验收基本完成 |
+| Windows 目标平台 | Windows 10/11 x64；ARM64 延期 |
+| 安装程序 | 每机器安装的 MSI/WiX，未签名的开发构建；签名钩子已就绪 |
+| 服务 | LocalSystem `rustvpn-clientd`，延迟自动启动，失败恢复 |
+| 传输 | Wintun L3 + 进程内以太网 shim；仅 IPv4 |
+| 验证主机 | Windows 10 物理机（分流隧道）、Windows 11 虚拟机（全隧道与加固） |
 
-## 2. Milestones
+## 2. 里程碑
 
-| Phase | Code | Status | Acceptance summary |
+| 阶段 | 代码 | 状态 | 验收摘要 |
 |---|---|---|---|
-| M1 Core integration | `9bc1466` | Done | Platform-neutral `TapConfig`, Wintun backend, Ethernet shim, bounded async pump, engine wiring. Windows target builds; real E2E deferred to M6. |
-| M2 Service + IPC | `8cef993`, `8132f24` | Done | Named pipe, explicit DACL, peer identity, SCM/console daemon, tunnel lock. Windows IPC/lock tests and standard-user access pass. |
-| M3 Network configuration | `cac143a`, `06a092b` | Done | Address/routes/DNS/NRPT/IPv6 guard, anti-loop route, ACL-restricted netstate, crash cleanup. Real Windows contract bugs fixed and split-tunnel routing verified in M6. |
-| M4 GUI adaptation | `7b73a82` | Done | Profile ACLs, Credential Manager, HKCU autostart, locale, named-pipe info, pre-password daemon identity. RDP validation passed. |
-| M5 Packaging | `cb39124` | Done | MSI, LocalSystem service, RustVPN group, process-query DACL, Wintun pinning, signing hooks. Install, same-version upgrade, uninstall and standard-user access validated. |
-| M6 Hardening + E2E | `06a092b` … `7f05a3e` | Mostly done | Split/full tunnel plain+noise, DNS/NRPT, IPv6 block, disconnect fix, rekey/reconnect, link flap, forced-kill recovery, fuzz, iperf3. Condition-blocked items remain below. |
+| M1 核心集成 | `9bc1466` | 完成 | 平台中立的 `TapConfig`、Wintun 后端、以太网 shim、有界异步 pump、引擎接线。Windows 目标可构建；真实 E2E 延后到 M6。 |
+| M2 服务 + IPC | `8cef993`, `8132f24` | 完成 | 命名管道、显式 DACL、对等身份、SCM/控制台守护进程、隧道锁。Windows IPC/锁测试与标准用户访问通过。 |
+| M3 网络配置 | `cac143a`, `06a092b` | 完成 | 地址/路由/DNS/NRPT/IPv6 防护、防环路路由、ACL 受限的 netstate、崩溃清理。真实 Windows 契约缺陷已修复，分流隧道路由在 M6 中验证。 |
+| M4 GUI 适配 | `7b73a82` | 完成 | 配置 ACL、Credential Manager、HKCU 自启动、区域设置、命名管道信息、密码前守护进程身份校验。RDP 验证通过。 |
+| M5 打包 | `cb39124` | 完成 | MSI、LocalSystem 服务、RustVPN 组、进程查询 DACL、Wintun 固定、签名钩子。安装、同版本升级、卸载以及标准用户访问均已验证。 |
+| M6 加固 + E2E | `06a092b` … `7f05a3e` | 基本完成 | 分流/全隧道 plain+noise、DNS/NRPT、IPv6 阻断、断连修复、rekey/重连、链路抖动、强杀恢复、fuzz、iperf3。受条件阻塞的项列于下文。 |
 
-## 3. Validated on Windows
+## 3. 已在 Windows 上验证
 
-- **Split tunnel (Windows 10 physical):** handshake, ping 4/4 to both test addresses, TCP SSH banner through the tunnel, no default-route takeover.
-- **Full tunnel (Windows 11 VM, plain and noise):** default route moves to Wintun, anti-loop `/32` keeps the underlay path, NRPT `.` resolves through tunnel DNS, IPv6 `2000::/3` and `fc00::/7` blocked.
-- **Disconnect:** after the direct-cmdlet fix, the physical host survived >130 s; the next daemon start cleaned the anti-loop route/netstate and survived >145 s; the original default route stayed unchanged.
-- **Service restart:** direct startup cleanup with no Wintun adapter succeeded; firewall/NRPT cleanup is idempotent when rules are already absent.
-- **Rekey:** 60 s rekey test produced two rehandshakes in 140 s with 68/69 pings successful and no state flapping.
-- **Reconnect and link flap:** server outage recovered after reconnect; NIC down 12 s kept the session, down 30 s timed out and reconnected with routes restored.
-- **Crash recovery:** two forced daemon kills were followed by SCM restart and startup route/netstate cleanup; default route correct both times.
-- **Performance:** split-tunnel iperf3 about 174 Mbit/s VM→server and 150 Mbit/s reverse, average latency 4.9 ms; reverse direction shows retransmits (WIN-013).
-- **Fuzz:** 7 deterministic shim fuzz tests; `rustvpn-net` reports 118 passing tests.
-- **Packaging:** MSI static checks, real install, service/group state, standard-user pipe access, non-member denial, same-version upgrade, uninstall with profile preservation.
+- **分流隧道（Windows 10 物理机）：** 握手、对两个测试地址 ping 4/4、通过隧道取得 TCP SSH banner、默认路由未被接管。
+- **全隧道（Windows 11 虚拟机，plain 与 noise）：** 默认路由切换到 Wintun，防环路 `/32` 保留底层路径，NRPT `.` 经隧道 DNS 解析，IPv6 `2000::/3` 与 `fc00::/7` 被阻断。
+- **断开连接：** 采用直接 cmdlet 修复后，物理机存活 >130 秒；下一次守护进程启动清理了防环路路由/netstate 并存活 >145 秒；原始默认路由保持不变。
+- **服务重启：** 无 Wintun 适配器时的直接启动清理成功；当规则已不存在时，防火墙/NRPT 清理具备幂等性。
+- **Rekey：** 60 秒 rekey 测试在 140 秒内产生两次 rehandshake，ping 成功 68/69，状态无抖动。
+- **重连与链路抖动：** 服务器中断后经重连恢复；网卡断开 12 秒保持会话，断开 30 秒超时并重连且路由恢复。
+- **崩溃恢复：** 两次强制终止守护进程后，SCM 重启并执行启动时路由/netstate 清理；默认路由两次均正确。
+- **性能：** 分流隧道 iperf3 约 174 Mbit/s（虚拟机→服务器）与 150 Mbit/s（反向），平均延迟 4.9 ms；反向出现重传（WIN-013）。
+- **Fuzz：** 7 个确定性 shim fuzz 测试；`rustvpn-net` 报告 118 个通过测试。
+- **打包：** MSI 静态检查、真实安装、服务/组状态、标准用户管道访问、非成员拒绝、同版本升级、卸载并保留配置。
 
-## 4. Open investigations
+## 4. 未决排查
 
-| Issue | Symptom | Next step |
+| 问题 | 症状 | 下一步 |
 |---|---|---|
-| WIN-012 | `last_handshake_unix` stays null in connected status | Trace daemon Status path vs traffic-sampler publication; add a live timestamp test |
-| WIN-013 | Reverse iperf3 ~150 Mbit/s with 193 retransmits | Capture packets, compare with MSS clamp, inspect Wintun RX/queue counters |
-| WIN-014 | Crash cleanup takes ~10-15 s before reconnect is allowed | Replace PowerShell-heavy startup cleanup or batch it; publish cleanup progress |
+| WIN-012 | 已连接状态下 `last_handshake_unix` 仍为 null | 追踪守护进程 Status 路径与流量采样器发布逻辑；增加实时时间戳测试 |
+| WIN-013 | 反向 iperf3 约 150 Mbit/s，出现 193 次重传 | 抓包、与 MSS clamp 对比、检查 Wintun RX/队列计数器 |
+| WIN-014 | 崩溃清理需约 10-15 秒才允许重连 | 替换或批量执行重度依赖 PowerShell 的启动清理；发布清理进度 |
 
-## 5. Condition-blocked
+## 5. 受条件阻塞
 
-| Issue | Item | Blocker |
+| 问题 | 事项 | 阻塞原因 |
 |---|---|---|
-| WIN-016 | Sleep/hibernate recovery | VM exposes no usable suspend; use disposable physical hardware later |
-| WIN-017 | Internet egress through full tunnel | No NAT environment scoped to the tunnel test subnet |
-| WIN-018 | Windows CI first real run | Branch not pushed; no self-hosted elevated Windows runner registered |
-| WIN-019 | Authenticode signing | No EV/OV certificate or private key available; unsigned builds clearly marked |
+| WIN-016 | 睡眠/休眠恢复 | 虚拟机未提供可用的挂起；稍后使用一次性物理硬件 |
+| WIN-017 | 经全隧道访问互联网出口 | 无专用于隧道测试子网的 NAT 环境 |
+| WIN-018 | Windows CI 首次真实运行 | 分支未推送；未注册自托管的高权限 Windows runner |
+| WIN-019 | Authenticode 签名 | 无可用 EV/OV 证书或私钥；未签名构建已明确标记 |
 
-## 6. Known unsupported or deferred
+## 6. 已知不支持或延期
 
-| Issue | Capability | Decision |
+| 问题 | 能力 | 决定 |
 |---|---|---|
-| WIN-020 | Windows kill-switch | Not implemented; profile/guard reject it, UI shows unsupported. Windows is fail-open by design. |
-| WIN-021 | Windows MSS clamp | Deferred; connection warns and reports `mss_applied=false`. |
-| WIN-024 | IPv6 transport | IPv4-only shim. Full tunnel blocks global unicast/ULA; loopback/link-local/multicast stay local. |
-| WIN-015 | Encless/TCP mode | Deferred; AONT expansion (~4128 B) needs more outer capacity and has no Windows E2E. |
-| WIN-023 | DHCP-only server networks | Static-address MVP only; DHCP client not implemented. |
-| WIN-022 | Windows ARM64 | x64-only packaging and Wintun pinning; ARM64 needs a separate matrix. |
-| WIN-001 | True L2 features | Wintun L3 loses VLAN, broadcast discovery and non-IP EtherTypes; `tap-windows6` is documented as a future alternative only. |
+| WIN-020 | Windows kill-switch | 未实现；配置/防护层拒绝，UI 显示不支持。Windows 在设计上为 fail-open。 |
+| WIN-021 | Windows MSS clamp | 延期；连接时告警并报告 `mss_applied=false`。 |
+| WIN-024 | IPv6 传输 | 仅 IPv4 的 shim。全隧道阻断全局单播/ULA；环回/链路本地/组播保持本地。 |
+| WIN-015 | Encless/TCP 模式 | 延期；AONT 扩展（约 4128 B）需要更多外层容量，且无 Windows E2E。 |
+| WIN-023 | 仅 DHCP 的服务器网络 | 仅静态地址 MVP；未实现 DHCP 客户端。 |
+| WIN-022 | Windows ARM64 | 仅 x64 打包与 Wintun 固定；ARM64 需独立矩阵。 |
+| WIN-001 | 真正的 L2 特性 | Wintun L3 会丢失 VLAN、广播发现和非 IP EtherType；`tap-windows6` 仅作为未来备选记录在案。 |
 
-## 7. Pointers
+## 7. 参考入口
 
-- **Issue index (authoritative):** `docs/windows-client-dev/windows-client-issues.xlsx` — sheets `Issues`, `Summary`, `Legend`.
-- **Issue details:** `docs/windows-client-dev/issues/WIN-<NNN>-<slug>.md` — one issue per file, concise evidence and follow-up.
-- Both paths are **development-only and local-only**, excluded through `.git/info/exclude`, and must never be uploaded or committed.
-- Install/signing procedure: [windows-install.md](windows-install.md).
-- Architecture and rationale: [windows-client-research.md](windows-client-research.md).
-- Toolchain and VM setup: [windows-dev-environment.md](windows-dev-environment.md).
+- **问题索引（权威）：** `docs/windows-client-dev/windows-client-issues.xlsx` — 工作表 `问题列表`、`汇总`、`图例`。
+- **问题详情：** `docs/windows-client-dev/issues/WIN-<NNN>-<slug>.md` — 每个文件一个问题，含简洁的证据与后续。
+- 这两个路径**仅用于开发且仅本地**，通过 `.git/info/exclude` 排除，绝不能上传或提交。
+- 安装/签名流程：[windows-install.md](windows-install.md)。
+- 架构与理由：[windows-client-research.md](windows-client-research.md)。
+- 工具链与虚拟机搭建：[windows-dev-environment.md](windows-dev-environment.md)。
 
-## 8. Security and operability constraints
+## 8. 安全与可运维约束
 
-- Never store passwords, private keys, verifier secrets, real host credentials, or tunnel secrets in the status doc, Excel index or issue files. Use generic test-host descriptions.
-- The daemon runs as LocalSystem. Its named pipe uses an explicit protected DACL and peer token checks; process access is limited to query rights.
-- Production distribution must use a signed MSI. Unsigned development builds are marked in `UNSIGNED.txt`, Product comments and `docs\SIGNING.txt`.
-- Windows has no kill switch; do not claim Linux-equivalent fail-closed behavior.
-- Run connect/disconnect, route, DNS, NRPT, IPv6 and crash tests only on disposable VMs/hosts with a dedicated test subnet.
-- Do not modify existing VPNs, the production default route, DNS, NAT or firewall during acceptance.
-- Wintun must be loaded from the installed absolute path with the pinned SHA-256; it is not user-configurable.
-- Logs may include rejected client PID/SID lists but no passwords, profiles or key material.
+- 绝不在状态文档、Excel 索引或问题文件中存储密码、私钥、验证器密钥、真实主机凭据或隧道密钥。使用通用的测试主机描述。
+- 守护进程以 LocalSystem 运行。其命名管道使用显式受保护的 DACL 与对等令牌校验；进程访问仅限查询权限。
+- 生产分发必须使用已签名的 MSI。未签名的开发构建在 `UNSIGNED.txt`、Product comments 和 `docs\SIGNING.txt` 中标记。
+- Windows 没有 kill switch；不要声称具备与 Linux 等价的 fail-closed 行为。
+- 仅在一次性虚拟机/主机及专用测试子网上运行连接/断开、路由、DNS、NRPT、IPv6 和崩溃测试。
+- 验收期间不得修改现有 VPN、生产默认路由、DNS、NAT 或防火墙。
+- Wintun 必须从安装的绝对路径加载，并使用固定的 SHA-256；该项用户不可配置。
+- 日志可能包含被拒绝客户端的 PID/SID 列表，但不会包含密码、配置或密钥材料。
 
-## 9. Next actions
+## 9. 后续行动
 
-1. Trace the live status path and fix WIN-012 (`last_handshake_unix`), with a regression test.
-2. Capture the reverse iperf3 flow and evaluate MSS/path effects for WIN-013.
-3. Batch or replace the PowerShell-heavy startup cleanup to shorten the WIN-014 window.
-4. Build a disposable NAT environment and validate off-subnet egress (WIN-017).
-5. Validate sleep/resume on disposable physical hardware (WIN-016).
-6. Push the branch and run the client CI; register the protected self-hosted runner for E2E (WIN-018).
-7. Acquire an EV/OV certificate, sign GUI/daemon/MSI, and pin the publisher identity (WIN-019).
-8. Re-check encless/TCP only after an outer path with sufficient capacity is available (WIN-015).
+1. 追踪实时状态路径并修复 WIN-012（`last_handshake_unix`），附带回归测试。
+2. 抓取反向 iperf3 流量，评估 MSS/路径影响以处理 WIN-013。
+3. 批量化或替换重度依赖 PowerShell 的启动清理，以缩短 WIN-014 的窗口。
+4. 构建一次性 NAT 环境并验证子网外出口（WIN-017）。
+5. 在一次性物理硬件上验证睡眠/恢复（WIN-016）。
+6. 推送分支并运行客户端 CI；为 E2E 注册受保护的自托管 runner（WIN-018）。
+7. 获取 EV/OV 证书，签名 GUI/守护进程/MSI，并固定发布者身份（WIN-019）。
+8. 仅在具备足够容量的外层路径可用后，再重新评估 encless/TCP（WIN-015）。
 
-## 10. Update cadence
+## 10. 更新节奏
 
-- The Excel index is the issue register; every discovered, fixed, deferred or blocked item gets one `WIN-NNN` row and one matching Markdown file.
-- Update the Excel row and the issue Markdown together. Keep the status doc high-level: milestones, validated capabilities, blockers, decisions.
-- Record commits, changed files, tests and remaining risk in the issue files, not in long narratives here.
-- After every Windows code commit, update the HEAD/sync line, the milestone table and any changed validation bullets.
+- Excel 索引即问题登记册；每个被发现、已修复、延期或阻塞的项都对应一行 `WIN-NNN` 和一个匹配的 Markdown 文件。
+- 同时更新 Excel 行和问题 Markdown。状态文档保持高层视角：里程碑、已验证能力、阻塞项、决策。
+- 在问题文件中记录提交、变更文件、测试与剩余风险，而不是在此写长篇叙述。
+- 每次 Windows 代码提交后，更新 HEAD/同步行、里程碑表以及任何有变化的验证条目。
+- 发现新问题时，先添加对应的 Excel 行与 Markdown 文件，再刷新本文档中的高层摘要。
