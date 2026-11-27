@@ -24,7 +24,7 @@ use crate::lock::TunnelLock;
 use crate::mtu;
 #[cfg(unix)]
 use crate::mtu::OuterFamily;
-use crate::netcfg::{FirewallOptions, NetOptions, NetworkGuard};
+use crate::netcfg::{ConnectionCleanup, FirewallOptions, NetOptions, NetworkGuard};
 use crate::profile::ValidatedProfile;
 use crate::session::{resolve_endpoints, start_session, Endpoints, Session, SessionEnd};
 
@@ -147,6 +147,14 @@ impl Engine {
                             current = Some((cancel, handle));
                         }
                         Some(Command::Disconnect) => {
+                            // The IPC acknowledgement is sent as soon as the
+                            // command is queued, not when teardown completes.
+                            // Publish a distinct state so clients can tell the
+                            // difference instead of assuming `Ok` means idle.
+                            let _ = events.send(Event::State(EngineStatus {
+                                state: "disconnecting".into(),
+                                ..EngineStatus::default()
+                            }));
                             #[cfg(windows)]
                             let was_active = current.is_some();
                             stop_current(&mut current).await;
@@ -169,7 +177,7 @@ impl Engine {
                             // Windows hang and must be deferred to the next
                             // daemon start (before any adapter is opened).
                             #[cfg(windows)]
-                            if !was_active {
+                            if !connection_closed {
                                 if let Err(error) = crate::netcfg::cleanup_owned_network().await {
                                     emit_log(
                                         &events,
@@ -238,7 +246,11 @@ trait TeardownDevice {
     /// Stop the platform reader thread without closing the device.
     fn stop_reader(&self);
     /// Close the device (Windows: session shutdown + adapter close).
-    fn close(self);
+    ///
+    /// Returns whether the device really closed.  For [`Arc<Tap>`] this is
+    /// false when another strong reference leaked: the Wintun session would
+    /// still be live, so post-close address work must not run.
+    fn close(self) -> bool;
 }
 
 impl TeardownDevice for Arc<Tap> {
@@ -246,8 +258,10 @@ impl TeardownDevice for Arc<Tap> {
         Tap::stop_reader(self.as_ref());
     }
 
-    fn close(self) {
+    fn close(self) -> bool {
+        let last_reference = Arc::strong_count(&self) == 1;
         drop(self);
+        last_reference
     }
 }
 
@@ -263,15 +277,55 @@ impl TeardownDevice for Arc<Tap> {
 ///
 /// No network query is performed by this function or after its close step.
 /// Callers publish the idle status only once this returns.
-async fn teardown_connection<D, R, RFut>(device: D, remove_network: R)
+/// Returns the cleanup value and whether the device really closed.
+async fn teardown_connection<D, R, RFut, T>(device: D, remove_network: R) -> (T, bool)
 where
     D: TeardownDevice,
     R: FnOnce() -> RFut,
-    RFut: Future<Output = ()>,
+    RFut: Future<Output = T>,
 {
     device.stop_reader();
-    remove_network().await;
-    device.close();
+    let cleanup = remove_network().await;
+    let closed = device.close();
+    // Returned to the caller so it can clear the state file only after close.
+    (cleanup, closed)
+}
+
+/// Clean previous Windows network state before any adapter is opened.
+///
+/// Runs the daemon's own leftover state first, then dead-owner crash state.  A
+/// failure (or a state file still owned by another live process) refuses the
+/// connection instead of mutating a live Wintun session later.
+#[cfg(windows)]
+async fn cleanup_before_opening_adapter(events: &broadcast::Sender<Event>) -> anyhow::Result<()> {
+    let owned = crate::netcfg::cleanup_owned_network().await?;
+    if !owned.errors.is_empty() {
+        anyhow::bail!(
+            "cannot clean this client's previous network state: {}",
+            owned.errors.join("; ")
+        );
+    }
+    let stale = crate::netcfg::cleanup_stale_network().await?;
+    if stale.skipped_live_owner {
+        anyhow::bail!(
+            "another live RustVPN owner still owns Windows network state; refusing to open \
+             an adapter"
+        );
+    }
+    if !stale.errors.is_empty() {
+        anyhow::bail!(
+            "cannot clean previous Windows network state: {}",
+            stale.errors.join("; ")
+        );
+    }
+    for action in owned.actions.iter().chain(stale.actions.iter()) {
+        emit_log(
+            events,
+            "info",
+            format!("pre-connect network cleanup: {action}"),
+        );
+    }
+    Ok(())
 }
 
 /// Whether resolving `host` needs the temporary DNS allowance.
@@ -609,6 +663,20 @@ async fn run_connection(
             return;
         }
     };
+    // Windows: clean any previous RustVPN network state *before* opening the
+    // adapter.  This is the only safe time to run crash-recovery commands;
+    // install later refuses if state is still recorded, and nothing issues
+    // Remove-Net* against a live Wintun session.
+    #[cfg(windows)]
+    if let Err(error) = cleanup_before_opening_adapter(&events).await {
+        emit_error(&events, &spec, format!("Windows network state: {error:#}"));
+        emit_log(
+            &events,
+            "error",
+            format!("Windows network state: {error:#}"),
+        );
+        return;
+    }
     let tap = match Tap::open_with_config(&tap_config).await {
         Ok(tap) => Arc::new(tap),
         Err(error) => {
@@ -788,15 +856,24 @@ async fn run_connection(
                                 },
                             );
                         }
-                        Err(error) => {
+                        Err(failure) => {
+                            // P1-3: stop the data plane before rolling back the
+                            // partial network state.  No Remove-Net* command
+                            // may run while the peer tasks or shim reader can
+                            // still touch the Wintun session.
+                            let message = failure.message();
                             session.close(&stats_state).await;
-                            // The guard rolled back its own state.  Join the
-                            // Wintun reader before releasing the adapter so no
-                            // thread is inside a read while NDIS tears down.
                             tap.stop_reader();
+                            let keep_address = tap.adapter_created();
+                            let cleanup = failure.rollback(keep_address).await;
+                            let closed = Arc::strong_count(&tap) == 1;
                             drop(tap);
-                            emit_error(&events, &spec, format!("network setup: {error:#}"));
-                            emit_log(&events, "error", format!("network setup: {error:#}"));
+                            // The state file is cleared only after the adapter
+                            // close (and, for a pre-existing adapter, the
+                            // post-close address removal) has completed.
+                            cleanup.finish(closed).await;
+                            emit_error(&events, &spec, message.clone());
+                            emit_log(&events, "error", message);
                             emit_log(&events, "info", "tunnel stopped");
                             return;
                         }
@@ -907,15 +984,19 @@ async fn run_connection(
 
     #[cfg(unix)]
     let had_guard = guard.is_some();
+    // `created` decides the address policy: a created Wintun adapter removes
+    // its address with the device on close, while a pre-existing adapter
+    // persists and its address is removed after the session/handle close.
+    let keep_address = tap.adapter_created();
     // Every session above was closed by an awaited `session.close()` (which
     // joins the peer tasks), so no task holds a `Tap` clone anymore.  The
     // reader is stopped before any route/DNS command runs, and the adapter is
-    // closed only after the guard has removed what outlives it.  On Windows
-    // the guard keeps the profile address; the adapter close removes it.
-    teardown_connection(tap, || async {
-        if let Some(guard) = guard {
-            guard.remove_connection_state().await;
-        }
+    // closed only after the guard has removed what outlives it.
+    let (cleanup, closed) = teardown_connection(tap, || async {
+        let cleanup = match guard {
+            Some(guard) => guard.begin_connection_teardown(keep_address).await,
+            None => ConnectionCleanup::none(),
+        };
         // An explicit disconnect/stop must restore connectivity even if the
         // daemon only ever managed to bootstrap through a preserved crash
         // table.  A failed setup (which returns above without cancellation)
@@ -929,8 +1010,11 @@ async fn run_connection(
                 "removed the preserved kill switch on explicit stop; connectivity restored",
             );
         }
+        cleanup
     })
     .await;
+    // Only now, after the adapter close, may the state file be deleted.
+    cleanup.finish(closed).await;
     emit_log(&events, "info", "tunnel stopped");
 }
 
@@ -1294,29 +1378,42 @@ mod tests {
             self.log.lock().unwrap().push("stop-reader");
         }
 
-        fn close(self) {
+        fn close(self) -> bool {
             self.log.lock().unwrap().push("close-device");
+            true
         }
     }
 
     #[tokio::test]
-    async fn teardown_stops_reader_removes_state_then_closes_device() {
-        // Locks in the Windows teardown contract: no network command may run until
-        // the reader is stopped, and the device must close last (after which no
-        // network query is allowed).
+    async fn teardown_stops_reader_removes_state_then_closes_device_then_finalizes() {
+        // Locks in the Windows teardown contract: no network command may run
+        // until the reader is stopped; the device closes after state removal;
+        // and the state file is cleared (finalize) only after that close.
         let log = Arc::new(std::sync::Mutex::new(Vec::new()));
         let remove_log = log.clone();
-        teardown_connection(RecordingDevice { log: log.clone() }, || {
+        let finalize_log = log.clone();
+        let (cleanup, closed) = teardown_connection(RecordingDevice { log: log.clone() }, || {
             let remove_log = remove_log;
             async move {
                 remove_log.lock().unwrap().push("remove-network");
+                "state-cleanup-token"
             }
         })
         .await;
 
+        // Mirrors the caller: `cleanup.finish(closed)` runs after the close.
+        assert_eq!(cleanup, "state-cleanup-token");
+        assert!(closed, "the recording device reports a real close");
+        finalize_log.lock().unwrap().push("finish-state");
+
         assert_eq!(
             &*log.lock().unwrap(),
-            &["stop-reader", "remove-network", "close-device"]
+            &[
+                "stop-reader",
+                "remove-network",
+                "close-device",
+                "finish-state"
+            ]
         );
     }
 

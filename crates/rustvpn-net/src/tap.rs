@@ -314,6 +314,25 @@ impl Tap {
         &self.name
     }
 
+    /// Whether this process created the underlying adapter.
+    ///
+    /// Windows returns `false` when a pre-existing Wintun adapter was opened
+    /// instead of created.  Closing such an adapter does **not** remove the
+    /// device, so its profile address and connected route must be removed
+    /// explicitly after the session close.  Linux always reports `true`; its
+    /// guard teardown owns the address regardless.
+    pub fn adapter_created(&self) -> bool {
+        #[cfg(target_os = "windows")]
+        {
+            let TapBackend::Wintun(tap) = self.inner.as_ref();
+            tap.created()
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            true
+        }
+    }
+
     /// Stop the platform's dedicated data-plane reader thread **without**
     /// closing the device.
     ///

@@ -393,35 +393,50 @@ existing `windows-shim.yml` prototype workflow is separate.
   (removing routes/address while the Wintun adapter is still open), the
   Wintun/NDIS adapter teardown, and an immediate post-disconnect OS network
   query (WMI/netsh) are all suspects.
-- **Teardown fix in the working tree (not committed, NOT yet verified on
-  Windows):**
+- **Teardown fix in the working tree (review P1/P2 fixes, not committed, NOT
+  yet verified on Windows):**
   1. `Session::close` is now async and cancels **and joins** every peer task;
      tasks no longer keep the last `Arc<Tap>`, so the adapter close is
-     deterministic and happens after the data plane is stopped.
+     deterministic. Also `PeerHandle` cancels its tasks on Drop even if
+     `shutdown` is never called (the server disarms this guard explicitly
+     because it keeps the cancellation token in its own entry).
   2. The Windows shim's dedicated blocking Wintun reader is explicitly joined
-     (`Tap::stop_reader`) before any route/DNS command runs.
-  3. The disconnect path no longer issues `Remove-NetIPAddress`: it removes
-     NRPT, DNS, split/default routes (anti-loop `/32` last), the interface
-     metric and the IPv6 firewall rule, then closes the Wintun session and
-     adapter. Closing the created adapter removes the profile address and its
-     implicit connected route as one NDIS teardown.
-  4. No `Get-Net*`/PowerShell/netsh query runs after the adapter close; a
-     failed cleanup is retried on the next daemon start (before any adapter is
-     opened). Idle status is published only after the close.
-  Install failure rollback keeps the address for the same adapter close.
-  Unit tests cover the order, reader join, peer-task join/abort and the
-  address-retaining cleanup on Linux; Linux teardown behaviour is unchanged.
+     (`Tap::stop_reader`) before any route/DNS command runs. A cancelled
+     `ShimPump::recv` restores its receiver, so a reconnect/reused adapter can
+     still receive.
+  3. The disconnect path no longer issues `Remove-NetIPAddress` **before** the
+     close: it removes NRPT, DNS, split/default routes (anti-loop `/32` last),
+     the interface metric and the IPv6 firewall rule, but keeps the profile
+     address and does **not** clear `netstate.json` yet.
+  4. The Wintun session/adapter is closed next. Only then does
+     `ConnectionCleanup::finish` delete the state file. For a **created**
+     adapter (`created=true`) the address and connected route go with the
+     device; for a **pre-existing** adapter (`created=false`, opened rather than
+     created) the address is removed only after the session/handle close, and
+     the state file is kept if that removal fails.
+  5. No `Get-Net*`/PowerShell/netsh query runs after the adapter close; the
+     `idle` status is published last. The IPC `Disconnect` acknowledgement only
+     means the command was queued — the engine publishes `disconnecting` first
+     and `idle` after teardown.
+  Install failure rollback is deferred to the engine: it stops the peer
+  tasks/reader, rolls back the returned partial state, closes the adapter, then
+  clears state. Previous-state cleanup runs **before** the adapter is opened;
+  install refuses if state is still present, so no `Remove-Net*` ever runs
+  against a live Wintun session. Unit tests cover these orderings and the
+  `created` policy on Linux; Linux teardown behaviour is unchanged.
 - **Still unverified:** this is a code-level hypothesis. Do not use
   connect/disconnect on a host you cannot physically recover. A disposable VM
   must run the matrix in the status document before the physical host is used:
   (1) disconnect with no OS query, wait 120 s, check ARP/ping/SSH; (2) query
   after a 60 s delay; (3) bisect the old build (close adapter only vs remove
   address only); (4) injected cleanup failure + daemon restart; (5) install
-  failure rollback; (6) full-tunnel DNS/NRPT/IPv6 disconnect. If the VM still
-  hangs, the cause is Wintun/NDIS close itself, not the explicit address
-  removal. Disconnect cleanup, crash recovery, full-tunnel DNS/NRPT/IPv6,
-  resume/network-switch and performance remain unverified; see the status
-  document.
+  failure rollback; (6) pre-existing (`created=false`) adapter disconnect and
+  the post-close address removal; (7) reconnect/reuse adapter after a cancelled
+  read; (8) IPC `disconnecting`/`idle`; (9) full-tunnel DNS/NRPT/IPv6
+  disconnect. If the VM still hangs, the cause is Wintun/NDIS close itself, not
+  the explicit address removal. Disconnect cleanup, crash recovery, full-tunnel
+  DNS/NRPT/IPv6, resume/network-switch and performance remain unverified; see
+  the status document.
 - If a test host was left with this build installed, uninstall the test MSI and
   delete any temporary credential/profile directories after verifying the
   network state file has been cleaned.

@@ -724,6 +724,11 @@ async fn handle_connection(
                 }
             }
             Request::Disconnect => match shared.commands.send(Command::Disconnect).await {
+                // `Ok` means the command was queued, not that teardown has
+                // finished.  The engine first publishes `disconnecting` and
+                // then `idle` after the adapter close; clients must wait for
+                // the `idle` event (event subscription/status) rather than
+                // treating this response as completion.
                 Ok(()) => Response::Ok,
                 Err(_) => Response::Error {
                     message: "engine unavailable".into(),

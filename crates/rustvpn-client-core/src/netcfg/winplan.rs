@@ -1001,6 +1001,19 @@ pub struct InstallContext<'a> {
     pub owner: OwnerToken,
 }
 
+/// Result of a failed install that may have applied some state.
+///
+/// The caller must stop the data plane (peer tasks and the Wintun reader)
+/// before rolling `state` back, and must clear the state file only after the
+/// adapter close.  `state` is `None` when the failure happened before any
+/// mutation.
+#[derive(Debug)]
+pub struct PartialInstall {
+    pub error: anyhow::Error,
+    pub state: Option<PersistedState>,
+}
+
+#[cfg(test)]
 pub async fn install_with(
     ctx: InstallContext<'_>,
     spec: &ProfileSpec,
@@ -1008,14 +1021,45 @@ pub async fn install_with(
     inner_mtu: usize,
     options: NetOptions,
 ) -> Result<PersistedState> {
-    // Everything up to the adapter checks is read-only.  Mutating steps run in
-    // `install_steps`; if any of them fails, the recorded state is used to roll
-    // back exactly what was added before the error is returned.
-    // A state file from a crashed instance must be cleaned before this install
-    // so its routes/rules cannot be mistaken for user configuration.
+    install_with_partial(ctx, spec, outer, inner_mtu, options)
+        .await
+        .map_err(|failure| failure.error)
+}
+
+/// Like the error-only test helper, but hands a partially applied state back
+/// on failure.
+///
+/// This is the engine-facing form: rollback must happen only after the data
+/// plane has been stopped, so `install_with_partial` never mutates the network
+/// or clears the state file on the error path.
+pub async fn install_with_partial(
+    ctx: InstallContext<'_>,
+    spec: &ProfileSpec,
+    outer: Option<SocketAddr>,
+    inner_mtu: usize,
+    options: NetOptions,
+) -> std::result::Result<PersistedState, PartialInstall> {
+    let mut state = None;
+    match install_inner(&ctx, spec, outer, inner_mtu, options, &mut state).await {
+        Ok(()) => Ok(state.expect("a successful install records its state")),
+        Err(error) => Err(PartialInstall { error, state }),
+    }
+}
+
+async fn install_inner(
+    ctx: &InstallContext<'_>,
+    spec: &ProfileSpec,
+    outer: Option<SocketAddr>,
+    inner_mtu: usize,
+    options: NetOptions,
+    state_out: &mut Option<PersistedState>,
+) -> Result<()> {
+    // A previous state file must have been cleaned *before* the adapter was
+    // opened (the engine does that).  Never issue Remove-Net* against a live
+    // Wintun session here: refuse instead of mutating another connection's
+    // state, and let the caller retry the pre-open cleanup.
     if let Some(previous) = ctx.store.load()? {
-        // State owned by this process is a leftover from an interrupted cleanup
-        // and is safe to retry.  State owned by another live process is not.
+        // State owned by another live process is definitely not ours.
         if previous.owner != ctx.owner && ctx.probe.is_alive(&previous.owner) {
             bail!(
                 "another RustVPN network guard is active (pid {}); refusing to touch its \
@@ -1023,15 +1067,12 @@ pub async fn install_with(
                 previous.owner.pid
             );
         }
-        let report = cleanup_state(ctx.runner, &previous).await;
-        if !report.errors.is_empty() {
-            bail!(
-                "cannot clean network state left by pid {}: {}",
-                previous.owner.pid,
-                report.errors.join("; ")
-            );
-        }
-        ctx.store.clear()?;
+        bail!(
+            "previous RustVPN network state (owner pid {}) is still recorded at {}; the daemon \
+             must clean it before opening an adapter",
+            previous.owner.pid,
+            ctx.store.path().display()
+        );
     }
 
     if options.firewall.kill_switch || spec.kill_switch {
@@ -1092,7 +1133,7 @@ pub async fn install_with(
 
     let mut state = PersistedState::new(ctx.owner, &spec.iface, adapter_index);
     if let Err(error) = install_steps(
-        &ctx,
+        ctx,
         spec,
         &plan,
         outer,
@@ -1103,22 +1144,14 @@ pub async fn install_with(
     )
     .await
     {
-        // The engine closes the Wintun adapter immediately after a failed
-        // install, so keep the profile address here as well: the adapter close
-        // removes it together with its implicit connected route, avoiding a
-        // `Remove-NetIPAddress` against a live session.
-        let report = cleanup_state_with(ctx.runner, &state, false).await;
-        if report.ok() {
-            let _ = ctx.store.clear();
-        }
-        let suffix = if report.ok() {
-            "rollback completed".to_string()
-        } else {
-            format!("rollback incomplete: {}", report.errors.join("; "))
-        };
-        return Err(error.context(format!("network setup failed ({suffix})")));
+        // Hand the partial state to the caller.  It stops the data plane and
+        // rolls back after the peer tasks and Wintun reader are stopped; the
+        // state file is cleared only after the adapter close.
+        *state_out = Some(state);
+        return Err(error.context("network setup failed"));
     }
-    Ok(state)
+    *state_out = Some(state);
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1561,6 +1594,104 @@ impl CleanupReport {
     pub fn ok(&self) -> bool {
         self.errors.is_empty()
     }
+}
+
+/// Clear the state file only when cleanup completed.
+///
+/// Call this **after** the Wintun adapter has been closed (or when no adapter
+/// is open at all).  A crash/hang in the close window then leaves the recovery
+/// record in place for the next daemon start instead of silently losing it.
+pub fn clear_state_if_clean(store: &dyn StateStore, report: &CleanupReport) -> Result<bool> {
+    if report.ok() {
+        store.clear()?;
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
+
+/// Remove one recorded address **after** the Wintun session/adapter handle has
+/// been closed.
+///
+/// This is only for a pre-existing adapter (`created == false`): closing it
+/// does not remove the Wintun device, so the profile address and its implicit
+/// connected route outlive the handle.  The adapter device still exists, but
+/// this process no longer has an open Wintun session, so the removal does not
+/// run against a live session.
+pub async fn cleanup_recorded_address(
+    runner: &dyn WinRunner,
+    iface: &str,
+    address: &PersistedAddress,
+) -> CleanupReport {
+    let mut report = CleanupReport::default();
+    let adapters = match runner.run(&WinCommand::ListAdapters).await {
+        Ok(text) => match parse_adapters(&text) {
+            Ok(adapters) => Some(adapters),
+            Err(error) => {
+                report.errors.push(format!("list adapters: {error:#}"));
+                None
+            }
+        },
+        Err(error) => {
+            report.errors.push(format!("list adapters: {error:#}"));
+            None
+        }
+    };
+    let alias_matches = adapters
+        .as_ref()
+        .and_then(|adapters| {
+            adapters
+                .iter()
+                .find(|adapter| adapter.ifindex == address.ifindex)
+                .map(|adapter| adapter.name.eq_ignore_ascii_case(iface))
+        })
+        .unwrap_or(false);
+    if !alias_matches {
+        report.actions.push(format!(
+            "skip address removal on interface {}: index now belongs to another adapter or is gone",
+            address.ifindex
+        ));
+        return report;
+    }
+
+    match runner
+        .run(&WinCommand::GetIpv4Addresses(address.ifindex))
+        .await
+    {
+        Ok(text) => match parse_addresses(&text) {
+            Ok(entries)
+                if entries.iter().any(|entry| {
+                    entry.address == address.address && entry.prefix_len == address.prefix_len
+                }) =>
+            {
+                match runner
+                    .run(&WinCommand::RemoveIpAddress {
+                        ifindex: address.ifindex,
+                        address: address.address,
+                    })
+                    .await
+                {
+                    Ok(_) => report.actions.push(format!(
+                        "remove address {}/{} on pre-existing adapter after close",
+                        address.address, address.prefix_len
+                    )),
+                    Err(error) => report
+                        .errors
+                        .push(format!("remove address {}: {error:#}", address.address)),
+                }
+            }
+            Ok(_) => report.actions.push(format!(
+                "address {} on interface {} already absent",
+                address.address, address.ifindex
+            )),
+            Err(error) => report.errors.push(format!("read addresses: {error:#}")),
+        },
+        Err(error) => report.actions.push(format!(
+            "skip address removal on interface {}: {error:#}",
+            address.ifindex
+        )),
+    }
+    report
 }
 
 /// Remove everything recorded in `state`, verifying each entry before touching
@@ -2562,6 +2693,26 @@ mod tests {
         }
     }
 
+    /// Simulate the engine's install-failure rollback: the data plane is
+    /// already stopped, no address is removed before the close, a pre-existing
+    /// adapter's address is removed after the close, and the state file is
+    /// cleared last.
+    async fn rollback_after_stop(
+        system: &FakeSystem,
+        store: &TempStore,
+        state: &PersistedState,
+        created_adapter: bool,
+    ) {
+        let report = cleanup_state_with(system, state, false).await;
+        assert!(report.ok(), "{report:?}");
+        if !created_adapter {
+            let address = state.address.as_ref().expect("recorded address");
+            let report = cleanup_recorded_address(system, &state.iface, address).await;
+            assert!(report.ok(), "{report:?}");
+        }
+        assert!(store.clear().is_ok());
+    }
+
     #[tokio::test]
     async fn full_tunnel_installs_anti_loop_before_default_and_dns_nrpt_ipv6() {
         let system = FakeSystem::new();
@@ -2725,7 +2876,7 @@ mod tests {
             .push(route("192.168.50.0/24", 12, "192.168.1.1", 25));
         let store = TempStore::new("conflict");
         let probe = Probe { alive: false };
-        let error = install_with(
+        let failure = install_with_partial(
             ctx(&system, &store, &probe),
             &split_spec(),
             Some("203.0.113.10:1194".parse().unwrap()),
@@ -2735,18 +2886,22 @@ mod tests {
         .await
         .unwrap_err();
         assert!(
-            format!("{error:#}").contains("refusing to overwrite"),
-            "{error:#}"
+            format!("{:#}", failure.error).contains("refusing to overwrite"),
+            "{:#}",
+            failure.error
         );
-        // Routes are rolled back, but the address added before the conflict is
-        // left for the engine's adapter close (which follows every failed
-        // install) instead of being removed against the live session.
+        let state = failure.state.expect("partial state");
+        // The engine stops the data plane and rolls back after this call, with
+        // a created adapter: routes are removed, the address is kept for the
+        // adapter close, and no Remove-NetIPAddress runs against the session.
+        rollback_after_stop(&system, &store, &state, true).await;
         assert!(!system
             .commands()
             .iter()
             .any(|command| matches!(command, WinCommand::RemoveIpAddress { .. })));
         assert_eq!(system.addresses.lock().unwrap().len(), 1);
         assert!(system.routes.lock().unwrap().len() == 1);
+        assert!(store.load().unwrap().is_none());
     }
 
     #[tokio::test]
@@ -2761,7 +2916,7 @@ mod tests {
         system.interfaces.lock().unwrap()[1].metric = 1;
         let store = TempStore::new("takeover");
         let probe = Probe { alive: false };
-        let error = install_with(
+        let failure = install_with_partial(
             ctx(&system, &store, &probe),
             &full_spec(),
             Some("203.0.113.10:1194".parse().unwrap()),
@@ -2771,9 +2926,12 @@ mod tests {
         .await
         .unwrap_err();
         assert!(
-            format!("{error:#}").contains("would still win"),
-            "{error:#}"
+            format!("{:#}", failure.error).contains("would still win"),
+            "{:#}",
+            failure.error
         );
+        let state = failure.state.expect("partial state");
+        rollback_after_stop(&system, &store, &state, true).await;
         // The address is left for the following adapter close; the competing
         // physical default route is untouched.
         assert!(!system
@@ -2782,6 +2940,7 @@ mod tests {
             .any(|command| matches!(command, WinCommand::RemoveIpAddress { .. })));
         assert_eq!(system.addresses.lock().unwrap().len(), 1);
         assert_eq!(system.routes.lock().unwrap().len(), 1);
+        assert!(store.load().unwrap().is_none());
     }
 
     #[tokio::test]
@@ -2813,7 +2972,7 @@ mod tests {
         system.fail_on("add-route");
         let store = TempStore::new("inject");
         let probe = Probe { alive: false };
-        let error = install_with(
+        let failure = install_with_partial(
             ctx(&system, &store, &probe),
             &full_spec(),
             Some("203.0.113.10:1194".parse().unwrap()),
@@ -2823,12 +2982,15 @@ mod tests {
         .await
         .unwrap_err();
         assert!(
-            format!("{error:#}").contains("injected add route failure"),
-            "{error:#}"
+            format!("{:#}", failure.error).contains("injected add route failure"),
+            "{:#}",
+            failure.error
         );
-        // Rollback removes the routes/DNS/NRPT it added, but deliberately
-        // leaves the profile address for the adapter close (which follows in
-        // the engine and removes the address + connected route together).
+        let state = failure.state.expect("partial state");
+        // Rollback happens after the data plane is stopped.  For a created
+        // adapter it removes routes/DNS/NRPT but leaves the profile address
+        // for the adapter close; the state file is cleared only after that.
+        rollback_after_stop(&system, &store, &state, true).await;
         assert!(
             !system
                 .commands()
@@ -2843,7 +3005,7 @@ mod tests {
         assert!(system.routes.lock().unwrap().is_empty());
         assert!(
             store.load().unwrap().is_none(),
-            "state file must be removed"
+            "state file is cleared after the close"
         );
     }
 
@@ -2999,6 +3161,92 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn created_adapter_keeps_the_address_preexisting_adapter_removes_it() {
+        // created=true: no Remove-NetIPAddress, the address is left for the
+        // adapter close to remove together with the device.
+        let created_system = FakeSystem::new();
+        let created_store = TempStore::new("created-adapter");
+        let probe = Probe { alive: false };
+        let created_state = install_with(
+            ctx(&created_system, &created_store, &probe),
+            &full_spec(),
+            Some("203.0.113.10:1194".parse().unwrap()),
+            1500,
+            NetOptions::default(),
+        )
+        .await
+        .unwrap();
+        let report = cleanup_state_with(&created_system, &created_state, false).await;
+        assert!(report.ok(), "{report:?}");
+        assert!(!created_system
+            .commands()
+            .iter()
+            .any(|command| matches!(command, WinCommand::RemoveIpAddress { .. })));
+        assert_eq!(created_system.addresses.lock().unwrap().len(), 1);
+
+        // created=false: closing the handle leaves the device and its address.
+        // The engine removes the address only after the session/handle close.
+        let pre_system = FakeSystem::new();
+        let pre_store = TempStore::new("preexisting-adapter");
+        let pre_state = install_with(
+            ctx(&pre_system, &pre_store, &probe),
+            &full_spec(),
+            Some("203.0.113.10:1194".parse().unwrap()),
+            1500,
+            NetOptions::default(),
+        )
+        .await
+        .unwrap();
+        let report = cleanup_state_with(&pre_system, &pre_state, false).await;
+        assert!(report.ok(), "{report:?}");
+        assert!(
+            !pre_system
+                .commands()
+                .iter()
+                .any(|command| matches!(command, WinCommand::RemoveIpAddress { .. })),
+            "no address removal may run before the session close"
+        );
+        assert_eq!(pre_system.addresses.lock().unwrap().len(), 1);
+
+        let address = pre_state.address.as_ref().expect("recorded address");
+        let report = cleanup_recorded_address(&pre_system, &pre_state.iface, address).await;
+        assert!(report.ok(), "{report:?}");
+        assert!(pre_system
+            .commands()
+            .iter()
+            .any(|command| matches!(command, WinCommand::RemoveIpAddress { .. })));
+        assert!(pre_system.addresses.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn state_file_survives_cleanup_until_after_the_adapter_close() {
+        // P1-2: a crash/teardown ordering bug must not delete the only
+        // recovery record before the Wintun adapter close returns.
+        let system = FakeSystem::new();
+        let store = TempStore::new("clear-after-close");
+        let probe = Probe { alive: false };
+        let state = install_with(
+            ctx(&system, &store, &probe),
+            &full_spec(),
+            Some("203.0.113.10:1194".parse().unwrap()),
+            1500,
+            NetOptions::default(),
+        )
+        .await
+        .unwrap();
+        let report = cleanup_state_with(&system, &state, false).await;
+        assert!(report.ok(), "{report:?}");
+        assert!(
+            store.load().unwrap().is_some(),
+            "cleanup must leave the state file until the caller clears it after close"
+        );
+
+        // The caller runs this only after the adapter close returned.
+        assert!(clear_state_if_clean(&store, &report).unwrap());
+        assert!(store.load().unwrap().is_none());
+    }
+
+    #[tokio::test]
     async fn crash_cleanup_removes_the_address_after_routes_and_nrpt() {
         // Crash/stale cleanup has no following adapter close, so it must still
         // remove the address; the order keeps routes/NRPT gone first so a
@@ -3104,6 +3352,53 @@ mod tests {
         let report = cleanup_stale_with(&system, &store, &probe).await.unwrap();
         assert!(report.ok());
         assert!(system.commands().is_empty());
+    }
+
+    #[tokio::test]
+    async fn install_refuses_previous_state_without_mutating_a_live_adapter() {
+        // P1-3: previous-state cleanup must run before an adapter is opened.
+        // If it was not done, install must refuse instead of issuing
+        // Remove-Net* against the still-open Wintun session.
+        let system = FakeSystem::new();
+        let store = TempStore::new("previous-refuse");
+        let probe = Probe { alive: false };
+        install_with(
+            ctx(&system, &store, &probe),
+            &full_spec(),
+            Some("203.0.113.10:1194".parse().unwrap()),
+            1500,
+            NetOptions::default(),
+        )
+        .await
+        .unwrap();
+        let before = system.commands().len();
+        let addresses_before = system.addresses.lock().unwrap().clone();
+        let routes_before = system.routes.lock().unwrap().clone();
+
+        let error = install_with(
+            ctx(&system, &store, &probe),
+            &full_spec(),
+            Some("203.0.113.10:1194".parse().unwrap()),
+            1500,
+            NetOptions::default(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("previous RustVPN network state"),
+            "{error:#}"
+        );
+        assert_eq!(
+            system.commands().len(),
+            before,
+            "no network command may run while refusing previous state"
+        );
+        assert_eq!(*system.addresses.lock().unwrap(), addresses_before);
+        assert_eq!(*system.routes.lock().unwrap(), routes_before);
+        assert!(
+            store.load().unwrap().is_some(),
+            "state must remain for the pre-open cleanup"
+        );
     }
 
     #[tokio::test]

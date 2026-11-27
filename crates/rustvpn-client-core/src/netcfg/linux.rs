@@ -131,6 +131,49 @@ pub async fn cleanup_stale_mss(scope: &str) {
     firewall::cleanup_stale_mss(scope).await;
 }
 
+/// A failed install that may have applied some state.
+///
+/// Linux keeps its historical rollback operations, but the engine performs them
+/// only after stopping the data plane, so the order is uniform with Windows.
+pub struct InstallFailure {
+    pub error: anyhow::Error,
+    pub guard: Option<NetworkGuard>,
+}
+
+impl InstallFailure {
+    fn before(error: anyhow::Error) -> Self {
+        Self { error, guard: None }
+    }
+
+    pub fn message(&self) -> String {
+        format!("{:#}", self.error)
+    }
+
+    /// Roll back the partial state after the peer tasks have been stopped.
+    ///
+    /// Linux always removes its address as part of `remove()`, so `keep_address`
+    /// is ignored and the historical Linux teardown order is unchanged.
+    pub async fn rollback(self, _keep_address: bool) -> ConnectionCleanup {
+        match self.guard {
+            Some(guard) => guard.begin_connection_teardown(false).await,
+            None => ConnectionCleanup::none(),
+        }
+    }
+}
+
+/// Linux has no deferred state file or adapter device; teardown is complete
+/// before the TAP is dropped.
+#[derive(Default)]
+pub struct ConnectionCleanup;
+
+impl ConnectionCleanup {
+    pub fn none() -> Self {
+        ConnectionCleanup
+    }
+
+    pub async fn finish(self, _closed: bool) {}
+}
+
 pub struct NetworkGuard {
     ip: PathBuf,
     enabled: bool,
@@ -158,18 +201,24 @@ impl NetworkGuard {
         outer: Option<SocketAddr>,
         inner_mtu: usize,
         options: NetOptions,
-    ) -> Result<Self> {
+    ) -> std::result::Result<Self, InstallFailure> {
         if spec.address.trim().is_empty() && !spec.routes.is_empty() {
-            bail!("profile has routes but no address");
+            return Err(InstallFailure::before(anyhow!(
+                "profile has routes but no address"
+            )));
         }
         if spec.ipv6 {
-            bail!("IPv6 is not implemented");
+            return Err(InstallFailure::before(anyhow!("IPv6 is not implemented")));
         }
         if has_default_route(&spec.routes) && outer.is_none() {
-            bail!("cannot install a default route without resolving the outer endpoint");
+            return Err(InstallFailure::before(anyhow!(
+                "cannot install a default route without resolving the outer endpoint"
+            )));
         }
         if options.firewall.kill_switch && !has_default_route(&spec.routes) {
-            bail!("kill_switch is only supported for full-tunnel profiles");
+            return Err(InstallFailure::before(anyhow!(
+                "kill_switch is only supported for full-tunnel profiles"
+            )));
         }
 
         let ip = ip_bin();
@@ -188,8 +237,12 @@ impl NetworkGuard {
         };
 
         if let Err(error) = guard.apply(spec, outer, inner_mtu, options).await {
-            guard.remove().await;
-            return Err(error);
+            // Do not roll back here: the engine stops the data plane first and
+            // then calls `InstallFailure::rollback`.
+            return Err(InstallFailure {
+                error,
+                guard: Some(guard),
+            });
         }
         Ok(guard)
     }
@@ -471,9 +524,11 @@ impl NetworkGuard {
     /// anti-loop route, IPv6 blackhole, DNS revert, firewall last), so this is
     /// exactly [`Self::remove`].  The method exists so the engine can share one
     /// teardown call with Windows, where the address is deliberately retained
-    /// for the adapter close.
-    pub async fn remove_connection_state(self) {
+    /// for the adapter close.  `keep_address` is ignored: Linux has no persistent
+    /// adapter whose close would remove the address.
+    pub async fn begin_connection_teardown(self, _keep_address: bool) -> ConnectionCleanup {
         self.remove().await;
+        ConnectionCleanup::none()
     }
 
     /// Whether the MSS clamp table was applied successfully.

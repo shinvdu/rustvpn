@@ -102,6 +102,24 @@ impl WireWriter {
     }
 }
 
+/// Cancels a token when dropped.
+///
+/// `PeerHandle` deliberately does **not** implement `Drop` so callers can move
+/// its public fields out.  This guard field gives the same "cancel on drop"
+/// behaviour without making the struct non-movable.
+struct CancelOnDrop {
+    token: CancellationToken,
+    armed: bool,
+}
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        if self.armed {
+            self.token.cancel();
+        }
+    }
+}
+
 pub struct PeerHandle {
     pub stats: Arc<LiveStats>,
     pub cancel: CancellationToken,
@@ -112,6 +130,8 @@ pub struct PeerHandle {
     /// reference to their join handles so [`Self::shutdown`] can join (or
     /// abort) them before the caller closes the shared TAP/Wintun device.
     tasks: Vec<JoinHandle<()>>,
+    /// Cancels the tasks even if the handle is dropped without `shutdown`.
+    _cancel_on_drop: CancelOnDrop,
 }
 
 impl PeerHandle {
@@ -123,6 +143,17 @@ impl PeerHandle {
     /// This is idempotent: a second call finds no tasks left.
     pub async fn shutdown(&mut self) {
         join_tasks_after_cancel(&self.cancel, &mut self.tasks, TASK_JOIN_TIMEOUT).await;
+    }
+
+    /// Disarm the cancel-on-drop guard.
+    ///
+    /// The server splits the handle into its `PeerEntry` fields and drops the
+    /// handle right away while keeping the cancellation token for its own
+    /// lifecycle; the guard must not fire in that case.  The client keeps it
+    /// armed, so dropping a `Session` (or a handle on an error path) cancels
+    /// the peer tasks.
+    pub fn disarm_cancel_on_drop(&mut self) {
+        self._cancel_on_drop.armed = false;
     }
 }
 
@@ -553,11 +584,15 @@ pub fn spawn_udp_peer(
     )));
     PeerHandle {
         stats,
-        cancel,
+        cancel: cancel.clone(),
         outbound: outbound_tx,
         inbound: Some(inbound_tx),
         events: events_rx,
         tasks,
+        _cancel_on_drop: CancelOnDrop {
+            token: cancel,
+            armed: true,
+        },
     }
 }
 
@@ -615,11 +650,15 @@ pub fn spawn_tcp(
     )));
     PeerHandle {
         stats,
-        cancel,
+        cancel: cancel.clone(),
         outbound: outbound_tx,
         inbound: None,
         events: events_rx,
         tasks,
+        _cancel_on_drop: CancelOnDrop {
+            token: cancel,
+            armed: true,
+        },
     }
 }
 
@@ -776,15 +815,72 @@ mod tests {
         let stats = LiveStats::new("test".into(), [1u8; 16], false, 0, false, 1515);
         let mut handle = PeerHandle {
             stats,
-            cancel,
+            cancel: cancel.clone(),
             outbound,
             inbound: None,
             events,
             tasks: Vec::new(),
+            _cancel_on_drop: CancelOnDrop {
+                token: cancel,
+                armed: true,
+            },
         };
         handle.shutdown().await;
         // A second call is a no-op and must not panic or block.
         handle.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn dropping_the_handle_cancels_the_peer_tasks() {
+        let cancel = CancellationToken::new();
+        let probe = cancel.clone();
+        let (outbound, _rx) = mpsc::channel(1);
+        let (_events_tx, events) = mpsc::channel(1);
+        let stats = LiveStats::new("test".into(), [1u8; 16], false, 0, false, 1515);
+        let handle = PeerHandle {
+            stats,
+            cancel: cancel.clone(),
+            outbound,
+            inbound: None,
+            events,
+            tasks: Vec::new(),
+            _cancel_on_drop: CancelOnDrop {
+                token: cancel,
+                armed: true,
+            },
+        };
+        assert!(!probe.is_cancelled());
+        drop(handle);
+        assert!(
+            probe.is_cancelled(),
+            "dropping the handle must cancel its peer tasks"
+        );
+    }
+
+    #[tokio::test]
+    async fn disarmed_handle_does_not_cancel_on_drop() {
+        // The server extracts the token into its own entry and drops the
+        // handle; it must not cancel the just-created peer.
+        let cancel = CancellationToken::new();
+        let probe = cancel.clone();
+        let (outbound, _rx) = mpsc::channel(1);
+        let (_events_tx, events) = mpsc::channel(1);
+        let stats = LiveStats::new("test".into(), [1u8; 16], false, 0, false, 1515);
+        let mut handle = PeerHandle {
+            stats,
+            cancel: cancel.clone(),
+            outbound,
+            inbound: None,
+            events,
+            tasks: Vec::new(),
+            _cancel_on_drop: CancelOnDrop {
+                token: cancel,
+                armed: true,
+            },
+        };
+        handle.disarm_cancel_on_drop();
+        drop(handle);
+        assert!(!probe.is_cancelled());
     }
 
     async fn spawn_sender_for_test(

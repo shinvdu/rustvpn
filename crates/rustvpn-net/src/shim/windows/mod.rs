@@ -99,6 +99,13 @@ impl WindowsTap {
         &self.adapter
     }
 
+    /// Whether this process created the adapter (`WintunCreateAdapter`) rather
+    /// than opening a pre-existing device.  A created adapter is removed when
+    /// the last handle closes; a pre-existing one persists.
+    pub fn created(&self) -> bool {
+        self.adapter.created()
+    }
+
     /// Join the dedicated blocking Wintun reader thread without closing the
     /// session or adapter.
     ///

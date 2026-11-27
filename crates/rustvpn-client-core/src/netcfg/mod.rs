@@ -51,7 +51,9 @@ pub(crate) mod winplan;
 #[cfg(unix)]
 pub use linux::{
     bring_link_up, cleanup_stale_firewall, cleanup_stale_ipv6_blackhole, cleanup_stale_mss,
-    NetworkGuard,
+    ConnectionCleanup, InstallFailure, NetworkGuard,
 };
 #[cfg(windows)]
-pub use windows::{cleanup_owned_network, cleanup_stale_network, NetworkGuard};
+pub use windows::{
+    cleanup_owned_network, cleanup_stale_network, ConnectionCleanup, InstallFailure, NetworkGuard,
+};

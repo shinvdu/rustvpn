@@ -32,7 +32,7 @@ Windows 端已经完成 **开发环境 + Wintun/以太网垫片原型**，并完
 | 代码分支 | `feature/client-ui` |
 | 最近提交 | `2dd3b66 fix(windows): make disconnect teardown deterministic`（候选修复，未 VM 验证） |
 | M5 代码 | 已提交（MSI/服务/组/DACL/CI/文档） |
-| M6 代码 | 已提交（分流 E2E 修复、fuzz、手动 E2E 工作流、teardown 重排候选修复）；断开/崩溃/全隧道验收被主机离线阻塞 |
+| M6 代码 | 已提交（分流 E2E 修复、fuzz、手动 E2E 工作流、teardown 重排候选修复）；当前工作区另有复审 P1/P2 修复（未提交）；断开/崩溃/全隧道验收被主机离线阻塞 |
 | M4 代码 | `7b73a82 feat(windows): adapt GUI paths, keyring, autostart and identity checks` |
 | M3 代码 | `cac143a feat(windows): add network guard and crash recovery` |
 | M2 代码 | `8cef993 feat(windows): add service, named-pipe IPC and tunnel lock` |
@@ -457,7 +457,8 @@ PowerShell IPC 客户端驱动 `Connect/Status/Disconnect`；未修改现有 VPN
   join peer 任务，任务仍持有 `Arc<Tap>`，`drop(tap)` 未必真正关闭会话/适配器。两
   条路径都需在一次性 VM 中用二分法验证（先只关闭适配器、不删地址；再只删
   地址、不关闭适配器）。
-- **已提交的候选修复（`2dd3b66`；未在 Windows 验证，禁止物理机重试）：**
+- **候选修复（`2dd3b66`）+ 复审 P1/P2 修复（当前工作区，未提交；未在 Windows
+  验证，禁止物理机重试）：**
   - **根因假设（按可能性排序）：** (a) 关闭适配器前显式
     `Remove-NetIPAddress` 删除 Wintun 上唯一的 profile 地址（并触发隐式
     connected 路由拆除），与仍打开的 NDIS 会话冲突；(b) shim 专用阻塞读线程
@@ -465,34 +466,66 @@ PowerShell IPC 客户端驱动 `Connect/Status/Disconnect`；未修改现有 VPN
     `Arc` 引用，适配器关闭时机不确定；(c) 断开后 engine 立即执行的
     `cleanup_owned_network()`（`Get-NetAdapter`/`Get-NetRoute`）落在
     teardown 之后。
-  - **新 teardown 契约（`engine.rs::teardown_connection`）：**
+  - **新 teardown 契约（`engine.rs::teardown_connection` → `ConnectionCleanup::finish`）：**
     1. `session.close().await` 取消并 **join** 全部 peer 任务（`peer.rs` 为
        `PeerHandle` 记录 `JoinHandle`；超时则 abort+join），保证没有任务再用
-       `tap.recv()`/`tap.send()`，也不再持有 `Arc<Tap>`；
+       `tap.recv()`/`tap.send()`，也不再持有 `Arc<Tap>`；客户端 `PeerHandle`
+       默认在 Drop 时 cancel（字段级 guard，不阻止移出字段），服务端在移出
+       字段前显式 `disarm_cancel_on_drop()` 以保留自己的 token 生命周期；
     2. `tap.stop_reader()` 在 Windows join Wintun 垫片读线程（`ShimPump`
        已有 join；新增 `WindowsTap::stop_reader`/`Tap::stop_reader`）；
-    3. `guard.remove_connection_state()` 只删 NRPT → DNS → 路由（分流/默认，
-       防环 `/32` 最后）→ 接口 metric → IPv6 防火墙；**保留 profile 地址与隐式
-       connected 路由**，不再执行 `Remove-NetIPAddress`；
+    3. `guard.begin_connection_teardown(keep_address = tap.adapter_created())`
+       只删 NRPT → DNS → 路由（分流/默认，防环 `/32` 最后）→ 接口 metric →
+       IPv6 防火墙；**close 前绝不执行 `Remove-NetIPAddress`**，也**不清除**
+       `netstate.json`；
     4. `drop(tap)`（此时为最后一个 `Arc`）→ `WintunAdapter` 先
-       `Session::shutdown` 再 `WintunCloseAdapter`，地址/connected 路由随创建
-       的适配器一并移除；
-    5. close 之后不再执行任何 `Get-Net*`/PowerShell/`netsh` 查询；
-    6. 最后才发布 `tunnel stopped` / idle 状态。
-  - **断开后不再立即重试清理：** 连接刚结束时跳过
-    `cleanup_owned_network()`；若清理失败，状态文件保留，由下次 daemon 启动
-    （打开适配器之前）的 crash recovery 重试。install 失败回滚同样保留地址
-    （紧随其后的适配器关闭会移除）。
-  - **测试（Linux 可跑，无需 Wintun）：** `engine::teardown_stops_reader_removes_state_then_closes_device`
-    （顺序）；`shim::pump_shutdown_joins_the_dedicated_reader_thread`；
+       `Session::shutdown` 再 `WintunCloseAdapter`；
+    5. `ConnectionCleanup::finish()`（**close 之后**）：
+       - `created=true`：地址/connected 路由已随适配器删除，直接清状态；
+       - `created=false`（打开的是已存在适配器，close 不删设备）：在会话/句柄
+         关闭后显式 `Remove-NetIPAddress`（`cleanup_recorded_address`），再清
+         状态；地址删除失败则保留状态文件。只有确认最后一个 `Arc<Tap>` 已释放
+         （`closed=true`）才执行；若仍有额外引用导致会话未关闭，跳过地址删除
+         并保留状态，绝不向 live 会话发命令；
+       - 只有所有清理都成功才删除 `netstate.json`；close 窗口内崩溃/挂起会留下
+         完整状态供下次启动清理；
+    6. close 之后不再执行任何 `Get-Net*`/PowerShell/`netsh` 查询；最后才发布
+       `tunnel stopped` / idle 状态。
+  - **created 标志贯穿：** `WintunAdapter.created` → `WindowsTap::created` →
+    `Tap::adapter_created` → engine；`created=false` 时地址在 close **之后**
+    删除，`created=true` 时保留给适配器关闭。这修复了“预存在适配器地址永不
+    删除”的 P1。
+  - **install 失败回滚（P1）：** `install_with_partial` 返回 `PartialInstall`
+    （含 partial state）；engine 先 `session.close().await` +
+    `tap.stop_reader()`，再 `failure.rollback(keep_address)`，然后 `drop(tap)`，
+    最后 `cleanup.finish()`。`install_with` 不再在 install 内部 mutate/清理。
+  - **previous-state 清理（P1）：** engine 在打开适配器**之前**运行
+    `cleanup_before_opening_adapter()`（先清本进程残留，再清死 owner 状态；
+    失败或仍有 live owner 则拒绝连接）；`install_inner` 若仍看到状态文件则拒绝
+    安装，绝不向 live Wintun 会话发 `Remove-Net*`。
+  - **断开后不立即重试清理：** 只有本进程从未完成过连接时才在 idle
+    `Disconnect` 运行 `cleanup_owned_network()`；否则留给下次 daemon 启动
+    （打开适配器之前）重试。
+  - **ShimPump receiver 可重用：** `recv()` 用 `ReceiverLease` 在 future 被
+    cancel（重连 join 旧 peer task）时归还 receiver；shutdown 时则关闭 channel
+    唤醒阻塞的 reader。修复重连/复用适配器后收包失效的风险。
+  - **IPC Disconnect 语义：** `Response::Ok` 只表示命令已入队；engine 在
+    teardown 前发布 `disconnecting`，完成后发布 `idle`。客户端应等待 `idle`
+    事件（或读取状态）而不是把 `Ok` 当完成。
+  - **测试（Linux 可跑，无需 Wintun）：**
+    `engine::teardown_stops_reader_removes_state_then_closes_device_then_finalizes`
+    （stop → remove → close → finish）；`shim::pump_shutdown_joins_the_dedicated_reader_thread`；
+    `shim::cancelled_recv_restores_the_receiver_for_the_next_call`；
     `peer::shutdown_joins_cancelled_tasks_and_aborts_wedged_ones`；
-    `winplan::connection_cleanup_keeps_the_address_for_the_adapter_close`；
-    `winplan::crash_cleanup_removes_the_address_after_routes_and_nrpt`；
+    `peer::dropping_the_handle_cancels_the_peer_tasks`；
+    `winplan::created_adapter_keeps_the_address_preexisting_adapter_removes_it`；
+    `winplan::state_file_survives_cleanup_until_after_the_adapter_close`；
+    `winplan::install_refuses_previous_state_without_mutating_a_live_adapter`；
     `winplan::injected_route_failure_rolls_back_routes_and_state_but_keeps_the_address`。
-    Linux 的 `NetworkGuard::remove_connection_state` 完全委托给原有
-    `remove()`，行为不变。
-  - **仍未验证：** 上述修复只是代码层假设，未在 Windows 上执行过一次断开。
-    在一次性 VM 中必须完成下面的矩阵后才可考虑物理机；若 VM 仍挂起，则
+    Linux `NetworkGuard::begin_connection_teardown` 完全委托原有 `remove()`，
+    行为不变。
+  - **仍未验证：** 上述修复仍是代码层假设，未在 Windows 上执行过一次断开。
+    必须在一次性 VM 完成下面的矩阵后才可考虑物理机；若 VM 仍挂起，则
     (a)/(b) 不成立，需要转向 Wintun 驱动/NDIS 关闭本身（例如保留适配器句柄
     到进程退出、升级或更换 Wintun 版本）。
 - **一次性 VM 验证矩阵（修复后必须执行）：**
@@ -501,12 +534,19 @@ PowerShell IPC 客户端驱动 `Connect/Status/Disconnect`；未修改现有 VPN
   3. 旧构建二分：只关闭适配器不删地址；只删地址不关闭适配器（在 VM 快照上
      逐项执行，每次失败后回滚快照）；
   4. 断开清理失败注入（如临时阻断 PowerShell），重启 daemon，确认启动清理
-     补删遗留项；
-  5. install 失败回滚路径（例如故意让 `New-NetRoute` 失败）后断开；
-  6. 全隧道（DNS/NRPT/IPv6 阻断）connect/disconnect，确认 DNS 恢复、NRPT/
+     补删遗留项，且清理完成前拒绝新连接；
+  5. install 失败回滚路径（例如故意让 `New-NetRoute` 失败）：确认先 stop
+     reader/peer，再回滚，再 close，最后清状态；
+  6. **预存在适配器（`created=false`）**：预先创建 `rsvpn0` 后连接/断开，确认
+     close 之后才执行 `Remove-NetIPAddress`，地址消失且 `netstate.json` 清除；
+     `created=true` 则全程不出现 `Remove-NetIPAddress`；
+  7. 重连/复用适配器：连接后触发一次超时重连，确认 shim reader 仍能收包（取消
+     的 `recv` 归还 receiver）；
+  8. IPC `Disconnect` 后先看到 `disconnecting`、teardown 完成后才是 `idle`；
+  9. 全隧道（DNS/NRPT/IPv6 阻断）connect/disconnect，确认 DNS 恢复、NRPT/
      防火墙规则删除、无 IPv6 泄漏。
   记录 `clientd.log` 最后几行和 System 事件（1074/109/41/42、NDIS/Wintun），
-  并确认全程无 `Remove-NetIPAddress`、close 后无任何网络查询。
+  并确认 `created=true` 时全程无 `Remove-NetIPAddress`、close 后无任何网络查询。
 - **第三嫌疑：断开后的 OS 网络查询。** 两次失联都发生在断开完成后紧接着
   执行 `Get-Net*`/`netsh` 检查时；第二次 harness 已排除重 WMI 快照，但仍
   调用了 `netsh interface ipv4 show ...`。若 Wintun/NDIS 拆除是异步的，
@@ -688,11 +728,15 @@ fuzz 发现的移位溢出，新增垫片 fuzz 与手动 E2E 工作流。**关�
 `Disconnect` 后 Windows 主机两次（2/2）从网络失联；第一次的事件日志显示无
 Kernel-Power 41、无睡眠支持，约 2 小时后由 `winlogon.exe` 干净关机并重启。
 修复前断连顺序在 Wintun 适配器仍打开时执行 `Remove-NetRoute`/`Remove-NetIPAddress`，
-且 peer 任务未 join、close 后仍有 `Get-Net*` 查询，是主要嫌疑。**已提交候选
-teardown 重排**（stop reader → join peer 任务 → 删路由/DNS/NRPT 保留地址 →
-关闭适配器 → 不再查询，见 2.11），但**未在 Windows 验证**；M6 未完成项
-（断开/崩溃清理、全隧道 DNS/NRPT/IPv6、休眠/切网、性能）须先在一次性 VM 中
-按 2.11 的矩阵补测，再决定 M6 是否签收。**在 VM 通过前禁止在物理机再次连接/断开。**
+且 peer 任务未 join、close 后仍有 `Get-Net*` 查询，是主要嫌疑。已提交候选
+teardown 重排（stop reader → join peer 任务 → 删路由/DNS/NRPT → 关闭适配器 →
+不再查询），**当前工作区另有复审 P1/P2 修复**：`created` 标志决定地址由适配器
+关闭删除还是 close 后显式删除、状态文件仅在 close 后清除、install 失败回滚推迟到
+数据面停止后、previous-state 只在打开适配器前清理/失败即拒绝、PeerHandle
+cancel-on-drop、ShimPump 取消 recv 后复用 receiver、IPC 暴露 `disconnecting`。
+全部**未在 Windows 验证**；M6 未完成项（断开/崩溃清理、全隧道 DNS/NRPT/IPv6、
+休眠/切网、性能）须先在一次性 VM 中按 2.11 的矩阵补测，再决定 M6 是否签收。
+**在 VM 通过前禁止在物理机再次连接/断开。**
 
 ---
 

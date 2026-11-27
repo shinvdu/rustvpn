@@ -1137,7 +1137,10 @@ async fn create_udp_peer(
             remote: addr,
         },
     };
-    let handle = spawn_udp_peer(cfg.clone(), tap.clone(), key, false, stats.clone(), writer);
+    let mut handle = spawn_udp_peer(cfg.clone(), tap.clone(), key, false, stats.clone(), writer);
+    // The server splits the handle into `PeerEntry` and drops it immediately;
+    // keep the explicit token instead of the cancel-on-drop guard.
+    handle.disarm_cancel_on_drop();
     // This runs in a spawned task, so unlike the TCP path it is NOT
     // serialised with the main task's reload revocation pass.  Publish the
     // entry and then re-validate it; a reload that lands between the check
@@ -1681,7 +1684,7 @@ async fn create_tcp_peer(
         cfg.mtu,
     );
     ctx.stats.insert(stats.clone());
-    let handle = spawn_tcp(
+    let mut handle = spawn_tcp(
         read,
         write,
         cfg.clone(),
@@ -1690,6 +1693,7 @@ async fn create_tcp_peer(
         false,
         stats.clone(),
     );
+    handle.disarm_cancel_on_drop();
     let token = NEXT_PEER_TOKEN.fetch_add(1, AtomicOrdering::Relaxed);
     watch_peer(handle.events, addr, cfg.id, token, ctx.events.clone());
     let entry = Arc::new(PeerEntry {

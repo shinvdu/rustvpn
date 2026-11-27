@@ -468,6 +468,38 @@ pub struct ShimPump {
     reader: Mutex<Option<JoinHandle<()>>>,
 }
 
+/// Owns the single inbound receiver while [`ShimPump::recv`] awaits on it.
+///
+/// If the `recv` future is cancelled (the peer task is joined/aborted during a
+/// reconnect), the receiver is put back so a reused adapter keeps working.
+/// During shutdown the receiver is dropped instead, which closes the channel
+/// and wakes a reader parked in `blocking_send`.
+struct ReceiverLease<'a> {
+    rx: Option<Receiver<Vec<u8>>>,
+    slot: &'a Mutex<Option<Receiver<Vec<u8>>>>,
+    stop: &'a AtomicBool,
+}
+
+impl Drop for ReceiverLease<'_> {
+    fn drop(&mut self) {
+        let Some(rx) = self.rx.take() else {
+            return;
+        };
+        if self.stop.load(AtomicOrdering::SeqCst) {
+            // Shutdown: closing the channel unblocks the reader.
+            drop(rx);
+            return;
+        }
+        let mut slot = self
+            .slot
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if slot.is_none() {
+            *slot = Some(rx);
+        }
+    }
+}
+
 impl ShimPump {
     /// Start the pump. `inbound_capacity` bounds the OS->tunnel channel;
     /// `max_packet_size` must be at least the configured inner IP MTU.
@@ -548,22 +580,28 @@ impl ShimPump {
                 return Ok(None);
             }
 
-            // Move the receiver out for the await so a std mutex is never held
-            // across `.await`.  The gate serializes concurrent `recv` callers.
-            let mut rx = {
+            // Move the receiver into a lease for the await so a std mutex is never
+            // held across `.await`.  The gate serializes concurrent `recv`
+            // callers.  The lease restores the receiver if this future is
+            // cancelled (reconnect), and closes the channel on shutdown.
+            let mut lease = {
                 let mut guard = self.rx.lock().unwrap_or_else(|poison| poison.into_inner());
                 match guard.take() {
-                    Some(rx) => rx,
+                    Some(rx) => ReceiverLease {
+                        rx: Some(rx),
+                        slot: &self.rx,
+                        stop: self.stop.as_ref(),
+                    },
                     None => return Ok(None),
                 }
             };
-            let received = rx.recv().await;
-            {
-                let mut guard = self.rx.lock().unwrap_or_else(|poison| poison.into_inner());
-                if guard.is_none() {
-                    *guard = Some(rx);
-                }
-            }
+            let received = lease
+                .rx
+                .as_mut()
+                .expect("receiver present in the lease")
+                .recv()
+                .await;
+            drop(lease);
 
             match received {
                 Some(packet) => {
@@ -1176,6 +1214,32 @@ mod tests {
             "shutdown must take and join the reader handle"
         );
         assert!(pump.stop.load(AtomicOrdering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn cancelled_recv_restores_the_receiver_for_the_next_call() {
+        // A reconnect joins the old peer task, which cancels a parked
+        // `recv()` future.  The receiver must survive that so the reused
+        // adapter still delivers OS packets.
+        let device = Arc::new(FakeDevice::new());
+        let pump = Arc::new(ShimPump::new(shim_config(), device.clone(), 8, 2048).expect("pump"));
+
+        let recv_pump = Arc::clone(&pump);
+        let task = tokio::spawn(async move { recv_pump.recv().await });
+        // Let the task take the receiver and park on the channel.
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        task.abort();
+        let _ = task.await;
+
+        device.push(ipv4(PEER_IP, 20));
+        let frame = tokio::time::timeout(Duration::from_secs(1), pump.recv())
+            .await
+            .expect("recv after cancel must complete")
+            .expect("pump must not report closed")
+            .expect("frame");
+        // First packet to an unknown peer is an ARP request.
+        assert_eq!(frame.len(), ETH_HEADER_LEN + ARP_PAYLOAD_LEN);
+        pump.shutdown();
     }
 
     #[tokio::test]
