@@ -5,10 +5,11 @@
 > 状态：M1（核心接入）、M2（服务 + 本地 IPC）、M3（网络配置）、M4（GUI 平台适配）
 > 已完成并提交；M5（MSI/WiX 打包、服务注册、组/DACL、Wintun、签名钩子、Windows CI）
 > 已完成并在 Windows 实机完成安装/升级/卸载验证，已提交；
-> M6（真实 E2E、硬化、fuzz、CI）进行中：分流 + 全隧道（plain/noise）E2E、
-> Disconnect、DNS/NRPT、IPv6 阻断、5 个 Windows 实机 bug 与垫片 fuzz 已完成。
-> 全隧道在 Windows 11 VM 验证通过，含断开/服务重启清理与 IPv6 清理幂等修复。
-> 休眠/切网、重连/rekey、encless、性能与 Windows CI 实跑仍未完成
+> M6（真实 E2E、硬化、fuzz、CI）进行中：分流 + 全隧道（plain/noise）、
+> Disconnect、DNS/NRPT、IPv6 阻断、rekey/重连、链路抖动、强杀恢复、性能均已
+> 在 Windows 11 VM 验证；IPv6 清理幂等修复已提交。
+> encless、休眠（VM 不支持）、互联网出口（需 NAT）、Windows CI 实跑、
+> 真实证书签名仍未完成
 > 相关文档：
 > - [Windows 安装/升级/卸载/签名](windows-install.md)
 > - [Windows 客户端调研与方案](windows-client-research.md)
@@ -32,13 +33,13 @@ Windows 端已经完成 **开发环境 + Wintun/以太网垫片原型**，并完
 | 代码分支 | `feature/client-ui` |
 | 最近提交 | `7f05a3e fix(windows): make firewall and NRPT cleanup idempotent` |
 | M5 代码 | 已提交（MSI/服务/组/DACL/CI/文档） |
-| M6 代码 | 已提交（分流/全隧道 E2E、DNS/NRPT、IPv6 阻断、Disconnect、直接路由删除、幂等防火墙/NRPT 清理、fuzz、手动 CI）；休眠/切网、encless、性能与 CI 实跑待验收 |
+| M6 代码 | 已提交（分流/全隧道 E2E、DNS/NRPT、IPv6 阻断、Disconnect、直接路由删除、幂等清理、fuzz、手动 CI）；VM 已验证 rekey/重连、链路抖动、强杀恢复与 iperf3 性能；encless/休眠/互联网出口/CI 实跑/签名待条件成熟 |
 | M4 代码 | `7b73a82 feat(windows): adapt GUI paths, keyring, autostart and identity checks` |
 | M3 代码 | `cac143a feat(windows): add network guard and crash recovery` |
 | M2 代码 | `8cef993 feat(windows): add service, named-pipe IPC and tunnel lock` |
 | M1 代码 | `9bc1466 feat(windows): integrate Wintun shim into client core` |
 | 远端 | 领先 `origin/feature/client-ui`，**未推送** |
-| 主仓库剩余改动 | M5、M6 代码已提交；M6 休眠/切网、encless、性能与 CI 实跑待验收 |
+| 主仓库剩余改动 | M5、M6 代码已提交；M6 encless、休眠、互联网出口、CI 实跑、签名待条件成熟 |
 | Windows 原型位置 | `prototypes/windows-shim/`，独立 crate，不加入 workspace |
 | Windows CI | `.github/workflows/windows-client.yml`（M5 客户端构建/MSI）与 `.github/workflows/windows-shim.yml`（原型）相互独立 |
 | 原型状态 | Phase 0 参考实现，不是生产代码 |
@@ -745,7 +746,7 @@ PowerShell IPC 客户端驱动 `Connect/Status/Disconnect`；未修改现有 VPN
 | M3 网络 | 路由/DNS/NRPT、防环、IPv6 阻断、清理 | 🟡 已提交；Windows 实机路由/DNS 验收待 M6 | 全隧道无泄漏，断开恢复 |
 | M4 GUI | 路径/钥匙串/自启/语言/状态/服务端身份 | ✅ 已提交 `7b73a82`，Windows RDP 实机验证 | 普通用户基础操作（真实服务端 E2E 归 M6） |
 | M5 安装 | MSI、服务安装、组/DACL、Wintun、签名钩子、Windows CI | ✅ 已提交 `cb39124`；MSI 静态检查、安装/升级/卸载、标准用户/非成员、GUI RDP 已实测 | 干净 Win10/11 安装/升级/卸载；无证书构建标记为 unsigned |
-| M6 硬化 | E2E、休眠/切网、fuzz、CI、性能 | 🟡 `7f05a3e`：分流 + 全隧道 plain/noise E2E、DNS/NRPT、IPv6 阻断、Disconnect/服务重启清理、5 个实机 bug、fuzz、手动 CI；休眠/切网、encless、性能、CI 实跑待验收 | 全隧道无泄漏、断开恢复、性能基线 |
+| M6 硬化 | E2E、休眠/切网、fuzz、CI、性能 | 🟡 `7f05a3e`：分流 + 全隧道 plain/noise、DNS/NRPT、IPv6 阻断、Disconnect/服务重启清理、rekey/重连、链路抖动、强杀恢复、iperf3 性能、fuzz、手动 CI；encless/休眠/互联网出口/CI 实跑/签名待条件 | 全隧道无泄漏、断开恢复、性能基线 |
 
 **当前状态：** M1–M6 代码已提交，Disconnect 根因修复为 `f4cc06e` 并已物理机验证：
 
@@ -773,8 +774,20 @@ PowerShell IPC 客户端驱动 `Connect/Status/Disconnect`；未修改现有 VPN
   （`7f05a3e`），无 seed 规则复测通过
 - noise 模式通过；encless 因外层容量未测
 
-剩余 M6：encless/TCP、休眠/切网、重连/rekey、强杀崩溃恢复、性能基线、
-Windows CI 实际运行、互联网出口（需要测试 server NAT）与真实证书签名。
+M6 VM 硬化验收已通过：
+
+- rekey 60s：140s 内两次重协商，68/69 ping 成功，状态未抖动
+- 服务器短暂下线：reconnect 恢复，8 个丢包集中在 28s 断线窗口
+- 网卡 down 12s：会话透明存活；down 30s：超时后自动重连并恢复路由
+- 强杀 daemon 两次：SCM 重启、防环/netstate 启动清理、默认路由正常
+- iperf3 split tunnel：VM→server ~174 Mbit/s，server→VM ~150 Mbit/s；
+  VM 到 server 延迟 avg 4.9ms
+- 残余：反向 193 次重传、`last_handshake_unix` 未暴露、crash 清理约 10–15s
+  异步窗口
+
+剩余 M6（条件不满足）：encless/TCP（1500B 外层容量）、休眠/唤醒（VM 禁用
+suspend）、互联网出口（需 NAT 测试环境）、Windows CI 实际运行（需推送）、
+真实证书签名（无证书）。
 
 ---
 
