@@ -318,7 +318,11 @@ impl StateStore for SecureStateStore {
 pub struct InstallFailure {
     pub error: anyhow::Error,
     /// Present when the failure happened after some state was applied.
-    pub guard: Option<NetworkGuard>,
+    ///
+    /// Boxed: `NetworkGuard` is large, and keeping it inline made the
+    /// `Result` returned by [`NetworkGuard::install`] pay for it (clippy
+    /// `result_large_err`).
+    pub guard: Option<Box<NetworkGuard>>,
 }
 
 impl InstallFailure {
@@ -427,9 +431,11 @@ impl NetworkGuard {
                 state: Some(state),
             }),
             Err(partial) => {
-                let guard = partial.state.map(|state| Self {
-                    runner,
-                    state: Some(state),
+                let guard = partial.state.map(|state| {
+                    Box::new(Self {
+                        runner,
+                        state: Some(*state),
+                    })
                 });
                 Err(InstallFailure {
                     error: partial.error,

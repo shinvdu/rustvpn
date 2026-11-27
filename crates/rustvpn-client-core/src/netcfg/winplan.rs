@@ -1031,7 +1031,10 @@ pub struct InstallContext<'a> {
 #[derive(Debug)]
 pub struct PartialInstall {
     pub error: anyhow::Error,
-    pub state: Option<PersistedState>,
+    /// Boxed: `PersistedState` is large, and keeping it inline made every
+    /// `Result` returned on the install path pay for it (clippy
+    /// `result_large_err`).
+    pub state: Option<Box<PersistedState>>,
 }
 
 #[cfg(test)]
@@ -1063,7 +1066,10 @@ pub async fn install_with_partial(
     let mut state = None;
     match install_inner(&ctx, spec, outer, inner_mtu, options, &mut state).await {
         Ok(()) => Ok(state.expect("a successful install records its state")),
-        Err(error) => Err(PartialInstall { error, state }),
+        Err(error) => Err(PartialInstall {
+            error,
+            state: state.map(Box::new),
+        }),
     }
 }
 

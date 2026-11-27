@@ -137,7 +137,9 @@ pub async fn cleanup_stale_mss(scope: &str) {
 /// only after stopping the data plane, so the order is uniform with Windows.
 pub struct InstallFailure {
     pub error: anyhow::Error,
-    pub guard: Option<NetworkGuard>,
+    /// Boxed to keep the `Result` returned by [`NetworkGuard::install`] small
+    /// (clippy `result_large_err`); rollback behavior is unchanged.
+    pub guard: Option<Box<NetworkGuard>>,
 }
 
 impl InstallFailure {
@@ -241,7 +243,7 @@ impl NetworkGuard {
             // then calls `InstallFailure::rollback`.
             return Err(InstallFailure {
                 error,
-                guard: Some(guard),
+                guard: Some(Box::new(guard)),
             });
         }
         Ok(guard)
