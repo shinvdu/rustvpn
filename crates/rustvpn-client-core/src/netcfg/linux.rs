@@ -151,11 +151,11 @@ impl InstallFailure {
 
     /// Roll back the partial state after the peer tasks have been stopped.
     ///
-    /// Linux always removes its address as part of `remove()`, so `keep_address`
-    /// is ignored and the historical Linux teardown order is unchanged.
-    pub async fn rollback(self, _keep_address: bool) -> ConnectionCleanup {
+    /// The historical Linux teardown order is unchanged; Windows defers its
+    /// host-route/state cleanup to the next start.
+    pub async fn rollback(self) -> ConnectionCleanup {
         match self.guard {
-            Some(guard) => guard.begin_connection_teardown(false).await,
+            Some(guard) => guard.begin_connection_teardown().await,
             None => ConnectionCleanup::none(),
         }
     }
@@ -171,7 +171,7 @@ impl ConnectionCleanup {
         ConnectionCleanup
     }
 
-    pub async fn finish(self, _closed: bool) {}
+    pub async fn finish_after_close(self, _closed: bool) {}
 }
 
 pub struct NetworkGuard {
@@ -523,10 +523,9 @@ impl NetworkGuard {
     /// Linux keeps its historical ordering here (routes, address, link down,
     /// anti-loop route, IPv6 blackhole, DNS revert, firewall last), so this is
     /// exactly [`Self::remove`].  The method exists so the engine can share one
-    /// teardown call with Windows, where the address is deliberately retained
-    /// for the adapter close.  `keep_address` is ignored: Linux has no persistent
-    /// adapter whose close would remove the address.
-    pub async fn begin_connection_teardown(self, _keep_address: bool) -> ConnectionCleanup {
+    /// teardown call with Windows, which defers its host-route/state cleanup to
+    /// the next start.
+    pub async fn begin_connection_teardown(self) -> ConnectionCleanup {
         self.remove().await;
         ConnectionCleanup::none()
     }

@@ -332,32 +332,29 @@ impl InstallFailure {
 
     /// Roll back the partial state after the data plane has been stopped.
     ///
-    /// `keep_address` is the adapter's `created` flag: a created adapter is
-    /// removed by the following close (so its address goes with it), while a
-    /// pre-existing adapter persists and its address is removed after the
-    /// session/handle close by [`ConnectionCleanup::finish`].
-    pub async fn rollback(self, keep_address: bool) -> ConnectionCleanup {
+    /// Only non-route state is removed before the close.  The recorded routes,
+    /// address and state file are kept for the next connect/daemon start,
+    /// which removes them while no Wintun session exists.
+    pub async fn rollback(self) -> ConnectionCleanup {
         match self.guard {
-            Some(guard) => guard.begin_connection_teardown(keep_address).await,
+            Some(guard) => guard.begin_connection_teardown().await,
             None => ConnectionCleanup::none(),
         }
     }
 }
 
-/// Deferred post-close cleanup for a Windows connection.
+/// Phase-1 cleanup result for a Windows connection.
 ///
-/// The state file is cleared only in [`Self::finish`], which the engine calls
-/// **after** the Wintun adapter close has returned.  For a pre-existing adapter
-/// (`created == false`) the profile address is removed here, after the Wintun
-/// session/handle is gone but while the device still exists.
+/// The disconnect path removes only non-route state.  Route and address
+/// cleanup and the state-file clear are deferred to the next connect (before
+/// any adapter is opened) or the next daemon start, because removing the
+/// anti-loop host route immediately after the Wintun close still stalls the
+/// Windows network stack.  This type therefore performs **no** network
+/// operation after the adapter close: `netstate.json` stays in place as the
+/// pending cleanup record.
 #[derive(Default)]
 pub struct ConnectionCleanup {
-    runner: Option<PowerShellRunner>,
-    store: Option<SecureStateStore>,
     report: Option<winplan::CleanupReport>,
-    iface: Option<String>,
-    address: Option<winplan::PersistedAddress>,
-    remove_address: bool,
 }
 
 impl ConnectionCleanup {
@@ -365,48 +362,31 @@ impl ConnectionCleanup {
         Self::default()
     }
 
-    pub async fn finish(self, closed: bool) {
-        let (Some(runner), Some(store), Some(mut report)) = (self.runner, self.store, self.report)
-        else {
-            return;
-        };
-        if self.remove_address {
-            if !closed {
-                // An extra `Arc<Tap>` is still alive, so the Wintun session may
-                // not be shut down.  Never issue Remove-NetIPAddress against a
-                // live session; keep the state for the next start instead.
-                report.errors.push(
-                    "adapter was not closed (extra Tap reference); address cleanup deferred".into(),
-                );
-            } else if let (Some(iface), Some(address)) = (self.iface, self.address) {
-                // The Wintun session/handle is closed here; the device persists
-                // because it was opened rather than created.
-                let address_report =
-                    winplan::cleanup_recorded_address(&runner, &iface, &address).await;
-                report.actions.extend(address_report.actions);
-                report.errors.extend(address_report.errors);
+    pub async fn finish_after_close(self, closed: bool) {
+        if let Some(report) = self.report {
+            for action in &report.actions {
+                eprintln!("net: {action}");
+            }
+            for error in &report.errors {
+                eprintln!("warning: Windows pre-close cleanup incomplete: {error}");
             }
         }
-        // The state file is deleted only now, after the adapter close returned.
-        match winplan::clear_state_if_clean(&store, &report) {
-            Ok(true) => {}
-            Ok(false) => eprintln!(
-                "warning: Windows network cleanup was incomplete; keeping {} for crash \
-                 recovery: {}",
-                store.path().display(),
-                report.errors.join("; ")
-            ),
-            Err(error) => eprintln!(
-                "warning: cannot delete {}: {error:#}",
-                store.path().display()
-            ),
+        if closed {
+            eprintln!(
+                "net: host-route cleanup deferred to the next connect/daemon start; \
+                 netstate.json kept"
+            );
+        } else {
+            eprintln!(
+                "warning: adapter was not closed; network state and netstate.json kept for \
+                 the next start"
+            );
         }
     }
 }
 
 pub struct NetworkGuard {
     runner: PowerShellRunner,
-    store: SecureStateStore,
     state: Option<PersistedState>,
 }
 
@@ -444,13 +424,11 @@ impl NetworkGuard {
         {
             Ok(state) => Ok(Self {
                 runner,
-                store,
                 state: Some(state),
             }),
             Err(partial) => {
                 let guard = partial.state.map(|state| Self {
                     runner,
-                    store,
                     state: Some(state),
                 });
                 Err(InstallFailure {
@@ -461,32 +439,27 @@ impl NetworkGuard {
         }
     }
 
-    /// Remove the state that outlives the Wintun adapter, but do **not** clear
-    /// the state file and do **not** remove the address yet.
+    /// Phase 1 of the ordered Windows teardown: remove only non-route state.
     ///
-    /// Contract: the engine stops the peer tasks and the Wintun reader before
-    /// calling this, then closes the adapter, then calls
-    /// [`ConnectionCleanup::finish`]:
+    /// The engine stops the peer tasks and the Wintun reader before calling
+    /// this, then closes the adapter.
     ///
-    /// * routes (including the anti-loop `/32`), DNS, NRPT, the interface
-    ///   metric and the IPv6 block are removed here;
-    /// * the profile address is left untouched until the adapter close;
-    /// * a created adapter removes its address with the device;
-    /// * a pre-existing adapter persists, so `finish` removes the address after
-    ///   the Wintun session/handle is gone;
-    /// * the state file is cleared only in `finish`, after the close.
-    pub async fn begin_connection_teardown(mut self, keep_address: bool) -> ConnectionCleanup {
+    /// * NRPT, DNS, the interface metric and the IPv6 firewall block are
+    ///   removed here;
+    /// * no route and no address is touched while the Wintun session is open;
+    ///   the adapter close removes the Wintun address and its connected/
+    ///   default/split routes;
+    /// * **no** `Remove-NetRoute` is issued after the close either: the
+    ///   anti-loop host route and the state file are kept for the next connect
+    ///   (before opening an adapter) or the next daemon start, which run the
+    ///   full cleanup with no Wintun session present.
+    pub async fn begin_connection_teardown(mut self) -> ConnectionCleanup {
         let Some(state) = self.state.take() else {
             return ConnectionCleanup::none();
         };
-        let report = winplan::cleanup_state_with(&self.runner, &state, false).await;
+        let report = winplan::cleanup_non_route_state_with(&self.runner, &state).await;
         ConnectionCleanup {
-            runner: Some(self.runner),
-            store: Some(self.store),
             report: Some(report),
-            iface: Some(state.iface),
-            address: state.address,
-            remove_address: !keep_address,
         }
     }
 

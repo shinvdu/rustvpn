@@ -520,21 +520,39 @@ PowerShell IPC 客户端驱动 `Connect/Status/Disconnect`；未修改现有 VPN
     teardown 前发布 `disconnecting`，完成后发布 `idle`。客户端应等待 `idle`
     事件（或读取状态）而不是把 `Ok` 当完成。
   - **测试（Linux 可跑，无需 Wintun）：**
-    `engine::teardown_stops_reader_removes_state_then_closes_device_then_finalizes`
-    （stop → remove → close → finish）；`shim::pump_shutdown_joins_the_dedicated_reader_thread`；
+    `engine::teardown_order_is_reader_then_non_route_then_close_then_defer_cleanup`
+    （stop → 非路由清理 → close → 延迟清理）；`shim::pump_shutdown_joins_the_dedicated_reader_thread`；
     `shim::cancelled_recv_restores_the_receiver_for_the_next_call`；
     `peer::shutdown_joins_cancelled_tasks_and_aborts_wedged_ones`；
     `peer::dropping_the_handle_cancels_the_peer_tasks`；
-    `winplan::created_adapter_keeps_the_address_preexisting_adapter_removes_it`；
-    `winplan::state_file_survives_cleanup_until_after_the_adapter_close`；
+    `winplan::non_route_cleanup_never_removes_routes_or_the_address_before_close`；
+    `winplan::disconnect_keeps_host_routes_and_state_without_post_close_commands`；
+    `winplan::next_start_cleanup_removes_deferred_host_routes_and_clears_state`；
+    `winplan::pre_open_cleanup_removes_deferred_host_routes_before_the_next_adapter`；
     `winplan::install_refuses_previous_state_without_mutating_a_live_adapter`；
-    `winplan::injected_route_failure_rolls_back_routes_and_state_but_keeps_the_address`。
+    `winplan::injected_route_failure_defers_routes_address_and_state_to_next_start`。
     Linux `NetworkGuard::begin_connection_teardown` 完全委托原有 `remove()`，
     行为不变。
   - **仍未验证：** 上述修复仍是代码层假设，未在 Windows 上执行过一次断开。
     必须在一次性 VM 完成下面的矩阵后才可考虑物理机；若 VM 仍挂起，则
     (a)/(b) 不成立，需要转向 Wintun 驱动/NDIS 关闭本身（例如保留适配器句柄
     到进程退出、升级或更换 Wintun 版本）。
+- **最终结论（2026-11-27 物理机二分）：** 触发点是 **daemon 内部由 PowerShell 执行的 `Get-NetRoute ... | Where-Object ... | Remove-NetRoute -PolicyStore ActiveStore` 路由删除流水线**，而不是适配器/会话是否存在：
+  - 只读 `Get-Net*`、不改路由的 close-only 均安全；
+  - cleanup-only/antiloop-only 在适配器打开时挂起；
+  - 固定顺序（close 后立即删）仍挂起；
+  - 延迟到下一次 daemon 启动、**无任何 Wintun 适配器**时由 startup 清理执行同一流水线，仍会在约 13–16s 后挂起；
+  - 相反，外部直接 `Remove-NetRoute -DestinationPrefix '...' -Confirm:$false`（无 pipeline、无 `-PolicyStore`）在多次手工清理中均安全。
+  因此 disconnect 路径**不做任何 close 后网络操作**，并把所有 daemon 路由删除改为**直接 cmdlet**：`Remove-NetRoute -DestinationPrefix '<prefix>' -InterfaceIndex <idx> -NextHop '<hop>' -RouteMetric <metric> -Confirm:$false`（精确身份、无流水线、无 `-PolicyStore`）：
+  1. `session.close().await` + `tap.stop_reader()`；
+  2. close 前只删 NRPT/DNS/接口 metric/IPv6 防火墙，不删路由/地址；
+  3. 关闭 Wintun 适配器（地址与 connected/default/split 路由随设备删除）；
+  4. **不删除防环/物理网卡主机路由，不清 `netstate.json`**；close 后不执行任何 `Get-Net*`/PowerShell/`Remove-NetRoute`，直接发布 `tunnel stopped`/idle；
+  5. 下一次 Connect 在打开适配器前（`cleanup_before_opening_adapter`）或下一次 daemon 启动（`cleanup_stale_network`）在**无 Wintun 会话**时执行完整清理，删除防环路由并清除 `netstate.json`；
+  6. 因此 daemon 空闲/断开期间，防环 `/32` 可能短暂保留；这是有意的 pending 清理记录（此时已无隧道适配器和 `10.x` 地址）。daemon 若在 idle 退出，下一次服务启动会先清理再允许打开适配器。
+  install 失败回滚同样在 close 后保留路由/地址/状态，由下次启动清理；崩溃恢复仍是无适配器打开时的完整清理。
+  **2026-11-27 物理机验证（直接 cmdlet）：** 正常 Disconnect 后主机存活 >120s，防环 `/32` 与 `netstate.json` 按要求保留，适配器/`10.99.*` 已消失；随后停止 daemon 再启动，startup 清理用直接 `Remove-NetRoute -DestinationPrefix '192.168.110.190/32' -InterfaceIndex 6 -NextHop '192.168.110.1' -RouteMetric 1 -Confirm:$false` 删除防环路由并清除 `netstate.json`，主机存活 >150s，默认路由仍为 `192.168.110.1`。因此 daemon 不再使用 `Get-NetRoute | Remove-NetRoute -PolicyStore ActiveStore` 流水线；Linux 保持不变。可选的重连（pre-open 清理）未再执行，以避免额外一次断开周期。
+  **OpenVPN 参考与后续改进：** OpenVPN 在 Windows 用 IP Helper API（`CreateIpForwardEntry2`/`DeleteIpForwardEntry2`）或 `route.exe` 增删路由，不用 PowerShell/WMI；teardown 先恢复 DNS、删隧道路由、最后删防环 `/32`，然后关闭适配器。微软文档说明 `Remove-NetRoute` 在无有效过滤时会删除包括默认路由在内的全部路由，且 `-PolicyStore` 只存在于 By-Name 参数集，与 pipeline/InputObject 组合属未定义绑定；这正是旧流水线导致整机断网的原因（13–16s 后默认路由/缓存失效才显现）。当前直接 cmdlet 已验证；下一步建议改用 `DeleteIpForwardEntry2` 按记录行精确删除（`ERROR_NOT_FOUND` 视为已删除），或用 `route.exe DELETE <dest> MASK 255.255.255.255 <gateway> IF <idx>`，彻底移除 daemon 热路径中的 PowerShell。
 - **一次性 VM 验证矩阵（修复后必须执行）：**
   1. connect → disconnect → **不做任何 OS 查询**，等待 120s，检查 ARP/ping/SSH/RDP；
   2. 同样流程，断开后延迟 60s 再做 `Get-Net*`/`netsh`，检查是否挂起；

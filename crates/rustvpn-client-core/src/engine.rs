@@ -270,13 +270,16 @@ impl TeardownDevice for Arc<Tap> {
 /// The contract, in order:
 ///
 /// 1. stop the platform reader (Windows: join the Wintun shim reader),
-/// 2. remove the RustVPN-owned routes/DNS/NRPT (Windows keeps the profile
-///    address for the adapter close),
+/// 2. run the pre-close cleanup closure (Windows: NRPT, DNS, interface metric
+///    and IPv6 firewall only - never `Remove-NetRoute`/`Remove-NetIPAddress`
+///    against a live Wintun session),
 /// 3. close the device (Windows: session shutdown + adapter close, which also
-///    removes the address and its implicit connected route).
+///    removes the address and its connected/default/split routes).
 ///
-/// No network query is performed by this function or after its close step.
-/// Callers publish the idle status only once this returns.
+/// The caller then publishes the idle status.  Host routes, the address of a
+/// pre-existing adapter and the state file are deliberately **not** touched
+/// here: the next connect (before opening an adapter) or the next daemon start
+/// runs the full cleanup with no Wintun session present.
 /// Returns the cleanup value and whether the device really closed.
 async fn teardown_connection<D, R, RFut, T>(device: D, remove_network: R) -> (T, bool)
 where
@@ -292,6 +295,10 @@ where
 }
 
 /// Clean previous Windows network state before any adapter is opened.
+///
+/// This is also the deferred-cleanup point for a normal Disconnect: the
+/// anti-loop host route and netstate.json are left in place by the disconnect
+/// path and removed here, while this process has no Wintun session open.
 ///
 /// Runs the daemon's own leftover state first, then dead-owner crash state.  A
 /// failure (or a state file still owned by another live process) refuses the
@@ -864,14 +871,13 @@ async fn run_connection(
                             let message = failure.message();
                             session.close(&stats_state).await;
                             tap.stop_reader();
-                            let keep_address = tap.adapter_created();
-                            let cleanup = failure.rollback(keep_address).await;
+                            let cleanup = failure.rollback().await;
                             let closed = Arc::strong_count(&tap) == 1;
                             drop(tap);
-                            // The state file is cleared only after the adapter
-                            // close (and, for a pre-existing adapter, the
-                            // post-close address removal) has completed.
-                            cleanup.finish(closed).await;
+                            // Routes/address and the state file are kept for
+                            // the next connect/daemon start, which clean them
+                            // with no Wintun session open.
+                            cleanup.finish_after_close(closed).await;
                             emit_error(&events, &spec, message.clone());
                             emit_log(&events, "error", message);
                             emit_log(&events, "info", "tunnel stopped");
@@ -984,17 +990,20 @@ async fn run_connection(
 
     #[cfg(unix)]
     let had_guard = guard.is_some();
-    // `created` decides the address policy: a created Wintun adapter removes
-    // its address with the device on close, while a pre-existing adapter
-    // persists and its address is removed after the session/handle close.
-    let keep_address = tap.adapter_created();
     // Every session above was closed by an awaited `session.close()` (which
     // joins the peer tasks), so no task holds a `Tap` clone anymore.  The
-    // reader is stopped before any route/DNS command runs, and the adapter is
-    // closed only after the guard has removed what outlives it.
+    // ordered teardown is:
+    //   1. stop the platform reader,
+    //   2. remove only non-route state (NRPT/DNS/metric/IPv6) while the Wintun
+    //      session is still open,
+    //   3. close the adapter as the final `Tap` reference.
+    // Routes (including the anti-loop host route), a pre-existing adapter's
+    // address and netstate.json are **deferred**: no network command runs after
+    // the close.  The next connect (before opening an adapter) or the next
+    // daemon start removes them with no Wintun session present.
     let (cleanup, closed) = teardown_connection(tap, || async {
         let cleanup = match guard {
-            Some(guard) => guard.begin_connection_teardown(keep_address).await,
+            Some(guard) => guard.begin_connection_teardown().await,
             None => ConnectionCleanup::none(),
         };
         // An explicit disconnect/stop must restore connectivity even if the
@@ -1013,8 +1022,9 @@ async fn run_connection(
         cleanup
     })
     .await;
-    // Only now, after the adapter close, may the state file be deleted.
-    cleanup.finish(closed).await;
+    // The adapter is closed; this only reports the pre-close cleanup and
+    // keeps netstate.json.  No network command may run here.
+    cleanup.finish_after_close(closed).await;
     emit_log(&events, "info", "tunnel stopped");
 }
 
@@ -1385,34 +1395,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn teardown_stops_reader_removes_state_then_closes_device_then_finalizes() {
-        // Locks in the Windows teardown contract: no network command may run
-        // until the reader is stopped; the device closes after state removal;
-        // and the state file is cleared (finalize) only after that close.
+    async fn teardown_order_is_reader_then_non_route_then_close_then_defer_cleanup() {
+        // Locks in the Windows teardown contract: the reader stops first, the
+        // pre-close cleanup removes only non-route state, then the device
+        // closes.  Host routes and the state file are deferred: no
+        // Remove-NetRoute may run before or after the close in this path.
         let log = Arc::new(std::sync::Mutex::new(Vec::new()));
         let remove_log = log.clone();
         let finalize_log = log.clone();
         let (cleanup, closed) = teardown_connection(RecordingDevice { log: log.clone() }, || {
             let remove_log = remove_log;
             async move {
-                remove_log.lock().unwrap().push("remove-network");
+                remove_log.lock().unwrap().push("cleanup-non-route");
                 "state-cleanup-token"
             }
         })
         .await;
 
-        // Mirrors the caller: `cleanup.finish(closed)` runs after the close.
+        // Mirrors the caller: the post-close cleanup runs after the close.
         assert_eq!(cleanup, "state-cleanup-token");
         assert!(closed, "the recording device reports a real close");
-        finalize_log.lock().unwrap().push("finish-state");
+        finalize_log.lock().unwrap().push("defer-host-routes");
 
         assert_eq!(
             &*log.lock().unwrap(),
             &[
                 "stop-reader",
-                "remove-network",
+                "cleanup-non-route",
                 "close-device",
-                "finish-state"
+                "defer-host-routes"
             ]
         );
     }
