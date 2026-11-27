@@ -183,9 +183,9 @@ New-Item -ItemType Directory -Force -Path $output | Out-Null
 # The release directory is a build output, not an archive.  Remove this
 # package's generated files so a stale MSI/wixpdb cannot be uploaded without a
 # checksum or inspected instead of the current build.
-Get-ChildItem -LiteralPath $output -File -ErrorAction SilentlyContinue |
+Get-ChildItem -LiteralPath $output -File -ErrorAction Stop |
     Where-Object { $_.Name -match '^(RustVPN-.*\.msi|.*\.wixpdb|SHA256SUMS\.txt|BUILD-INFO\.txt|UNSIGNED\.txt)$' } |
-    Remove-Item -Force -ErrorAction SilentlyContinue
+    Remove-Item -Force -ErrorAction Stop
 $work = Join-Path $repo 'target\windows-msi'
 $stage = Join-Path $work 'stage'
 $wixobj = Join-Path $work 'wixobj'
