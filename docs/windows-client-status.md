@@ -11,6 +11,7 @@
 **总体状态：** M1-M5 已完成，M6 代码完成且大部分验收已完成。剩余项均为受条件阻塞或范围受限的排查，而非缺少 M6 实现。
 
 相关文档：[Windows 安装/签名](windows-install.md) ·
+[Authenticode 签名科普](authenticode-signing-primer.md) ·
 [Windows 调研](windows-client-research.md) ·
 [开发环境](windows-dev-environment.md) ·
 [P0 决策](p0-decision-review.md) · [桌面 UI](client-ui.md)
@@ -23,7 +24,7 @@
 |---|---|
 | 里程碑 | M1-M5 已完成并提交；M6 代码完成，验收基本完成 |
 | Windows 目标平台 | Windows 10/11 x64；ARM64 延期 |
-| 安装程序 | 每机器安装的 MSI/WiX，未签名的开发构建；签名钩子已就绪 |
+| 安装程序 | 每机器安装的 MSI/WiX；开发自签 Authenticode 已验证，正式 EV/OV/发布签名待办 |
 | 服务 | LocalSystem `rustvpn-clientd`，延迟自动启动，失败恢复 |
 | 传输 | Wintun L3 + 进程内以太网 shim；仅 IPv4 |
 | 验证主机 | Windows 10 物理机（分流隧道）、Windows 11 虚拟机（全隧道与加固） |
@@ -51,6 +52,7 @@
 - **性能：** 分流隧道 iperf3 约 174 Mbit/s（虚拟机→服务器）与 150 Mbit/s（反向），平均延迟 4.9 ms；反向出现重传（WIN-013）。
 - **互联网出口：** 全隧道经临时 VPS NAT 验证；`ifconfig.me` 返回 VPS 公网 IP，`example.com` HTTP 200，1 MiB 下载完整；VPS TAP/NAT/防火墙已清理。
 - **Windows CI：** `windows-client` workflow 已真实运行并通过（format/check/clippy/test/MSI/inspect/upload），commit `ffe9657`，run 45995988463。
+- **自签 Authenticode：** `CN=RustVPN Development` 证书签名 GUI/daemon/MSI；导入 CER 到 VM Root + TrustedPublisher 后，`signtool verify /pa` 与 `Get-AuthenticodeSignature` 均为 Valid，服务/管道与 GUI 服务端身份校验通过。
 - **Fuzz：** 7 个确定性 shim fuzz 测试；`rustvpn-net` 报告 118 个通过测试。
 - **打包：** MSI 静态检查、真实安装、服务/组状态、标准用户管道访问、非成员拒绝、同版本升级、卸载并保留配置。
 
@@ -67,7 +69,7 @@
 | 问题 | 事项 | 阻塞原因 |
 |---|---|---|
 | WIN-016 | 睡眠/休眠恢复 | 虚拟机未提供可用的挂起；稍后使用一次性物理硬件 |
-| WIN-019 | Authenticode 签名 | 无可用 EV/OV 证书或私钥；未签名构建已明确标记 |
+| WIN-019（剩余） | 正式 EV/OV/发布签名 | 开发自签已验证；仍缺正式证书、时间戳与 publisher/certificate pinning |
 | WIN-018（剩余） | 自托管 Windows E2E workflow | `windows-client-e2e.yml` 需要已注册的高权限 self-hosted runner；当前 runner 数 0，且 workflow 仅在 `feature/client-ui` |
 
 ## 6. 已知不支持或延期
@@ -109,8 +111,7 @@
 3. 批量化或替换重度依赖 PowerShell 的启动清理，以缩短 WIN-014 的窗口。
 4. 在一次性物理硬件上验证睡眠/恢复（WIN-016）。
 5. 为自托管 Windows E2E 注册受保护 runner，并让 workflow 进入默认分支（WIN-018 剩余项）。
-6. 条件成熟时提供 Authenticode 证书并验证签名安装包（WIN-019）。
-7. 获取 EV/OV 证书，签名 GUI/守护进程/MSI，并固定发布者身份（WIN-019）。
+6. 获取 EV/OV 证书，签名 GUI/守护进程/MSI，启用发布时间戳并固定 publisher/certificate（WIN-019 剩余项）。
 8. 仅在具备足够容量的外层路径可用后，再重新评估 encless/TCP（WIN-015）。
 
 ## 10. 更新节奏

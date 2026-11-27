@@ -1,3 +1,15 @@
 /target/
 /dist/
 /crates/rustvpn-client-gui/gen/
+
+# Signing material must never enter the repository.  Development certificates
+# live in C:\rustvpn-signing on the build host (see packaging/windows/README.md).
+*.pfx
+*.p12
+*.pvk
+*.cer
+*.crt
+*.key
+*.pem
+*.snk
+/signing/

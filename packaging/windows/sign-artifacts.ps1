@@ -1,11 +1,16 @@
 # Authenticode signing hook for the RustVPN Windows artifacts.
 #
 # Certificate material is never part of the repository.  Configure one of:
-#   $env:RUSTVPN_SIGN_CERT_THUMBPRINT   certificate in the CurrentUser/My store
-#   $env:RUSTVPN_SIGN_CERT_FILE         .pfx/.p12 path
-#   $env:RUSTVPN_SIGN_CERT_PASSWORD     password for the .pfx
-#   $env:RUSTVPN_TIMESTAMP_URL          RFC 3161 timestamp server (optional)
-#   $env:RUSTVPN_SIGNTOOL               explicit signtool.exe (optional)
+#   $env:RUSTVPN_SIGN_CERT_THUMBPRINT     certificate in the CurrentUser/My store
+#   $env:RUSTVPN_SIGN_CERT_FILE           .pfx/.p12 path
+#   $env:RUSTVPN_SIGN_CERT_PASSWORD       password for the .pfx
+#   $env:RUSTVPN_SIGN_CERT_PASSWORD_FILE  protected file with the .pfx password
+#   $env:RUSTVPN_TIMESTAMP_URL            RFC 3161 timestamp server (optional)
+#   $env:RUSTVPN_NO_TIMESTAMP             1/true/yes disables timestamping
+#   $env:RUSTVPN_SIGNTOOL                 explicit signtool.exe (optional)
+#
+# Development self-signed builds can disable timestamping (-NoTimestamp or
+# RUSTVPN_NO_TIMESTAMP=1).  A timestamp is recommended for OV/EV releases.
 #
 # Without a certificate the script verifies that every artifact really is
 # unsigned (rather than claiming success) and optionally writes an UNSIGNED
@@ -18,15 +23,23 @@ param(
     [string]$Thumbprint = $env:RUSTVPN_SIGN_CERT_THUMBPRINT,
     [string]$PfxFile = $env:RUSTVPN_SIGN_CERT_FILE,
     [string]$PfxPassword = $env:RUSTVPN_SIGN_CERT_PASSWORD,
+    [string]$PfxPasswordFile = $env:RUSTVPN_SIGN_CERT_PASSWORD_FILE,
     [string]$TimestampUrl = $env:RUSTVPN_TIMESTAMP_URL,
     [string]$SignTool = $env:RUSTVPN_SIGNTOOL,
     [string]$UnsignedMarker = '',
-    [switch]$RequireSigned
+    [switch]$RequireSigned,
+    [switch]$NoTimestamp
 )
 
 $ErrorActionPreference = 'Stop'
 
-if ([string]::IsNullOrWhiteSpace($TimestampUrl)) {
+$envNoTimestamp = if ($env:RUSTVPN_NO_TIMESTAMP) {
+    $env:RUSTVPN_NO_TIMESTAMP.Trim().ToLowerInvariant()
+} else {
+    ''
+}
+$skipTimestamp = [bool]$NoTimestamp -or ($envNoTimestamp -in @('1', 'true', 'yes', 'on'))
+if (-not $skipTimestamp -and [string]::IsNullOrWhiteSpace($TimestampUrl)) {
     $TimestampUrl = 'http://timestamp.digicert.com'
 }
 
@@ -62,7 +75,9 @@ function Invoke-SignTool([string[]]$Arguments) {
     $previous = $ErrorActionPreference
     try {
         $ErrorActionPreference = 'Continue'
-        & $signToolPath @Arguments
+        # Out-Host keeps signtool output visible without mixing it into the
+        # function's return value; callers must receive only the exit code.
+        & $signToolPath @Arguments | Out-Host
         return $LASTEXITCODE
     } finally {
         $ErrorActionPreference = $previous
@@ -75,6 +90,16 @@ function Test-Signature([string]$Path) {
 
 $thumb = if ($Thumbprint) { $Thumbprint.Trim() } else { '' }
 $configured = ($thumb -ne '') -or ($PfxFile -ne '')
+
+if ([string]::IsNullOrEmpty($PfxPassword) -and -not [string]::IsNullOrEmpty($PfxPasswordFile)) {
+    if (-not (Test-Path -LiteralPath $PfxPasswordFile)) {
+        throw "PFX password file does not exist: $PfxPasswordFile"
+    }
+    $PfxPassword = (Get-Content -LiteralPath $PfxPasswordFile -Raw).Trim()
+}
+if ($configured -and $thumb -eq '' -and [string]::IsNullOrEmpty($PfxPassword)) {
+    throw 'PFX signing requires RUSTVPN_SIGN_CERT_PASSWORD or RUSTVPN_SIGN_CERT_PASSWORD_FILE (or use -Thumbprint)'
+}
 
 if (-not $configured) {
     foreach ($file in $Files) {
@@ -92,7 +117,8 @@ if (-not $configured) {
         'directory are unsigned development artifacts. Windows SmartScreen will',
         'warn and enterprise deployment policies may reject them.',
         '',
-        'Signing inputs: RUSTVPN_SIGN_CERT_THUMBPRINT or RUSTVPN_SIGN_CERT_FILE.',
+        'Signing inputs: RUSTVPN_SIGN_CERT_THUMBPRINT, or RUSTVPN_SIGN_CERT_FILE +',
+        'RUSTVPN_SIGN_CERT_PASSWORD / RUSTVPN_SIGN_CERT_PASSWORD_FILE.',
         'See docs/windows-install.md and packaging/windows/README.md.',
         'Verified with: ' + $signToolPath,
         'Time: ' + (Get-Date -Format o)
@@ -101,21 +127,25 @@ if (-not $configured) {
         Set-Content -LiteralPath $UnsignedMarker -Value $message -Encoding ASCII
     }
     Write-Host 'SIGNING STATUS: UNSIGNED (signtool verify confirmed no embedded signature)'
-    [pscustomobject]@{ Signed = $false; Files = $Files; SignTool = $signToolPath }
+    [pscustomobject]@{ Signed = $false; Timestamped = $false; Files = $Files; SignTool = $signToolPath }
     exit 0
 }
 
 foreach ($file in $Files) {
-    $exit = if ($thumb -ne '') {
-        Invoke-SignTool @('sign', '/sha1', $thumb, '/fd', 'SHA256', '/tr', $TimestampUrl,
-            '/td', 'SHA256', $file)
+    if ($thumb -ne '') {
+        $signArguments = @('sign', '/sha1', $thumb, '/fd', 'SHA256')
     } else {
         if (-not (Test-Path -LiteralPath $PfxFile)) {
             throw "certificate file does not exist: $PfxFile"
         }
-        Invoke-SignTool @('sign', '/f', $PfxFile, '/p', $PfxPassword, '/fd', 'SHA256',
-            '/tr', $TimestampUrl, '/td', 'SHA256', $file)
+        $signArguments = @('sign', '/f', $PfxFile, '/p', $PfxPassword, '/fd', 'SHA256')
     }
+    if (-not $skipTimestamp) {
+        $signArguments += @('/tr', $TimestampUrl, '/td', 'SHA256')
+    }
+    $signArguments += $file
+
+    $exit = Invoke-SignTool $signArguments
     if ($exit -ne 0) {
         throw "signtool sign failed for $file (exit $exit)"
     }
@@ -128,5 +158,12 @@ foreach ($file in $Files) {
 if ($UnsignedMarker -and (Test-Path -LiteralPath $UnsignedMarker)) {
     Remove-Item -LiteralPath $UnsignedMarker -Force
 }
-Write-Host 'SIGNING STATUS: SIGNED (all artifacts verified with signtool /pa)'
-[pscustomobject]@{ Signed = $true; Files = $Files; SignTool = $signToolPath }
+$timestampStatus = if ($skipTimestamp) { 'unsigned timestamp (disabled)' } else { $TimestampUrl }
+Write-Host "SIGNING STATUS: SIGNED (all artifacts verified with signtool /pa; timestamp: $timestampStatus)"
+[pscustomobject]@{
+    Signed = $true
+    Timestamped = -not $skipTimestamp
+    TimestampUrl = if ($skipTimestamp) { '' } else { $TimestampUrl }
+    Files = $Files
+    SignTool = $signToolPath
+}

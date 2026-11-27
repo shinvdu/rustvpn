@@ -14,7 +14,7 @@
 # The layout and upgrade rules are explained in packaging/windows/README.md.
 [CmdletBinding()]
 param(
-    [string]$RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path,
+    [string]$RepoRoot = '',
     [string]$WintunDir = 'C:\rustvpn-dev\vendor\wintun',
     [string]$OutputDir = '',
     [string]$MsiVersion = '',
@@ -26,12 +26,28 @@ param(
     [string]$SignCertThumbprint = $env:RUSTVPN_SIGN_CERT_THUMBPRINT,
     [string]$SignCertFile = $env:RUSTVPN_SIGN_CERT_FILE,
     [string]$SignCertPassword = $env:RUSTVPN_SIGN_CERT_PASSWORD,
+    [string]$SignCertPasswordFile = $env:RUSTVPN_SIGN_CERT_PASSWORD_FILE,
     [string]$TimestampUrl = $env:RUSTVPN_TIMESTAMP_URL,
-    [string]$SignTool = $env:RUSTVPN_SIGNTOOL
+    [string]$SignTool = $env:RUSTVPN_SIGNTOOL,
+    [switch]$NoTimestamp
 )
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 2.0
+
+$envNoTimestamp = if ($env:RUSTVPN_NO_TIMESTAMP) {
+    $env:RUSTVPN_NO_TIMESTAMP.Trim().ToLowerInvariant()
+} else {
+    ''
+}
+$timestampDisabled = [bool]$NoTimestamp -or ($envNoTimestamp -in @('1', 'true', 'yes', 'on'))
+$timestampText = if ($timestampDisabled) {
+    'disabled (development self-signed build)'
+} elseif ($TimestampUrl) {
+    $TimestampUrl
+} else {
+    'http://timestamp.digicert.com'
+}
 
 $PinnedWintunSha256 = 'e5da8447dc2c320edc0fc52fa01885c103de8c118481f683643cacc3220dafce'
 $PinnedWintunVersion = '0.14.1'
@@ -141,7 +157,14 @@ function Assert-X64Pe([string]$Path) {
     if ((Get-PeMachine $Path) -ne 0x8664) { throw "$Path is not an amd64 PE image" }
 }
 
-$repo = (Resolve-Path -LiteralPath $RepoRoot).Path
+# $PSScriptRoot is not populated in a CmdletBinding param default when the
+# script is launched through `powershell -File` from another PowerShell
+# session, so resolve the repository root in the body.
+$repo = if ($RepoRoot) {
+    (Resolve-Path -LiteralPath $RepoRoot).Path
+} else {
+    (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..\..')).Path
+}
 $semver = Get-WorkspaceSemver $repo
 $tauriConfPath = Join-Path $repo 'crates\rustvpn-client-gui\tauri.conf.json'
 $tauriVersion = (Get-Content -LiteralPath $tauriConfPath -Raw | ConvertFrom-Json).version
@@ -268,9 +291,11 @@ if ($SkipSign) {
         -Thumbprint $SignCertThumbprint `
         -PfxFile $SignCertFile `
         -PfxPassword $SignCertPassword `
+        -PfxPasswordFile $SignCertPasswordFile `
         -TimestampUrl $TimestampUrl `
         -SignTool $SignTool `
-        -UnsignedMarker $marker
+        -UnsignedMarker $marker `
+        -NoTimestamp:$timestampDisabled
     $signed = [bool]$signResult.Signed
     $signingStatus = if ($signed) {
         'Signed build (signtool /pa verified)'
@@ -281,9 +306,10 @@ if ($SkipSign) {
 
 $signingText = @(
     "Signing status: $signingStatus",
-    "Timestamp URL: $(if ($TimestampUrl) { $TimestampUrl } else { 'http://timestamp.digicert.com' })",
+    "Timestamp: $timestampText",
     'Certificate material is never stored in the repository.',
-    'See docs/windows-install.md for SmartScreen and EV expectations.'
+    'Self-signed development builds must not be distributed publicly; see',
+    'docs/windows-install.md for trust-store steps and EV/OV expectations.'
 ) -join [Environment]::NewLine
 Set-Content -LiteralPath (Join-Path $stage 'docs\SIGNING.txt') -Value $signingText -Encoding ASCII
 
@@ -332,9 +358,11 @@ if (-not $SkipSign) {
         -Thumbprint $SignCertThumbprint `
         -PfxFile $SignCertFile `
         -PfxPassword $SignCertPassword `
+        -PfxPasswordFile $SignCertPasswordFile `
         -TimestampUrl $TimestampUrl `
         -SignTool $SignTool `
-        -UnsignedMarker $marker
+        -UnsignedMarker $marker `
+        -NoTimestamp:$timestampDisabled
     if ($msiSign.Signed -ne $signed) {
         throw 'the MSI signing result differs from the binaries; refusing a partially signed release'
     }
@@ -348,6 +376,7 @@ $info = @(
     "Wintun: $PinnedWintunVersion amd64 ($wintunHash)",
     "Source commit: $gitCommit ($gitDirty)",
     "Signing: $signingStatus",
+    "Timestamp: $timestampText",
     "Built (UTC): $([DateTime]::UtcNow.ToString('o'))"
 ) -join [Environment]::NewLine
 Set-Content -LiteralPath (Join-Path $output 'BUILD-INFO.txt') -Value $info -Encoding ASCII

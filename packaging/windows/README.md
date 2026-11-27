@@ -7,6 +7,8 @@ This directory builds the per-machine RustVPN Windows installer:
 | `rustvpn-client.wxs` | WiX Toolset 3.14 source: files, shortcuts, service, group helper |
 | `build-msi.ps1` | Release build, Wintun verification, candle/light, signing hooks |
 | `sign-artifacts.ps1` | `signtool` wrapper; cert store or PFX via environment |
+| `create-dev-cert.ps1` | Development-only self-signed code-signing certificate + protected PFX/CER |
+| `trust-dev-cert.ps1` | Import/remove the `.cer` in machine `Root` and `TrustedPublisher` |
 | `verify-msi.ps1` | Administrative-install extraction + MSI table inspection |
 | `verify-client-access.ps1` | Standard-user pipe / process-query / Hello acceptance probe |
 | `setup-group.ps1` | Creates `RustVPN`, adds the installing user, safe rollback |
@@ -158,15 +160,17 @@ are blocked with a clear message; uninstall the newer build first.
 
 ## Signing
 
-Never commit certificates or private keys. Configure:
+Never commit certificates, private keys or passwords. The build reads:
 
-```powershell
-$env:RUSTVPN_SIGN_CERT_THUMBPRINT = '<SHA-1 thumbprint in CurrentUser\My>'
-# or
-$env:RUSTVPN_SIGN_CERT_FILE = 'D:\secure\rustvpn.pfx'
-$env:RUSTVPN_SIGN_CERT_PASSWORD = '<password>'
-$env:RUSTVPN_TIMESTAMP_URL = 'http://timestamp.digicert.com'  # optional
-```
+| Variable | Meaning |
+| --- | --- |
+| `RUSTVPN_SIGN_CERT_THUMBPRINT` | SHA-1 thumbprint in `CurrentUser\My` |
+| `RUSTVPN_SIGN_CERT_FILE` | `.pfx`/`.p12` path |
+| `RUSTVPN_SIGN_CERT_PASSWORD` | PFX password |
+| `RUSTVPN_SIGN_CERT_PASSWORD_FILE` | protected file containing the PFX password |
+| `RUSTVPN_TIMESTAMP_URL` | RFC 3161 timestamp server |
+| `RUSTVPN_NO_TIMESTAMP` | `1` disables timestamping for local dev builds |
+| `RUSTVPN_SIGNTOOL` | explicit `signtool.exe` |
 
 The build signs the GUI and daemon before packaging and the MSI after linking,
 then verifies each file with `signtool verify /pa`. If no certificate is
@@ -175,10 +179,66 @@ configured it verifies that the artifacts really are unsigned, writes
 comments, `docs\SIGNING.txt` and `BUILD-INFO.txt`. It never labels an unsigned
 build as signed.
 
-Formal distribution should use an EV code-signing certificate (hardware token
-or cloud HSM) and a timestamp server. Unsigned or newly issued OV builds will
-trigger SmartScreen "Unknown publisher" warnings until reputation accrues.
-See `docs/windows-install.md`.
+### Self-signed development certificate (development only)
+
+`create-dev-cert.ps1` creates a SHA-256/RSA-3072 code-signing certificate with
+subject `CN=RustVPN Development`, valid for three years by default, and
+exports:
+
+```text
+C:\rustvpn-signing\rustvpn-dev.pfx        private key (never copy to the repo/VM)
+C:\rustvpn-signing\rustvpn-dev.cer        public certificate for trust import
+C:\rustvpn-signing\dev-cert.password      generated PFX password
+```
+
+The directory and files are ACL-restricted to Administrators and SYSTEM, and
+the password is never printed. The script refuses to write inside the
+repository. Run the certificate helpers from `packaging\windows` on the
+dedicated Windows build host (elevated):
+
+```powershell
+# from packaging\windows
+powershell -NoProfile -ExecutionPolicy Bypass -File .\create-dev-cert.ps1
+# trust the public .cer locally so signtool verify /pa succeeds
+powershell -NoProfile -ExecutionPolicy Bypass -File .\trust-dev-cert.ps1 `
+    -CertFile C:\rustvpn-signing\rustvpn-dev.cer
+
+# from the repository root (cargo needs Cargo.toml in the current directory)
+$env:RUSTVPN_SIGN_CERT_FILE = 'C:\rustvpn-signing\rustvpn-dev.pfx'
+$env:RUSTVPN_SIGN_CERT_PASSWORD_FILE = 'C:\rustvpn-signing\dev-cert.password'
+$env:RUSTVPN_NO_TIMESTAMP = '1'
+.\packaging\windows\build-msi.ps1 -WintunDir C:\rustvpn-dev\vendor\wintun
+```
+
+A timestamp is not required for a local self-signed build; OV/EV releases
+should use a timestamp server. `-NoTimestamp` is equivalent to
+`RUSTVPN_NO_TIMESTAMP=1`. The build host keeps the development certificate in
+its machine trust stores so `signtool verify /pa` validates future builds; run
+`trust-dev-cert.ps1 -Remove` to revoke that local trust.
+
+Import the same `.cer` on the test VM before installing (elevated):
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\trust-dev-cert.ps1 `
+    -CertFile .\rustvpn-dev.cer
+Get-AuthenticodeSignature 'C:\Program Files\RustVPN\rustvpn-clientd.exe'
+```
+
+Remove it after testing (and uninstall the MSI first):
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\trust-dev-cert.ps1 `
+    -CertFile .\rustvpn-dev.cer -Remove
+```
+
+> **Development only.** A self-signed certificate is trusted only on hosts
+> that import it manually. Do not distribute these builds. Public releases
+> need an EV or OV code-signing certificate, a timestamp, and explicit
+> publisher/certificate pinning (the current GUI accepts any trusted subject
+> containing "RustVPN"). EV/OV onboarding remains future work.
+
+Unsigned or newly issued OV builds trigger SmartScreen "Unknown publisher"
+warnings until reputation accrues. See `docs/windows-install.md`.
 
 ## Inspection and acceptance
 

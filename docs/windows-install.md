@@ -244,19 +244,13 @@ the repository. The build reads:
 
 | Variable | Meaning |
 | --- | --- |
-| `RUSTVPN_SIGN_CERT_THUMBPRINT` | SHA-1 thumbprint in `CurrentUser\My` (preferred) |
+| `RUSTVPN_SIGN_CERT_THUMBPRINT` | SHA-1 thumbprint in `CurrentUser\My` |
 | `RUSTVPN_SIGN_CERT_FILE` | `.pfx`/`.p12` path |
 | `RUSTVPN_SIGN_CERT_PASSWORD` | PFX password |
+| `RUSTVPN_SIGN_CERT_PASSWORD_FILE` | protected file containing the PFX password |
 | `RUSTVPN_TIMESTAMP_URL` | timestamp server, default `http://timestamp.digicert.com` |
+| `RUSTVPN_NO_TIMESTAMP` | `1` disables timestamping for local dev builds |
 | `RUSTVPN_SIGNTOOL` | explicit `signtool.exe` |
-
-Example:
-
-```powershell
-$env:RUSTVPN_SIGN_CERT_THUMBPRINT = '<thumbprint>'
-$env:RUSTVPN_TIMESTAMP_URL = 'http://timestamp.digicert.com'
-.\packaging\windows\build-msi.ps1 -WintunDir C:\rustvpn-dev\vendor\wintun
-```
 
 The script signs the executables before packaging and the MSI after linking,
 then verifies each artifact with `signtool verify /pa`. If no certificate is
@@ -266,6 +260,59 @@ configured it does **not** pretend to sign:
 - `dist\windows\UNSIGNED.txt` is written;
 - Product comments, `docs\SIGNING.txt` and `BUILD-INFO.txt` say
   "Unsigned development build".
+
+### Self-signed development signing
+
+Until an EV/OV certificate is available, a dedicated Windows build host can
+use a self-signed certificate for local development and VM testing. This
+proves the signing path end to end; it is **not** suitable for public
+distribution.
+
+On the elevated build host:
+
+```powershell
+# from packaging\windows
+.\create-dev-cert.ps1
+.\trust-dev-cert.ps1 -CertFile C:\rustvpn-signing\rustvpn-dev.cer
+
+# from the repository root (the cargo build needs Cargo.toml in the CWD)
+$env:RUSTVPN_SIGN_CERT_FILE = 'C:\rustvpn-signing\rustvpn-dev.pfx'
+$env:RUSTVPN_SIGN_CERT_PASSWORD_FILE = 'C:\rustvpn-signing\dev-cert.password'
+$env:RUSTVPN_NO_TIMESTAMP = '1'
+.\packaging\windows\build-msi.ps1 -WintunDir C:\rustvpn-dev\vendor\wintun
+```
+
+`create-dev-cert.ps1` creates a three-year self-signed code-signing
+certificate (`CN=RustVPN Development`, SHA-256, Code Signing EKU,
+DigitalSignature key usage) and stores the PFX, password and public `.cer`
+under `C:\rustvpn-signing` with ACLs limited to Administrators/SYSTEM. It
+never writes inside the repository and never prints the password. A timestamp
+is optional for local builds; `-NoTimestamp` is equivalent to
+`RUSTVPN_NO_TIMESTAMP=1`.
+
+Before installing on a test VM, import the public `.cer` into the machine
+`Root` and `TrustedPublisher` stores (elevated):
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\trust-dev-cert.ps1 `
+    -CertFile .\rustvpn-dev.cer
+Get-AuthenticodeSignature 'C:\Program Files\RustVPN\rustvpn-clientd.exe'
+```
+
+`Status` must be `Valid`; the signer subject contains `RustVPN Development`,
+so the GUI's pre-passphrase publisher check accepts the daemon. After testing,
+uninstall the MSI and remove the certificate from both stores:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\trust-dev-cert.ps1 `
+    -CertFile .\rustvpn-dev.cer -Remove
+```
+
+> **Warning:** self-signed builds are for development/testing only. Other
+> machines reject them unless the certificate is imported manually. Public
+> releases still require an EV or OV certificate, a timestamp server, and
+> publisher/certificate pinning. Uninstall the test MSI and remove the
+> development certificate from test hosts when finished.
 
 Unsigned and newly issued OV certificates trigger SmartScreen "Unknown
 publisher" warnings until reputation accumulates. Formal distribution should
@@ -445,6 +492,10 @@ existing `windows-shim.yml` prototype workflow is separate.
 - Event Log integration for the service is absent; the file log is primary.
 - Certificate pinning for portable signed daemons is not implemented; the
   installer path check is the primary rule.
+- Authenticode signing has been validated end to end with a development
+  self-signed certificate (section 6), but a formal EV/OV certificate,
+  timestamping for releases, and publisher/certificate pinning remain future
+  work. Development-signed builds are not for public distribution.
 - Pre-release MSI versions need an explicit increasing `-MsiVersion` if two
   betas must upgrade in order.
 - The MSI does not remove the `RustVPN` group or `%ProgramData%\RustVPN` on
