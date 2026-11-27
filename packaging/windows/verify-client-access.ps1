@@ -2,9 +2,10 @@
 #
 # Run this as an unprivileged user to test the real M5 security boundary:
 #   1. the named-pipe DACL accepts the account (RustVPN group membership),
-#   2. the daemon process allows PROCESS_QUERY_LIMITED_INFORMATION,
+#   2. the daemon process allows PROCESS_QUERY_LIMITED_INFORMATION + READ_CONTROL,
 #   3. QueryFullProcessImageNameW resolves the installed daemon image,
-#   4. a protocol-v2 Hello round-trip succeeds.
+#   4. the process owner SID is LocalSystem (the service account),
+#   5. a protocol-v2 Hello round-trip succeeds.
 #
 # The GUI performs steps 2-3 before sending a passphrase; this script is the
 # manual acceptance check for that path.  It never connects a tunnel.
@@ -36,6 +37,18 @@ public static class RustVPNPipeProbe
 
     [DllImport("kernel32.dll", SetLastError = true)]
     public static extern bool CloseHandle(IntPtr handle);
+
+    [DllImport("advapi32.dll", SetLastError = true)]
+    public static extern uint GetSecurityInfo(
+        IntPtr handle, int objectType, uint securityInfo,
+        out IntPtr owner, IntPtr group, IntPtr dacl, IntPtr sacl,
+        out IntPtr descriptor);
+
+    [DllImport("advapi32.dll", SetLastError = true)]
+    public static extern bool ConvertSidToStringSidW(IntPtr sid, out IntPtr text);
+
+    [DllImport("kernel32.dll")]
+    public static extern IntPtr LocalFree(IntPtr memory);
 }
 '@
 
@@ -60,9 +73,10 @@ try {
     $serverPid = $serverProcessId
     Write-Host "server PID: $serverPid"
 
-    # PROCESS_QUERY_LIMITED_INFORMATION.  A LocalSystem service is not openable
-    # by a standard user unless the daemon granted this right (M5).
-    $process = [RustVPNPipeProbe]::OpenProcess(0x1000, $false, $serverPid)
+    # PROCESS_QUERY_LIMITED_INFORMATION | READ_CONTROL.  A LocalSystem service
+    # is not openable by a standard user unless the daemon granted these
+    # rights (M5/M6).
+    $process = [RustVPNPipeProbe]::OpenProcess(0x21000, $false, $serverPid)
     if ($process -eq [IntPtr]::Zero) {
         throw "OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION) failed: $([Runtime.InteropServices.Marshal]::GetLastWin32Error())"
     }
@@ -74,10 +88,34 @@ try {
             throw "QueryFullProcessImageNameW failed: $([Runtime.InteropServices.Marshal]::GetLastWin32Error())"
         }
         $image = $buffer.ToString()
+        [IntPtr]$owner = [IntPtr]::Zero
+        [IntPtr]$descriptor = [IntPtr]::Zero
+        $securityStatus = [RustVPNPipeProbe]::GetSecurityInfo(
+            $process, 6, 1, [ref]$owner, [IntPtr]::Zero, [IntPtr]::Zero, [IntPtr]::Zero, [ref]$descriptor)
+        if ($securityStatus -ne 0 -or $owner -eq [IntPtr]::Zero) {
+            throw "GetSecurityInfo(owner) failed: $securityStatus"
+        }
+        try {
+            [IntPtr]$ownerText = [IntPtr]::Zero
+            if (-not [RustVPNPipeProbe]::ConvertSidToStringSidW($owner, [ref]$ownerText)) {
+                throw "ConvertSidToStringSidW failed: $([Runtime.InteropServices.Marshal]::GetLastWin32Error())"
+            }
+            try {
+                $ownerSid = [Runtime.InteropServices.Marshal]::PtrToStringUni($ownerText)
+            } finally {
+                [void][RustVPNPipeProbe]::LocalFree($ownerText)
+            }
+        } finally {
+            [void][RustVPNPipeProbe]::LocalFree($descriptor)
+        }
     } finally {
         [void][RustVPNPipeProbe]::CloseHandle($process)
     }
     Write-Host "server image: $image"
+    Write-Host "server owner SID: $ownerSid"
+    if ($ownerSid -ne 'S-1-5-18') {
+        throw "server owner SID is $ownerSid, expected LocalSystem S-1-5-18"
+    }
     Write-Host ("process query completed after {0:N3}s" -f ([DateTime]::UtcNow - $connectedAt).TotalSeconds)
 
     $normalizedImage = $image.Replace('/', '\')
@@ -124,7 +162,7 @@ try {
     if ($parsed.op -ne 'hello' -or $parsed.version -ne 2) {
         throw "unexpected Hello response"
     }
-    Write-Host 'RESULT: OK (pipe, process query, installed image and Hello v2 all verified)'
+    Write-Host 'RESULT: OK (pipe, process query, installed image, SYSTEM owner and Hello v2 all verified)'
     exit 0
 } catch {
     Write-Host "RESULT: FAIL - $($_.Exception.Message)"

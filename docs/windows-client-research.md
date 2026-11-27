@@ -481,13 +481,15 @@ Product/Feature/UpgradeCode 与打包资源布局；M5 需要服务注册、延�
 ### 8.2 组、服务访问与进程查询
 
 - 安装器在 `StartServices` 前运行 `installer\setup-group.ps1`，创建本地
-  `RustVPN` 组并把 `[LogonUser]`（或 `RUSTVPN_USER`）加入；失败时回滚
-  本次创建的组；服务模式缺少该组时拒绝启动，而不是回退到 INTERACTIVE。
+  `RustVPN` 组并把 `[LogonUser]`（或 `RUSTVPN_USER`）加入；成员添加失败时
+  保留（可能为空的）组，服务仍可 fail-closed 启动。服务模式缺少该组时拒绝
+  启动，而不是回退到 INTERACTIVE。
 - daemon 的 pipe DACL 使用该组；M2 的客户端 token 校验也在同一组上。
 - daemon 启动时给同一组与 daemon 自身账户授予
-  `PROCESS_QUERY_LIMITED_INFORMATION`（仅 0x1000），使 M4 GUI 能在发送
-  口令前解析 LocalSystem 服务镜像并校验 Authenticode；不授予内存、句柄
-  或终止权限。
+  `PROCESS_QUERY_LIMITED_INFORMATION | READ_CONTROL`（0x21000），使 M4 GUI
+  能在发送口令前解析 LocalSystem 服务镜像、校验 Authenticode 并读取进程
+  owner SID；不授予内存、句柄或终止权限。GUI 不打开服务 token，因为标准
+  用户无权读取 LocalSystem token，即使进程句柄可查询。
 - 标准用户需要重新登录以刷新包含组的 token；安装器/文档已说明。
 - M5 修复了 `group_sid_bytes()` 保留 68 字节缓冲区的 bug：Windows 10 的
   `LookupAccountNameW` 成功时不总是更新 `cbSid`，导致 `ClientPolicy` 的

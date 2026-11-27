@@ -4,9 +4,9 @@
 # the group and restricts the named pipe to it.  The script never fails the
 # installation:
 #   * if the group already exists it is reused;
-#   * if the user cannot be added, a group created by this run is deleted; the
-#     service then fails closed (missing RustVPN group), never falling back to
-#     INTERACTIVE users;
+#   * if the user cannot be added, the group is kept (empty if necessary) so
+#     the fail-closed service can still start; the account must be added
+#     manually and must re-login before its token carries the group;
 #   * membership becomes effective at the next logon for an account whose
 #     token was created before this run (a re-login is documented).
 param(
@@ -67,14 +67,22 @@ $skip = @('', 'SYSTEM', '$', 'LocalSystem', 'NT AUTHORITY\SYSTEM',
     'NT AUTHORITY\LOCAL SERVICE', 'NT AUTHORITY\NETWORK SERVICE')
 if ($skip -contains $User) {
     if (-not (Test-Group $group)) {
-        Write-Log 'no interactive user; not creating the RustVPN group (service will fail closed until the group exists)'
+        & $net localgroup $group /add /comment:"RustVPN client users" *>> $log
+        if ($LASTEXITCODE -ne 0 -or -not (Test-Group $group)) {
+            Write-Log 'no interactive user and cannot create the RustVPN group; service will fail closed'
+            exit 0
+        }
+        Write-Log 'no interactive user; created an empty RustVPN group for the fail-closed service'
     } else {
         Write-Log 'no interactive user to add; existing RustVPN group left unchanged'
     }
     exit 0
 }
 if ($User -match '["\r\n]') {
-    Write-Log 'refusing a user name containing quotes or newlines'
+    if (-not (Test-Group $group)) {
+        & $net localgroup $group /add /comment:"RustVPN client users" *>> $log
+    }
+    Write-Log 'refusing a user name containing quotes or newlines; group left present for the service'
     exit 0
 }
 

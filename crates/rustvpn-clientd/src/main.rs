@@ -29,8 +29,8 @@ use zeroize::Zeroizing;
 
 const DAEMON_VERSION: &str = env!("CARGO_PKG_VERSION");
 const MAX_LOG_LINES: usize = 2000;
-const MAX_LOG_LINE_CHARS: usize = 2048;
-const MAX_LOGS_RESPONSE_LINES: usize = 400;
+const MAX_LOG_LINE_CHARS: usize = 1024;
+const MAX_LOGS_RESPONSE_LINES: usize = 256;
 const DEFAULT_HELLO_TIMEOUT_SECS: u64 = 5;
 const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 300;
 const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -378,7 +378,10 @@ fn validate_console_endpoint(args: &Args) -> Result<()> {
     }
     let normalized = rustvpn_client_ipc::windows::normalize_pipe_path(&args.socket)
         .with_context(|| format!("validate console endpoint {:?}", args.socket))?;
-    if normalized == std::path::Path::new(rustvpn_client_ipc::windows::DEFAULT_PIPE_NAME) {
+    if normalized
+        .to_string_lossy()
+        .eq_ignore_ascii_case(rustvpn_client_ipc::windows::DEFAULT_PIPE_NAME)
+    {
         bail!(
             "console mode must not bind the production pipe {}; pass a development \
              -socket name (and RUSTVPN_CLIENTD_SOCKET to the GUI) or run the service",
@@ -392,10 +395,11 @@ fn validate_console_endpoint(args: &Args) -> Result<()> {
 ///
 /// The GUI verifies the pipe server's image path and Authenticode signer
 /// before sending a passphrase.  A LocalSystem service is not openable by a
-/// standard user by default, so the daemon grants `PROCESS_QUERY_LIMITED_
-/// INFORMATION` to the same group that the pipe DACL allows.  This is
-/// additive to the GUI policy in M4: it exposes no memory or control rights
-/// and the GUI still fails closed when the image is not the installed daemon.
+/// standard user by default, so the daemon grants
+/// `PROCESS_QUERY_LIMITED_INFORMATION | READ_CONTROL` to the same group that
+/// the pipe DACL allows.  READ_CONTROL lets the GUI read the process owner;
+/// neither right exposes memory, handle duplication or terminate access, and
+/// the GUI still fails closed when the image/owner is not trusted.
 #[cfg(windows)]
 pub(crate) fn harden_process_identity(config: &RunConfig) {
     let audience = config.pipe_group.as_deref().unwrap_or("INTERACTIVE users");
@@ -605,9 +609,9 @@ async fn run(mut config: RunConfig, shutdown: CancellationToken) -> Result<()> {
     spawn_collector(events_tx.clone(), status.clone(), logs.clone());
 
     // In service mode retry a squatted endpoint instead of exiting on the
-    // first first-instance collision.  A bounded retry keeps a transient
-    // squatter/SCM race from taking the service down permanently; console
-    // mode keeps its immediate error.
+    // first first-instance collision.  The retry window is 60 s and stays
+    // below the SCM wait hint configured in service.rs; console mode keeps
+    // its immediate error.
     let mut bind_attempt = 0u32;
     let listener = loop {
         if shutdown.is_cancelled() {
@@ -620,10 +624,10 @@ async fn run(mut config: RunConfig, shutdown: CancellationToken) -> Result<()> {
             },
         ) {
             Ok(listener) => break listener,
-            Err(error) if config.service_mode && bind_attempt < 60 => {
+            Err(error) if config.service_mode && bind_attempt < 30 => {
                 bind_attempt += 1;
                 dlog!(
-                    "bind {} failed: {error}; retrying in 2s ({bind_attempt}/60)",
+                    "bind {} failed: {error}; retrying in 2s ({bind_attempt}/30)",
                     socket_path.display()
                 );
                 tokio::select! {

@@ -944,13 +944,8 @@ fn spawn_disconnect(_app: &tauri::AppHandle) {
 }
 
 async fn disconnect_any() {
-    for path in rustvpn_client_ipc::candidate_socket_paths() {
-        if let Ok(Ok(mut client)) =
-            tokio::time::timeout(Duration::from_secs(2), Client::connect(&path)).await
-        {
-            let _ = client.disconnect().await;
-            return;
-        }
+    if let Ok(mut client) = ipc_client(Duration::from_secs(2)).await {
+        let _ = client.disconnect().await;
     }
 }
 

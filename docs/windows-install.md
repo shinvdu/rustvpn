@@ -124,11 +124,11 @@ net localgroup RustVPN <user> /add
 # that user must log off/on afterwards
 ```
 
-If the installer cannot create the group or add the user (for example a
-domain policy), `installer\setup-group.ps1` rolls back a group it created; the
-service then fails closed until the group exists. The reason is logged to
-`%TEMP%\RustVPN-setup-group.log`. If a pre-existing group cannot accept the
-user, add the user manually and re-login.
+If the installer cannot add the user (for example a domain policy), the helper
+keeps the `RustVPN` group (empty if necessary) so the fail-closed service can
+start; add the account manually and log on again. If the group itself cannot
+be created, the service start fails and the install rolls back. The reason is
+logged to `%TEMP%\RustVPN-setup-group.log`.
 
 On uninstall the group is **kept**, together with its membership, because an
 administrator may manage it independently of the package. Remove it manually
@@ -335,7 +335,7 @@ The MSI:
 
 1. sends a stop to `rustvpn-clientd` and waits (the daemon removes its
    transient routes/DNS/NRPT/IPv6 rules as on a normal stop);
-2. runs the install-only `--cleanup` helper before files are removed, which
+2. runs the uninstall-only `--cleanup` helper before files are removed, which
    clears the deferred anti-loop route and `netstate.json` left by the normal
    stop;
 3. removes the service registration and `Program Files\RustVPN`;

@@ -4,7 +4,7 @@
 > **分支：** `feature/client-ui`
 > **HEAD：** 以 `git log -1` 为准
 > **同步状态：** 以 `git status` 为准
-> **工作区：** 2026-11-27 复审修复位于工作区，尚未提交
+> **工作区：** 以 `git status` 为准；2026-11-27 复审修复已提交
 > **问题索引：** `docs/windows-client-dev/windows-client-issues.xlsx`（仅本地）
 > **问题详情：** `docs/windows-client-dev/issues/WIN-<NNN>-<slug>.md`（仅本地）
 
@@ -38,7 +38,7 @@
 | M3 网络配置 | `cac143a`, `06a092b` | 完成 | 地址/路由/DNS/NRPT/IPv6 防护、防环路路由、ACL 受限的 netstate、崩溃清理。真实 Windows 契约缺陷已修复，分流隧道路由在 M6 中验证。 |
 | M4 GUI 适配 | `7b73a82` | 完成 | 配置 ACL、Credential Manager、HKCU 自启动、区域设置、命名管道信息、密码前守护进程身份校验。RDP 验证通过。 |
 | M5 打包 | `cb39124` | 完成 | MSI、LocalSystem 服务、RustVPN 组、进程查询 DACL、Wintun 固定、签名钩子。安装、同版本升级、卸载以及标准用户访问均已验证。 |
-| M6 加固 + E2E | `06a092b` … `ffe9657` | 基本完成 | 分流/全隧道 plain+noise、DNS/NRPT、IPv6 阻断、断连修复、rekey/重连、链路抖动、强杀恢复、fuzz、iperf3；VPS 全隧道互联网出口通过；Windows CI 已真实运行并通过。2026-11-27 代码复审又修复了跨用户守护进程冒充、状态/事件通道校验、既有 Wintun 清理、pipe 抢占与 IPC 资源上限等 19 项（WIN-025…044）。受条件阻塞的项列于下文。 |
+| M6 加固 + E2E | `06a092b` … `ffe9657` | 基本完成 | 分流/全隧道 plain+noise、DNS/NRPT、IPv6 阻断、断连修复、rekey/重连、链路抖动、强杀恢复、fuzz、iperf3；VPS 全隧道互联网出口通过；Windows CI 已真实运行并通过。2026-11-27 两轮代码复审新增登记 WIN-025…050，其中 25 项已修复（跨用户守护进程冒充、状态/事件通道校验、既有 Wintun 清理、pipe 抢占与 IPC 资源上限等）；WIN-045 仍待 Windows 安全/并发 E2E。受条件阻塞的项列于下文。 |
 
 ## 3. 已在 Windows 上验证
 
@@ -63,7 +63,6 @@
 | WIN-013 | 反向 iperf3 约 150 Mbit/s，出现 193 次重传 | 抓包、与 MSS clamp 对比、检查 Wintun RX/队列计数器 |
 | WIN-014 | 崩溃清理需约 10-15 秒才允许重连 | 替换或批量执行重度依赖 PowerShell 的启动清理；发布清理进度 |
 | WIN-027（剩余） | 服务被显式停止后，普通用户仍可抢占 global pipe | 已加 60×2s bind 重试；后续可再做端点不可预测化 |
-| WIN-043（剩余） | CI 下载 WiX 未 pin SHA-256 | 取得官方 zip 固定摘要后增加校验 |
 | WIN-045 | Windows 安全/并发 E2E 缺口 | 在自托管 runner 增加跨用户、假 pipe、既有 adapter、并发 shutdown 回归 |
 
 ## 5. 受条件阻塞
@@ -113,7 +112,7 @@
 3. 在一次性物理硬件上验证睡眠/恢复（WIN-016）。
 4. 为自托管 Windows E2E 注册受保护 runner，并让 workflow 进入默认分支（WIN-018 剩余项）。
 5. 获取 EV/OV 证书，签名 GUI/守护进程/MSI，启用发布时间戳并固定 publisher/certificate（WIN-019 剩余项）。
-6. 完成 WIN-043 的 WiX 摘要固定，并在一次性 Windows 环境执行 WIN-045 的安全/并发 E2E。
+6. 在一次性 Windows 环境执行 WIN-045 的安全/并发 E2E。
 7. 仅在具备足够容量的外层路径可用后，再重新评估 encless/TCP（WIN-015）。
 
 ## 10. 更新节奏

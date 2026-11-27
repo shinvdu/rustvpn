@@ -34,17 +34,6 @@ pub fn run_dispatcher() -> ServiceResult<()> {
 fn service_main(_arguments: Vec<OsString>) {
     init_service_log();
     let args = parse_args();
-    let mut config = match build_config(&args, false) {
-        Ok(config) => config,
-        Err(error) => {
-            dlog!("service configuration error: {error:#}");
-            process::exit(1);
-        }
-    };
-    crate::harden_process_identity(&config);
-    let (ready_tx, mut ready_rx) = tokio::sync::oneshot::channel();
-    config.ready = Some(ready_tx);
-
     let shutdown = CancellationToken::new();
     let handler_shutdown = shutdown.clone();
     let shared_status: Arc<Mutex<Option<service_control_handler::ServiceStatusHandle>>> =
@@ -93,6 +82,23 @@ fn service_main(_arguments: Vec<OsString>) {
         dlog!("cannot report StartPending: {error}");
         process::exit(1);
     }
+
+    let mut config = match build_config(&args, false) {
+        Ok(config) => config,
+        Err(error) => {
+            dlog!("service configuration error: {error:#}");
+            let _ = status.set_service_status(service_status(
+                ServiceState::Stopped,
+                ServiceControlAccept::empty(),
+                ServiceExitCode::ServiceSpecific(1),
+                0,
+            ));
+            process::exit(1);
+        }
+    };
+    crate::harden_process_identity(&config);
+    let (ready_tx, mut ready_rx) = tokio::sync::oneshot::channel();
+    config.ready = Some(ready_tx);
 
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -166,7 +172,8 @@ fn service_status(
         controls_accepted: accepted,
         exit_code,
         checkpoint,
-        wait_hint: Duration::from_secs(30),
+        // Covers the 60 s service-mode bind retry window plus teardown.
+        wait_hint: Duration::from_secs(120),
         process_id: None,
     }
 }

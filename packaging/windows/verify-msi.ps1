@@ -31,6 +31,9 @@ if (-not $explicitExtract) {
 New-Item -ItemType Directory -Force -Path $work | Out-Null
 $extract = Join-Path $work 'payload'
 $darkOut = Join-Path $work 'dark'
+# An explicit ExtractDir is caller-owned; only clear the subdirectories this
+# script fills, so stale payload files cannot make a missing-file check pass.
+Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $extract, $darkOut
 New-Item -ItemType Directory -Force -Path $extract, $darkOut | Out-Null
 
 function Write-Step([string]$Message) { Write-Host "==> $Message" }

@@ -50,7 +50,8 @@ pub struct ProcessImage {
     pub image: String,
     /// Authenticode signer subject, when the image is signed and trusted.
     pub publisher: Option<String>,
-    /// Account SID of the server process.
+    /// Owner SID of the server process (SYSTEM for the service, the user for
+    /// a console daemon).
     pub user_sid: String,
     pub trust: Trust,
 }
@@ -85,8 +86,8 @@ pub fn verify_pipe_server(pid: u32) -> Result<ProcessImage, String> {
         gui_exe.as_deref(),
         &installed_dirs,
     )?;
-    let user_sid = rustvpn_client_ipc::windows::process_user_sid_string(pid)
-        .map_err(|error| format!("read the account SID of the pipe server: {error}"))?;
+    let user_sid = rustvpn_client_ipc::windows::process_owner_sid_string(pid)
+        .map_err(|error| format!("read the owner SID of the pipe server: {error}"))?;
     let current_sid = rustvpn_client_ipc::windows::current_user_sid_string()
         .map_err(|error| format!("read the current user SID: {error}"))?;
     daemon_identity::check_daemon_user(&user_sid, &current_sid, trust == Trust::Installed)?;

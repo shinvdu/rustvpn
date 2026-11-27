@@ -19,7 +19,7 @@
 //! malicious process is still in the trusted set; the pipe DACL cannot
 //! distinguish it, and it can also create extra pipe instances because
 //! GENERIC_WRITE implies FILE_CREATE_PIPE_INSTANCE on a pipe object.  The
-//! GUI therefore also verifies the server image, publisher and token user.
+//! GUI therefore also verifies the server image, publisher and process owner.
 
 use std::ffi::{c_void, OsStr};
 use std::io;
@@ -30,19 +30,19 @@ use std::ptr;
 
 use windows_sys::Win32::Foundation::{LocalFree, ERROR_SUCCESS, HANDLE, HLOCAL};
 use windows_sys::Win32::Security::Authorization::{
-    ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, SetSecurityInfo,
-    SDDL_REVISION_1, SE_KERNEL_OBJECT,
+    ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, GetSecurityInfo,
+    SetSecurityInfo, SDDL_REVISION_1, SE_KERNEL_OBJECT,
 };
 use windows_sys::Win32::Security::{
     CreateWellKnownSid, GetLengthSid, GetSecurityDescriptorDacl, GetTokenInformation, TokenGroups,
     TokenUser, WinBuiltinAdministratorsSid, ACL, DACL_SECURITY_INFORMATION,
-    PROTECTED_DACL_SECURITY_INFORMATION, PSID, SECURITY_ATTRIBUTES, SECURITY_MAX_SID_SIZE,
-    TOKEN_GROUPS, TOKEN_QUERY, TOKEN_USER,
+    OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
+    SECURITY_ATTRIBUTES, SECURITY_MAX_SID_SIZE, TOKEN_GROUPS, TOKEN_QUERY, TOKEN_USER,
 };
 use windows_sys::Win32::System::Pipes::GetNamedPipeClientProcessId;
 use windows_sys::Win32::System::Threading::{
     GetCurrentProcess, GetCurrentProcessId, OpenProcess, OpenProcessToken,
-    PROCESS_QUERY_LIMITED_INFORMATION,
+    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_READ_CONTROL,
 };
 
 /// Prefix required for a Win32 named-pipe path.
@@ -158,7 +158,12 @@ pub fn pipe_sddl(group_sid: Option<&str>, daemon_user: Option<&str>) -> String {
 /// duplication or terminate rights to ordinary users.  INTERACTIVE is never
 /// granted; without a dedicated group only the daemon's own account can query.
 pub fn process_sddl(group_sid: Option<&str>, daemon_user: Option<&str>) -> String {
-    let query = format!("(A;;0x{PROCESS_QUERY_LIMITED_INFORMATION:X};;;");
+    // READ_CONTROL is needed to inspect the process owner; it does not expose
+    // memory, handles or terminate rights.
+    let query = format!(
+        "(A;;0x{:X};;;",
+        PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_READ_CONTROL
+    );
     let mut aces = vec!["(A;;FA;;;SY)".to_string(), "(A;;FA;;;BA)".to_string()];
     if let Some(sid) = group_sid {
         aces.push(format!("{query}{sid})"));
@@ -422,6 +427,53 @@ pub fn process_user_sid_string(pid: u32) -> io::Result<String> {
     sid_to_string(&process_user_sid(pid)?)
 }
 
+/// String SID of the account that owns the process object.  The owner is the
+/// account that created the process (SYSTEM for an SCM service), and reading
+/// it requires only PROCESS_READ_CONTROL on the process object.  Unlike
+/// opening the process token, this is available to the pipe audience that the
+/// daemon explicitly grants query access.
+pub fn process_owner_sid_string(pid: u32) -> io::Result<String> {
+    let process = unsafe {
+        OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_READ_CONTROL,
+            0,
+            pid,
+        )
+    };
+    if process.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    let process = unsafe { OwnedHandle::from_raw_handle(process as RawHandle) };
+    let mut owner: PSID = ptr::null_mut();
+    let mut descriptor: PSECURITY_DESCRIPTOR = ptr::null_mut();
+    let status = unsafe {
+        GetSecurityInfo(
+            process.as_raw_handle() as HANDLE,
+            SE_KERNEL_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            &mut owner,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            ptr::null_mut(),
+            &mut descriptor,
+        )
+    };
+    if status != ERROR_SUCCESS {
+        return Err(io::Error::from_raw_os_error(status as i32));
+    }
+    if owner.is_null() {
+        unsafe {
+            LocalFree(descriptor as HLOCAL);
+        }
+        return Err(io::Error::other("process owner SID is null"));
+    }
+    let bytes = sid_bytes(owner);
+    unsafe {
+        LocalFree(descriptor as HLOCAL);
+    }
+    sid_to_string(&bytes?)
+}
+
 /// PID of the process on the other end of a connected server pipe.
 pub(crate) fn client_process_id(pipe: HANDLE) -> io::Result<u32> {
     let mut pid = 0u32;
@@ -648,7 +700,10 @@ mod tests {
         assert!(sddl.starts_with("D:P"), "{sddl}");
         assert!(sddl.contains("(A;;FA;;;SY)"), "{sddl}");
         assert!(sddl.contains("(A;;FA;;;BA)"), "{sddl}");
-        assert!(sddl.contains("(A;;0x1000;;;S-1-5-21-9-9-9-1001)"), "{sddl}");
+        assert!(
+            sddl.contains("(A;;0x21000;;;S-1-5-21-9-9-9-1001)"),
+            "{sddl}"
+        );
         assert!(!sddl.contains(";;;IU)"), "{sddl}");
         // No write/terminate-style access for ordinary users.
         assert!(!sddl.contains("0x1F"), "{sddl}");
@@ -659,7 +714,10 @@ mod tests {
     #[test]
     fn process_dacl_dedicated_group_replaces_interactive() {
         let sddl = process_sddl(Some("S-1-5-21-1-2-3-1001"), None);
-        assert!(sddl.contains("(A;;0x1000;;;S-1-5-21-1-2-3-1001)"), "{sddl}");
+        assert!(
+            sddl.contains("(A;;0x21000;;;S-1-5-21-1-2-3-1001)"),
+            "{sddl}"
+        );
         assert!(!sddl.contains(";;;IU)"), "{sddl}");
     }
 
@@ -676,11 +734,13 @@ mod tests {
     }
 
     #[test]
-    fn process_user_sid_string_matches_the_current_process() {
+    fn process_user_and_owner_sid_strings_match_the_current_process() {
         let current = current_user_sid_string().expect("current user SID");
         let own = process_user_sid_string(std::process::id()).expect("own process SID");
         assert_eq!(own, current);
-        assert!(own.starts_with("S-1-"));
+        let owner = process_owner_sid_string(std::process::id()).expect("own process owner");
+        assert_eq!(owner, current);
+        assert!(owner.starts_with("S-1-"));
     }
 
     #[test]

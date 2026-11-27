@@ -10,8 +10,8 @@ This directory builds the per-machine RustVPN Windows installer:
 | `create-dev-cert.ps1` | Development-only self-signed code-signing certificate + protected PFX/CER |
 | `trust-dev-cert.ps1` | Import/remove the `.cer` in machine `Root` and `TrustedPublisher` |
 | `verify-msi.ps1` | Administrative-install extraction + MSI table inspection |
-| `verify-client-access.ps1` | Standard-user pipe / process-query / Hello acceptance probe |
-| `setup-group.ps1` | Creates `RustVPN`, adds the installing user, safe rollback |
+| `verify-client-access.ps1` | Standard-user pipe / process-query / owner-SID / Hello acceptance probe |
+| `setup-group.ps1` | Creates `RustVPN`, adds the installing user, best-effort membership |
 | `license.rtf` | License page shown by `WixUI_Minimal` |
 | `licenses/` | Wintun 0.14.1 license, version and SHA-256 metadata |
 
@@ -37,7 +37,9 @@ and embedded by `tauri-build`), so GUI behaviour is untouched.
 - Windows 10/11 x64 build host.
 - Rust 1.90+ with `x86_64-pc-windows-msvc`; VS 2022 Build Tools.
 - WiX Toolset 3.14 (`candle.exe`, `light.exe`, `dark.exe`) on `PATH` or in
-  `C:\Program Files (x86)\WiX Toolset v3.14\bin`.
+  `C:\Program Files (x86)\WiX Toolset v3.14\bin`.  The CI fallback pins the
+  official `wix314-binaries.zip` SHA-256 to
+  `6ac824e1642d6f7277d0ed7ea09411a508f6116ba6fae0aa5f2c7daa2ff43d31`.
 - Windows SDK `signtool.exe` (only needed for signing/verification; the build
   script locates it under `Windows Kits\10\bin` when it is not on `PATH`).
 - A genuine Wintun 0.14.1 amd64 DLL. The default source is
@@ -127,9 +129,8 @@ before `StartServices`. It creates the local `RustVPN` group if needed and adds
 `[LogonUser]` (override with the public `RUSTVPN_USER` property). The daemon
 then auto-detects the group (M2) and restricts the pipe to SYSTEM,
 Administrators and that group. If membership cannot be applied, the helper
-rolls back a group it created; service mode then fails closed until the group
-exists. Otherwise the account needs a re-login before its token carries the
-group.  There is no INTERACTIVE fallback.
+keeps the created group (empty if necessary) so the fail-closed service can
+start; add the account manually and re-login. There is no INTERACTIVE fallback.
 
 At startup the daemon also applies a process DACL that grants
 `PROCESS_QUERY_LIMITED_INFORMATION` (0x1000) to the same pipe audience. The M4

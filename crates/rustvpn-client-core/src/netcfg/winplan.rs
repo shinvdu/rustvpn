@@ -913,7 +913,9 @@ pub enum RouteDecision {
     Add,
     /// An identical RustVPN-owned route is already present (idempotent).
     Idempotent,
-    /// An identical, unowned route is present; reuse it but never delete it.
+    /// An identical, unowned route is present.  Default and split routes are
+    /// adopted into the state file so teardown can remove them; host routes
+    /// are reused without adoption.
     Reuse,
     /// The route is the adapter's connected route; nothing to add.
     SkipConnected,
@@ -1469,7 +1471,16 @@ async fn install_steps(
                 ctx.store.save(state)?;
                 existing_routes.push(entry(&default_route));
             }
-            RouteDecision::Idempotent | RouteDecision::Reuse => {}
+            RouteDecision::Idempotent => {}
+            RouteDecision::Reuse => {
+                // Adopt an exact unowned tunnel default so a later full
+                // cleanup (for example after a pre-existing adapter survives
+                // close) can remove it.  It is not an unrelated physical
+                // default: the interface is our Wintun adapter.
+                let alias = state.iface.clone();
+                state.routes.push(persisted(&default_route, &alias));
+                ctx.store.save(state)?;
+            }
             RouteDecision::SkipConnected => unreachable!("default routes are never skipped"),
         }
     }
@@ -1510,7 +1521,15 @@ async fn install_steps(
                      it is already present and is not added again"
                 );
             }
-            RouteDecision::Idempotent | RouteDecision::Reuse => {}
+            RouteDecision::Idempotent => {}
+            RouteDecision::Reuse => {
+                // Same adoption rule as the default route; without this a
+                // state-file loss leaves a split route that cleanup cannot
+                // find.
+                let alias = state.iface.clone();
+                state.routes.push(persisted(&route, &alias));
+                ctx.store.save(state)?;
+            }
         }
     }
 
@@ -2817,6 +2836,81 @@ mod tests {
         assert!(
             store.load().unwrap().is_some(),
             "rollback keeps the state file for the next-start cleanup"
+        );
+    }
+
+    #[tokio::test]
+    async fn reused_default_and_split_routes_are_adopted_and_cleaned() {
+        let system = FakeSystem::new();
+        let store = TempStore::new("reuse-adopt");
+        let probe = Probe { alive: false };
+        system
+            .routes
+            .lock()
+            .unwrap()
+            .push(route("0.0.0.0/0", 7, "0.0.0.0", 0));
+
+        let state = install_with(
+            ctx(&system, &store, &probe),
+            &full_spec(),
+            Some("203.0.113.10:1194".parse().unwrap()),
+            1500,
+            NetOptions::default(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            state
+                .routes
+                .iter()
+                .any(|route| route.kind == RouteKind::Default),
+            "the exact unowned default must be recorded for cleanup"
+        );
+        let report = cleanup_state(&system, &state).await;
+        assert!(report.ok(), "{report:?}");
+        assert!(
+            !system
+                .routes
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|route| route.dest == "0.0.0.0/0" && route.ifindex == 7),
+            "the adopted default must be removed by cleanup"
+        );
+
+        let system = FakeSystem::new();
+        let store = TempStore::new("reuse-split");
+        system
+            .routes
+            .lock()
+            .unwrap()
+            .push(route("192.168.50.0/24", 7, "10.88.0.1", 50));
+        let state = install_with(
+            ctx(&system, &store, &probe),
+            &split_spec(),
+            Some("203.0.113.10:1194".parse().unwrap()),
+            1500,
+            NetOptions::default(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            state
+                .routes
+                .iter()
+                .any(|route| route.kind == RouteKind::Split),
+            "the exact unowned split route must be recorded for cleanup"
+        );
+        let report = cleanup_state(&system, &state).await;
+        assert!(report.ok(), "{report:?}");
+        assert!(
+            !system
+                .routes
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|route| route.dest == "192.168.50.0/24" && route.ifindex == 7),
+            "the adopted split route must be removed by cleanup"
         );
     }
 

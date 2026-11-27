@@ -129,13 +129,12 @@ if (-not $configured) {
         'Signing inputs: RUSTVPN_SIGN_CERT_THUMBPRINT, or RUSTVPN_SIGN_CERT_FILE +',
         'RUSTVPN_SIGN_CERT_PASSWORD / RUSTVPN_SIGN_CERT_PASSWORD_FILE.',
         'See docs/windows-install.md and packaging/windows/README.md.',
-        'Verified with: ' + $signToolPath,
         'Time: ' + (Get-Date -Format o)
     ) -join [Environment]::NewLine
     if ($UnsignedMarker) {
         Set-Content -LiteralPath $UnsignedMarker -Value $message -Encoding ASCII
     }
-    Write-Host 'SIGNING STATUS: UNSIGNED (signtool verify confirmed no embedded signature)'
+    Write-Host 'SIGNING STATUS: UNSIGNED (Get-AuthenticodeSignature confirmed NotSigned)'
     [pscustomobject]@{ Signed = $false; Timestamped = $false; Files = $Files; SignTool = $signToolPath }
     exit 0
 }

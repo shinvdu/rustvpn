@@ -356,13 +356,13 @@ impl InstallFailure {
 
 /// Phase-1 cleanup result for a Windows connection.
 ///
-/// The disconnect path removes only non-route state.  Route and address
-/// cleanup and the state-file clear are deferred to the next connect (before
-/// any adapter is opened) or the next daemon start, because removing the
-/// anti-loop host route immediately after the Wintun close still stalls the
-/// Windows network stack.  This type therefore performs **no** network
-/// operation after the adapter close: `netstate.json` stays in place as the
-/// pending cleanup record.
+/// The disconnect path removes only non-route state.  For a created adapter,
+/// route/address cleanup and the state-file clear are deferred to the next
+/// connect (before any adapter is opened) or the next daemon start, because
+/// removing the anti-loop host route immediately after the Wintun close still
+/// stalls the Windows network stack.  For a **pre-existing** adapter that
+/// survives close, the full cleanup runs after the close with no Wintun
+/// session open; there is no adapter to defer to.
 #[derive(Default)]
 pub struct ConnectionCleanup {
     report: Option<winplan::CleanupReport>,

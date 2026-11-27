@@ -215,9 +215,9 @@
 
     <!--
       Create the local group and add the installing user before StartServices.
-      The helper is deliberately tolerant of installation failure, but the
-      daemon is not: it rolls back only a group it created, and service mode
-      then fails closed if RustVPN is missing.  There is no INTERACTIVE fallback.
+      The helper always leaves the RustVPN group present (empty if needed) so
+      the fail-closed service can start; a failed user add must be finished
+      manually and require a re-login.  There is no INTERACTIVE fallback.
     -->
     <!--
       The Windows Installer ServiceConfig / ServiceConfigFailureActions tables

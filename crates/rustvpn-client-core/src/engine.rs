@@ -1054,10 +1054,11 @@ async fn run_connection(
     //   2. remove only non-route state (NRPT/DNS/metric/IPv6) while the Wintun
     //      session is still open,
     //   3. close the adapter as the final `Tap` reference.
-    // Routes (including the anti-loop host route), a pre-existing adapter's
+    // For a created adapter, routes (including the anti-loop host route), the
     // address and netstate.json are **deferred**: no network command runs after
     // the close.  The next connect (before opening an adapter) or the next
-    // daemon start removes them with no Wintun session present.
+    // daemon start removes them with no Wintun session present.  A pre-existing
+    // adapter survives close, so its full cleanup runs after the close instead.
     let adapter_created = tap.adapter_created();
     let (cleanup, closed, created_at_teardown) = teardown_connection(tap, || async {
         let cleanup = match guard {
@@ -1296,6 +1297,12 @@ async fn session_loop(
                 };
             }
             _ = timer.tick() => {
+                // Disconnect publishes "disconnecting" and cancels this task
+                // before teardown; do not let a racing tick republish
+                // "connected" afterwards.
+                if cancel.is_cancelled() {
+                    return SessionEnd::Terminated;
+                }
                 let now = Instant::now();
                 let elapsed = now.duration_since(last_at).as_secs_f64().max(0.001);
                 let snap = session.stats.snapshot();
@@ -1323,6 +1330,9 @@ async fn session_loop(
                 status.rates_available = true;
                 status.rate_window_sec = Some(1);
                 status.traffic = traffic.clone();
+                if cancel.is_cancelled() {
+                    return SessionEnd::Terminated;
+                }
                 // The daemon's status collector updates only `traffic` from
                 // Event::Traffic.  Publish the full state as well so
                 // endpoint/heartbeat/last_handshake fields do not stay at

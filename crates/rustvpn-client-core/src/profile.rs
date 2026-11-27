@@ -27,8 +27,8 @@ const REKEY_JITTER_MAX: u64 = 3600;
 /// too large for a profile: an unbounded `remote` is written to SYSTEM logs on
 /// every retry, and unbounded route/DNS lists amplify memory and PowerShell
 /// work.  These are deliberately generous for real deployments.
-const MAX_REMOTE_LEN: usize = 255;
-const MAX_PROXY_LEN: usize = 255;
+const MAX_REMOTE_LEN: usize = 512;
+const MAX_PROXY_LEN: usize = 512;
 const MAX_PROXY_AUTH_LEN: usize = 512;
 const MAX_VERIFIER_LEN: usize = 512;
 const MAX_ADDRESS_LEN: usize = 64;
