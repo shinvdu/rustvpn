@@ -173,7 +173,7 @@ impl ConnectionCleanup {
         ConnectionCleanup
     }
 
-    pub async fn finish_after_close(self, _closed: bool) {}
+    pub async fn finish_after_close(self, _closed: bool, _adapter_created: bool) {}
 }
 
 pub struct NetworkGuard {

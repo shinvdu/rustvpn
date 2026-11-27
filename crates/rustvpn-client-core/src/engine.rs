@@ -178,13 +178,41 @@ impl Engine {
                             // daemon start (before any adapter is opened).
                             #[cfg(windows)]
                             if !connection_closed {
-                                if let Err(error) = crate::netcfg::cleanup_owned_network().await {
-                                    emit_log(
-                                        &events,
-                                        "warn",
-                                        format!("cannot clean Windows network state: {error:#}"),
-                                    );
-                                }
+                                crate::netcfg::cleanup_owned_network().await.map_or_else(
+                                    |error| {
+                                        emit_log(
+                                            &events,
+                                            "warn",
+                                            format!(
+                                                "cannot clean this client's Windows network state: \
+                                                 {error:#}"
+                                            ),
+                                        );
+                                    },
+                                    |_| {},
+                                );
+                                crate::netcfg::cleanup_stale_network().await.map_or_else(
+                                    |error| {
+                                        emit_log(
+                                            &events,
+                                            "warn",
+                                            format!(
+                                                "cannot clean crashed Windows network state: {error:#}"
+                                            ),
+                                        );
+                                    },
+                                    |report| {
+                                        for error in &report.errors {
+                                            emit_log(
+                                                &events,
+                                                "warn",
+                                                format!(
+                                                    "crashed Windows network state left for retry: {error}"
+                                                ),
+                                            );
+                                        }
+                                    },
+                                );
                             }
                             let _ = events.send(Event::State(EngineStatus {
                                 state: "idle".into(),
@@ -227,8 +255,24 @@ impl Engine {
                 emit_log(
                     &events,
                     "warn",
-                    format!("cannot finish Windows network cleanup: {error:#}"),
+                    format!("cannot finish this client's Windows network cleanup: {error:#}"),
                 );
+            }
+            match crate::netcfg::cleanup_stale_network().await {
+                Ok(report) => {
+                    for error in &report.errors {
+                        emit_log(
+                            &events,
+                            "warn",
+                            format!("crashed Windows network state left for retry: {error}"),
+                        );
+                    }
+                }
+                Err(error) => emit_log(
+                    &events,
+                    "warn",
+                    format!("cannot finish crashed Windows network cleanup: {error:#}"),
+                ),
             }
         }
     }
@@ -245,6 +289,10 @@ async fn stop_current(current: &mut Option<(CancellationToken, JoinHandle<()>)>)
 trait TeardownDevice {
     /// Stop the platform reader thread without closing the device.
     fn stop_reader(&self);
+    /// Whether this process created the platform device.  A pre-existing
+    /// Wintun adapter is not removed by close, so its address/routes must be
+    /// cleaned explicitly after the close.
+    fn adapter_created(&self) -> bool;
     /// Close the device (Windows: session shutdown + adapter close).
     ///
     /// Returns whether the device really closed.  For [`Arc<Tap>`] this is
@@ -256,6 +304,10 @@ trait TeardownDevice {
 impl TeardownDevice for Arc<Tap> {
     fn stop_reader(&self) {
         Tap::stop_reader(self.as_ref());
+    }
+
+    fn adapter_created(&self) -> bool {
+        Tap::adapter_created(self.as_ref())
     }
 
     fn close(self) -> bool {
@@ -280,18 +332,21 @@ impl TeardownDevice for Arc<Tap> {
 /// pre-existing adapter and the state file are deliberately **not** touched
 /// here: the next connect (before opening an adapter) or the next daemon start
 /// runs the full cleanup with no Wintun session present.
-/// Returns the cleanup value and whether the device really closed.
-async fn teardown_connection<D, R, RFut, T>(device: D, remove_network: R) -> (T, bool)
+/// Returns the cleanup value, whether the device really closed, and whether
+/// this process created the adapter.  A pre-existing adapter survives close,
+/// so the caller must run the full host cleanup after the close.
+async fn teardown_connection<D, R, RFut, T>(device: D, remove_network: R) -> (T, bool, bool)
 where
     D: TeardownDevice,
     R: FnOnce() -> RFut,
     RFut: Future<Output = T>,
 {
+    let adapter_created = device.adapter_created();
     device.stop_reader();
     let cleanup = remove_network().await;
     let closed = device.close();
     // Returned to the caller so it can clear the state file only after close.
-    (cleanup, closed)
+    (cleanup, closed, adapter_created)
 }
 
 /// Clean previous Windows network state before any adapter is opened.
@@ -872,12 +927,13 @@ async fn run_connection(
                             session.close(&stats_state).await;
                             tap.stop_reader();
                             let cleanup = failure.rollback().await;
+                            let adapter_created = tap.adapter_created();
                             let closed = Arc::strong_count(&tap) == 1;
                             drop(tap);
-                            // Routes/address and the state file are kept for
-                            // the next connect/daemon start, which clean them
-                            // with no Wintun session open.
-                            cleanup.finish_after_close(closed).await;
+                            // A created adapter takes its address/routes with
+                            // it.  A pre-existing adapter survives, so clean
+                            // that state now that no session is open.
+                            cleanup.finish_after_close(closed, adapter_created).await;
                             emit_error(&events, &spec, message.clone());
                             emit_log(&events, "error", message);
                             emit_log(&events, "info", "tunnel stopped");
@@ -1001,7 +1057,8 @@ async fn run_connection(
     // address and netstate.json are **deferred**: no network command runs after
     // the close.  The next connect (before opening an adapter) or the next
     // daemon start removes them with no Wintun session present.
-    let (cleanup, closed) = teardown_connection(tap, || async {
+    let adapter_created = tap.adapter_created();
+    let (cleanup, closed, created_at_teardown) = teardown_connection(tap, || async {
         let cleanup = match guard {
             Some(guard) => guard.begin_connection_teardown().await,
             None => ConnectionCleanup::none(),
@@ -1022,9 +1079,13 @@ async fn run_connection(
         cleanup
     })
     .await;
-    // The adapter is closed; this only reports the pre-close cleanup and
-    // keeps netstate.json.  No network command may run here.
-    cleanup.finish_after_close(closed).await;
+    debug_assert_eq!(adapter_created, created_at_teardown);
+    // The adapter is closed; this reports the pre-close cleanup.  For a
+    // pre-existing adapter that survives close, it also runs the full cleanup
+    // now that no Wintun session is open.
+    cleanup
+        .finish_after_close(closed, created_at_teardown)
+        .await;
     emit_log(&events, "info", "tunnel stopped");
 }
 
@@ -1388,6 +1449,10 @@ mod tests {
             self.log.lock().unwrap().push("stop-reader");
         }
 
+        fn adapter_created(&self) -> bool {
+            true
+        }
+
         fn close(self) -> bool {
             self.log.lock().unwrap().push("close-device");
             true
@@ -1403,18 +1468,20 @@ mod tests {
         let log = Arc::new(std::sync::Mutex::new(Vec::new()));
         let remove_log = log.clone();
         let finalize_log = log.clone();
-        let (cleanup, closed) = teardown_connection(RecordingDevice { log: log.clone() }, || {
-            let remove_log = remove_log;
-            async move {
-                remove_log.lock().unwrap().push("cleanup-non-route");
-                "state-cleanup-token"
-            }
-        })
-        .await;
+        let (cleanup, closed, adapter_created) =
+            teardown_connection(RecordingDevice { log: log.clone() }, || {
+                let remove_log = remove_log;
+                async move {
+                    remove_log.lock().unwrap().push("cleanup-non-route");
+                    "state-cleanup-token"
+                }
+            })
+            .await;
 
         // Mirrors the caller: the post-close cleanup runs after the close.
         assert_eq!(cleanup, "state-cleanup-token");
         assert!(closed, "the recording device reports a real close");
+        assert!(adapter_created, "the recording device created its adapter");
         finalize_log.lock().unwrap().push("defer-host-routes");
 
         assert_eq!(

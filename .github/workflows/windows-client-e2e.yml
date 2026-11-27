@@ -116,13 +116,15 @@ jobs:
           $msi = Get-ChildItem -LiteralPath 'dist\windows' -Filter *.msi |
             Sort-Object LastWriteTime | Select-Object -Last 1
           if (-not $msi) { throw 'no MSI was produced' }
+          # Export before install so the always() cleanup can uninstall even if
+          # service registration or the start step fails.
+          "MSI_PATH=$($msi.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           $log = Join-Path $env:RUNNER_TEMP 'rustvpn-e2e-install.log'
           $p = Start-Process msiexec.exe -Wait -PassThru -ArgumentList @(
-            '/i', $msi.FullName, '/qn', '/l*v', $log,
-            "RUSTVPN_USER=$env:USERDOMAIN\$env:USERNAME")
+            '/i', "`"$($msi.FullName)`"", '/qn', '/l*v', "`"$log`"",
+            "`"RUSTVPN_USER=$env:USERDOMAIN\$env:USERNAME`"")
           if ($p.ExitCode -ne 0) { throw "MSI install failed: $($p.ExitCode) (log: $log)" }
           Get-Service rustvpn-clientd | Format-List Name, Status
-          "MSI_PATH=$($msi.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
       - name: Write the ephemeral passphrase file (restricted ACL)
         shell: pwsh
@@ -132,36 +134,48 @@ jobs:
           $path = Join-Path $env:RUNNER_TEMP 'rustvpn-e2e-pass.txt'
           Set-Content -LiteralPath $path -Value $env:RUSTVPN_E2E_PASSWORD `
             -NoNewline -Encoding ascii
-          icacls $path /inheritance:r /grant:r "SYSTEM:(R)" "Administrators:(R)" | Out-Null
+          icacls $path /inheritance:r /grant:r "*S-1-5-18:(R)" "*S-1-5-32-544:(R)" | Out-Null
           "RUSTVPN_E2E_PASS_FILE=$path" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
       - name: Connect and verify (split tunnel)
         shell: pwsh
         env:
           RUSTVPN_E2E_VERIFIER: ${{ secrets.RUSTVPN_E2E_VERIFIER }}
+          INPUT_SERVER: ${{ inputs.server }}
+          INPUT_ADDRESS: ${{ inputs.address }}
+          INPUT_GATEWAY: ${{ inputs.gateway }}
+          INPUT_ROUTES: ${{ inputs.routes }}
+          INPUT_PING_TARGETS: ${{ inputs.ping_targets }}
+          INPUT_TCP_TARGET: ${{ inputs.tcp_target }}
+          INPUT_TCP_PORT: ${{ inputs.tcp_port }}
+          INPUT_IFACE: ${{ inputs.iface }}
+          INPUT_FULL_TUNNEL: ${{ inputs.full_tunnel }}
         run: |
-          $routes = @('${{ inputs.routes }}' -split ',' |
+          # Never interpolate workflow_dispatch inputs into script text.  A
+          # quote in an input would otherwise execute arbitrary PowerShell on
+          # this elevated, secret-bearing self-hosted runner.
+          $routes = @($env:INPUT_ROUTES -split ',' |
             ForEach-Object { $_.Trim() } | Where-Object { $_ })
-          $pings = @('${{ inputs.ping_targets }}' -split ',' |
+          $pings = @($env:INPUT_PING_TARGETS -split ',' |
             ForEach-Object { $_.Trim() } | Where-Object { $_ })
-          $server = '${{ inputs.server }}'
+          $server = $env:INPUT_SERVER
           $params = @{
             Phase = 'connect'
             Remote = $server
             ShortVerifier = $env:RUSTVPN_E2E_VERIFIER
             PasswordFile = $env:RUSTVPN_E2E_PASS_FILE
-            Iface = '${{ inputs.iface }}'
-            Address = '${{ inputs.address }}'
-            Gateway = '${{ inputs.gateway }}'
+            Iface = $env:INPUT_IFACE
+            Address = $env:INPUT_ADDRESS
+            Gateway = $env:INPUT_GATEWAY
             Routes = $routes
             PingTargets = $pings
             OuterEndpoint = $server.Substring(0, $server.LastIndexOf(':'))
           }
-          if ('${{ inputs.tcp_target }}') {
-            $params.TcpTarget = '${{ inputs.tcp_target }}'
-            $params.TcpPort = [int]'${{ inputs.tcp_port }}'
+          if ($env:INPUT_TCP_TARGET) {
+            $params.TcpTarget = $env:INPUT_TCP_TARGET
+            $params.TcpPort = [int]$env:INPUT_TCP_PORT
           }
-          if ('${{ inputs.full_tunnel }}' -eq 'true') {
+          if ($env:INPUT_FULL_TUNNEL -eq 'true') {
             $params.AllowFullTunnel = $true
           }
           & packaging/windows/e2e-tunnel.ps1 @params |
@@ -170,11 +184,13 @@ jobs:
       - name: Disconnect (always)
         if: always()
         shell: pwsh
+        env:
+          INPUT_IFACE: ${{ inputs.iface }}
         run: |
           if (Test-Path -LiteralPath 'packaging\windows\e2e-tunnel.ps1') {
             & powershell -NoProfile -ExecutionPolicy Bypass `
               -File 'packaging\windows\e2e-tunnel.ps1' -Phase disconnect `
-              -Iface '${{ inputs.iface }}' -WaitSeconds 60
+              -Iface $env:INPUT_IFACE -WaitSeconds 60
           }
 
       - name: Compare the default route and show state (always)
@@ -201,9 +217,14 @@ jobs:
           if ($env:RUSTVPN_E2E_PASS_FILE -and (Test-Path -LiteralPath $env:RUSTVPN_E2E_PASS_FILE)) {
             Remove-Item -LiteralPath $env:RUSTVPN_E2E_PASS_FILE -Force
           }
+          if (-not $env:MSI_PATH) {
+            $found = Get-ChildItem -LiteralPath 'dist\windows' -Filter *.msi -ErrorAction SilentlyContinue |
+              Sort-Object LastWriteTime | Select-Object -Last 1
+            if ($found) { $env:MSI_PATH = $found.FullName }
+          }
           if ($env:MSI_PATH -and (Test-Path -LiteralPath $env:MSI_PATH)) {
             $p = Start-Process msiexec.exe -Wait -PassThru -ArgumentList @(
-              '/x', $env:MSI_PATH, '/qn')
+              '/x', "`"$env:MSI_PATH`"", '/qn')
             if ($p.ExitCode -ne 0) { Write-Warning "MSI uninstall exited $($p.ExitCode)" }
           }
           Get-Service rustvpn-clientd -ErrorAction SilentlyContinue |

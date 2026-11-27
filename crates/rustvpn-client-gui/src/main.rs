@@ -174,8 +174,9 @@ fn verify_daemon_before_password(client: &Client) -> Result<(), String> {
     let info = windows_platform::verify_pipe_server(pid)
         .map_err(|error| format!("refusing to send the passphrase: {error}"))?;
     eprintln!(
-        "named-pipe server verified: pid={} image={} publisher={:?} trust={}",
+        "named-pipe server verified: pid={} user={} image={} publisher={:?} trust={}",
         info.pid,
+        info.user_sid,
         info.image,
         info.publisher,
         info.trust.as_str()
@@ -184,6 +185,7 @@ fn verify_daemon_before_password(client: &Client) -> Result<(), String> {
 }
 
 #[cfg(not(windows))]
+#[allow(dead_code)]
 fn verify_daemon_before_password(_client: &Client) -> Result<(), String> {
     Ok(())
 }
@@ -194,7 +196,6 @@ async fn connect(profile: ProfileSpec, password: String) -> Result<(), String> {
         return Err("passphrase is empty".into());
     }
     let mut client = ipc_client(Duration::from_secs(3)).await?;
-    verify_daemon_before_password(&client)?;
     tokio::time::timeout(
         Duration::from_secs(5),
         client.connect_profile(profile, password),
@@ -555,15 +556,21 @@ fn save_profile_at(
 
     let stem = file_stem(&profile.name)?;
     let file = dir.join(format!("{stem}.yaml"));
-    if file.exists() {
-        if let Ok(existing) = read_profile(&file) {
-            if existing.name != profile.name && Some(existing.name.as_str()) != previous_name {
-                return Err(format!(
-                    "profile file name collides with existing profile {:?}",
-                    existing.name
-                ));
-            }
-        }
+    let previous_stem = previous_name.map(file_stem).transpose()?;
+    let editing_same_file = previous_stem
+        .as_deref()
+        .is_some_and(|previous| previous.eq_ignore_ascii_case(&stem));
+    if file.exists() && !editing_same_file {
+        return match read_profile(&file) {
+            Ok(existing) => Err(format!(
+                "profile file name collides with existing profile {:?}",
+                existing.name
+            )),
+            Err(_) => Err(format!(
+                "profile file {} already exists and cannot be parsed; move it aside first",
+                file.display()
+            )),
+        };
     }
 
     let yaml = serde_yaml_ng::to_string(profile).map_err(|error| error.to_string())?;
@@ -582,14 +589,13 @@ fn save_profile_at(
         return Err(error.to_string());
     }
 
-    if let Some(previous) = previous_name {
-        if previous != profile.name {
-            if let Ok(previous_stem) = file_stem(previous) {
-                let old = dir.join(format!("{previous_stem}.yaml"));
-                if old != file {
-                    let _ = std::fs::remove_file(old);
-                }
-            }
+    if let Some(previous_stem) = previous_stem {
+        // NTFS is case-insensitive: `Office.yaml` and `office.yaml` are the
+        // same file.  Removing a "different" path would delete the file we
+        // just wrote.  Only remove when the sanitized stems really differ.
+        if !previous_stem.eq_ignore_ascii_case(&stem) {
+            let old = dir.join(format!("{previous_stem}.yaml"));
+            let _ = std::fs::remove_file(old);
         }
     }
     Ok(())
@@ -626,12 +632,44 @@ async fn ipc_client(timeout: Duration) -> Result<Client, String> {
     let mut last_error = "client daemon is not reachable".to_string();
     for path in rustvpn_client_ipc::candidate_socket_paths() {
         match tokio::time::timeout(timeout, Client::connect(&path)).await {
-            Ok(Ok(client)) => return Ok(client),
+            Ok(Ok(client)) => {
+                #[cfg(windows)]
+                verify_daemon_before_password(&client)?;
+                return Ok(client);
+            }
             Ok(Err(error)) => last_error = describe_endpoint_error(&path, &error),
             Err(_) => last_error = format!("{}: timed out", path.display()),
         }
     }
     Err(last_error)
+}
+
+/// Subscribe only after the same server-identity check used for commands.
+async fn subscribe_verified(path: &Path) -> Result<EventStream, String> {
+    #[cfg(windows)]
+    {
+        let stream = tokio::time::timeout(
+            Duration::from_secs(2),
+            rustvpn_client_ipc::transport::connect(path),
+        )
+        .await
+        .map_err(|_| format!("{}: timed out", path.display()))?
+        .map_err(|error| {
+            describe_endpoint_error(path, &rustvpn_client_ipc::client::ClientError::Io(error))
+        })?;
+        let pid = rustvpn_client_ipc::transport::pipe_server_pid(&stream)
+            .map_err(|error| format!("read named-pipe server PID: {error}"))?;
+        windows_platform::verify_pipe_server(pid)?;
+        EventStream::subscribe_stream(stream)
+            .await
+            .map_err(|error| error.to_string())
+    }
+    #[cfg(not(windows))]
+    {
+        EventStream::subscribe(path)
+            .await
+            .map_err(|error| error.to_string())
+    }
 }
 
 fn spawn_event_listener(app: tauri::AppHandle) {
@@ -640,8 +678,7 @@ fn spawn_event_listener(app: tauri::AppHandle) {
             let mut connected = false;
             for path in rustvpn_client_ipc::candidate_socket_paths() {
                 let subscribed =
-                    tokio::time::timeout(Duration::from_secs(3), EventStream::subscribe(&path))
-                        .await;
+                    tokio::time::timeout(Duration::from_secs(3), subscribe_verified(&path)).await;
                 let Ok(Ok(mut stream)) = subscribed else {
                     continue;
                 };
@@ -709,6 +746,19 @@ fn file_stem(name: &str) -> Result<String, String> {
     }
     if stem.is_empty() || stem == "." || stem == ".." {
         return Err("profile name cannot be used as a file name".into());
+    }
+    #[cfg(windows)]
+    {
+        // Windows reserved devices are reserved even with an extension
+        // (`CON.yaml` opens the console device).
+        let base = stem.split('.').next().unwrap_or(&stem);
+        const RESERVED: &[&str] = &[
+            "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7",
+            "COM8", "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+        ];
+        if RESERVED.iter().any(|name| name.eq_ignore_ascii_case(base)) || stem.ends_with('.') {
+            return Err(format!("profile name {stem:?} is reserved on Windows"));
+        }
     }
     Ok(stem)
 }
@@ -1030,6 +1080,47 @@ mod tests {
         let error = save_profile_at(&dir, &profile("other-lab"), None).unwrap_err();
         assert!(error.contains("collides"));
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn renaming_onto_another_profile_is_rejected_without_touching_it() {
+        let dir = temp_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        save_profile_at(&dir, &profile("first"), None).unwrap();
+        save_profile_at(&dir, &profile("second"), None).unwrap();
+        let second_path = profile_path(&dir, "second").unwrap();
+        let before = std::fs::read_to_string(&second_path).unwrap();
+
+        let error = save_profile_at(&dir, &profile("second"), Some("first")).unwrap_err();
+        assert!(error.contains("collides"), "unexpected error: {error}");
+        assert_eq!(std::fs::read_to_string(&second_path).unwrap(), before);
+        assert!(profile_path(&dir, "first").unwrap().exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn unreadable_existing_profile_is_not_overwritten() {
+        let dir = temp_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = profile_path(&dir, "legacy").unwrap();
+        std::fs::write(&path, b"mtu: auto\n").unwrap();
+
+        let error = save_profile_at(&dir, &profile("legacy"), None).unwrap_err();
+        assert!(
+            error.contains("cannot be parsed"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"mtu: auto\n");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_reserved_device_names_are_rejected() {
+        for name in ["CON", "con", "PRN", "COM1", "LPT9", "CON.yaml"] {
+            assert!(file_stem(name).is_err(), "{name} must be rejected");
+        }
+        assert!(file_stem("console").is_ok());
     }
 
     #[test]

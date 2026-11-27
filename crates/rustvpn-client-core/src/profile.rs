@@ -23,6 +23,41 @@ const REKEY_TIME_MIN: u64 = 60;
 const REKEY_TIME_MAX: u64 = 86_400;
 const REKEY_JITTER_MAX: u64 = 3600;
 
+/// IPC input bounds.  The frame layer caps a message at 1 MiB, but that is far
+/// too large for a profile: an unbounded `remote` is written to SYSTEM logs on
+/// every retry, and unbounded route/DNS lists amplify memory and PowerShell
+/// work.  These are deliberately generous for real deployments.
+const MAX_REMOTE_LEN: usize = 255;
+const MAX_PROXY_LEN: usize = 255;
+const MAX_PROXY_AUTH_LEN: usize = 512;
+const MAX_VERIFIER_LEN: usize = 512;
+const MAX_ADDRESS_LEN: usize = 64;
+const MAX_GATEWAY_LEN: usize = 64;
+const MAX_ROUTE_LEN: usize = 64;
+const MAX_DNS_LEN: usize = 64;
+const MAX_ROUTES: usize = 256;
+const MAX_DNS_SERVERS: usize = 16;
+/// Stricter client-side Argon2 ceiling.  The verifier crate accepts up to
+/// 256 MiB / 4096 passes for server compatibility; accepting that from a local
+/// IPC peer would let a standard user monopolise the SYSTEM daemon.
+const MAX_PROFILE_ARGON2_M: u32 = 65_536;
+const MAX_PROFILE_ARGON2_T: u32 = 512;
+const MAX_PROFILE_ARGON2_P: u32 = 4;
+
+fn reject_control(field: &str, value: &str) -> Result<()> {
+    if value.chars().any(char::is_control) {
+        bail!("{field} contains control characters");
+    }
+    Ok(())
+}
+
+fn check_len(field: &str, value: &str, max: usize) -> Result<()> {
+    if value.len() > max {
+        bail!("{field} is too long (max {max} bytes)");
+    }
+    Ok(())
+}
+
 pub struct ValidatedProfile {
     spec: ProfileSpec,
     verifier: Verifier,
@@ -34,17 +69,56 @@ impl ValidatedProfile {
         if spec.name.trim().is_empty() {
             bail!("profile name is empty");
         }
-        if spec.name.len() > 64 {
-            bail!("profile name is too long (max 64 bytes)");
-        }
+        check_len("profile name", &spec.name, 64)?;
+        reject_control("profile name", &spec.name)?;
         if spec.remote.trim().is_empty() {
             bail!("remote address is empty");
         }
+        check_len("remote address", &spec.remote, MAX_REMOTE_LEN)?;
+        reject_control("remote address", &spec.remote)?;
         if spec.verifier.trim().is_empty() {
             bail!("verifier is empty");
         }
+        check_len("verifier", &spec.verifier, MAX_VERIFIER_LEN)?;
+        reject_control("verifier", &spec.verifier)?;
+        if spec.proxy.len() > MAX_PROXY_LEN {
+            bail!("proxy is too long (max {MAX_PROXY_LEN} bytes)");
+        }
+        reject_control("proxy", &spec.proxy)?;
+        if spec.proxy_auth.len() > MAX_PROXY_AUTH_LEN {
+            bail!("proxy auth is too long (max {MAX_PROXY_AUTH_LEN} bytes)");
+        }
+        reject_control("proxy auth", &spec.proxy_auth)?;
+        if spec.routes.len() > MAX_ROUTES {
+            bail!("too many routes (max {MAX_ROUTES})");
+        }
+        for route in &spec.routes {
+            check_len("route", route, MAX_ROUTE_LEN)?;
+            reject_control("route", route)?;
+        }
+        if spec.dns.len() > MAX_DNS_SERVERS {
+            bail!("too many DNS servers (max {MAX_DNS_SERVERS})");
+        }
+        for server in &spec.dns {
+            check_len("DNS server", server, MAX_DNS_LEN)?;
+            reject_control("DNS server", server)?;
+        }
+        check_len("address", &spec.address, MAX_ADDRESS_LEN)?;
+        reject_control("address", &spec.address)?;
+        check_len("gateway", &spec.gateway, MAX_GATEWAY_LEN)?;
+        reject_control("gateway", &spec.gateway)?;
+
         let verifier =
             Verifier::from_string(&spec.verifier).map_err(|e| anyhow!("invalid verifier: {e}"))?;
+        if verifier.m > MAX_PROFILE_ARGON2_M
+            || verifier.t > MAX_PROFILE_ARGON2_T
+            || verifier.p > MAX_PROFILE_ARGON2_P
+        {
+            bail!(
+                "verifier Argon2 cost is too high for the client (m<={MAX_PROFILE_ARGON2_M}, \
+                 t<={MAX_PROFILE_ARGON2_T}, p<={MAX_PROFILE_ARGON2_P})"
+            );
+        }
 
         let proxy = !spec.proxy.trim().is_empty();
         let effective_proto = if proxy {
@@ -545,5 +619,33 @@ mod tests {
         let mut spec = base();
         spec.dns = vec!["2001:4860:4860::8888".into()];
         assert!(ValidatedProfile::new(&spec).is_err());
+    }
+
+    #[test]
+    fn rejects_oversized_or_controlled_ipc_fields() {
+        let mut spec = base();
+        spec.remote = "x".repeat(MAX_REMOTE_LEN + 1);
+        assert!(ValidatedProfile::new(&spec).is_err());
+
+        let mut spec = base();
+        spec.remote = "vpn.example.com:1194\nforged log line".into();
+        assert!(ValidatedProfile::new(&spec).is_err());
+
+        let mut spec = base();
+        spec.routes = (0..=MAX_ROUTES)
+            .map(|index| format!("10.{}.0.0/16", index % 250))
+            .collect();
+        assert!(ValidatedProfile::new(&spec).is_err());
+
+        let mut spec = base();
+        spec.dns = (0..=MAX_DNS_SERVERS)
+            .map(|index| format!("10.88.0.{}", (index % 250) + 1))
+            .collect();
+        assert!(ValidatedProfile::new(&spec).is_err());
+
+        let mut spec = base();
+        spec.verifier = "$argon2d$m=262144,t=4096,p=64$AAECAwQFBgcICQoLDA0ODw".into();
+        let error = ValidatedProfile::new(&spec).err().unwrap().to_string();
+        assert!(error.contains("Argon2 cost"), "{error}");
     }
 }

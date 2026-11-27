@@ -33,7 +33,7 @@ pub fn run_dispatcher() -> ServiceResult<()> {
 fn service_main(_arguments: Vec<OsString>) {
     init_service_log();
     let args = parse_args();
-    let config = match build_config(&args, false) {
+    let mut config = match build_config(&args, false) {
         Ok(config) => config,
         Err(error) => {
             dlog!("service configuration error: {error:#}");
@@ -41,6 +41,8 @@ fn service_main(_arguments: Vec<OsString>) {
         }
     };
     crate::harden_process_identity(&config);
+    let (ready_tx, mut ready_rx) = tokio::sync::oneshot::channel();
+    config.ready = Some(ready_tx);
 
     let shutdown = CancellationToken::new();
     let handler_shutdown = shutdown.clone();
@@ -74,16 +76,6 @@ fn service_main(_arguments: Vec<OsString>) {
         process::exit(1);
     }
 
-    if let Err(error) = status.set_service_status(service_status(
-        ServiceState::Running,
-        ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN,
-        ServiceExitCode::NO_ERROR,
-        0,
-    )) {
-        dlog!("cannot report Running: {error}");
-        process::exit(1);
-    }
-
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -101,7 +93,25 @@ fn service_main(_arguments: Vec<OsString>) {
         }
     };
 
-    let result = runtime.block_on(run(config, shutdown));
+    let result = runtime.block_on(async {
+        let mut run_future = Box::pin(run(config, shutdown));
+        tokio::select! {
+            result = &mut run_future => result,
+            ready = &mut ready_rx => {
+                if ready.is_ok() {
+                    if let Err(error) = status.set_service_status(service_status(
+                        ServiceState::Running,
+                        ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN,
+                        ServiceExitCode::NO_ERROR,
+                        0,
+                    )) {
+                        dlog!("cannot report Running: {error}");
+                    }
+                }
+                run_future.await
+            }
+        }
+    });
     let failed = result.is_err();
     if let Err(error) = result {
         dlog!("service stopped with an error: {error:#}");

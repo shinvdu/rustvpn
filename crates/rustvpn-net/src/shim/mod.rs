@@ -494,7 +494,13 @@ impl Drop for ReceiverLease<'_> {
             .slot
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        if slot.is_none() {
+        // Re-check after acquiring the slot lock: shutdown() sets `stop`
+        // before taking the same lock.  Without this check a cancelled recv
+        // can reinsert the receiver after shutdown dropped it, leaving the
+        // reader parked in blocking_send and join() hung forever.
+        if self.stop.load(AtomicOrdering::SeqCst) {
+            drop(rx);
+        } else if slot.is_none() {
             *slot = Some(rx);
         }
     }
@@ -676,9 +682,10 @@ impl ShimPump {
         // Disconnect an idle reader parked in `blocking_send`.  If a `recv`
         // future currently owns the receiver it will observe the channel
         // closing / stop flag itself.
-        if let Ok(mut guard) = self.rx.lock() {
-            guard.take();
-        }
+        self.rx
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .take();
         let handle = self
             .reader
             .lock()

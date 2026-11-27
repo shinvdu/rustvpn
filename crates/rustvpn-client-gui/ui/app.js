@@ -119,6 +119,7 @@ function setLanguage(lang) {
   renderLogs();
   I18n.apply(document.body);
   applyPlatformLabels();
+  if (invoke) loadUpdateStatus();
 }
 
 function bindNavigation() {
@@ -275,7 +276,7 @@ function applyPlatformLabels() {
       : t("本地 Unix socket，SO_PEERCRED / 组权限");
   document.getElementById("daemon-hint").textContent =
     state.platform === "windows"
-      ? t("Windows 服务未安装或未启动时，开发模式可运行 rustvpn-clientd.exe --console；M5 安装器负责注册服务。")
+      ? t("Windows 服务未安装或未启动时，开发模式需运行 rustvpn-clientd.exe --console -socket <非生产管道>，并用 RUSTVPN_CLIENTD_SOCKET 指向同一管道；M5 安装器负责注册服务。")
       : "";
   document.getElementById("autostart-platform").textContent =
     state.platform === "windows"
@@ -849,6 +850,8 @@ function openPassword(profile) {
   invoke("get_password", { profileName: profile.name })
     .then((saved) => {
       if (state.pendingProfile !== profile || !saved) return;
+      if (input.value !== "") return; // never clobber text the user already typed
+      if (document.getElementById("password-modal").classList.contains("hidden")) return;
       input.value = saved;
       save.checked = true;
       state.pendingHadSavedPassword = true;
@@ -1193,6 +1196,13 @@ function show(id) {
 
 function hide(id) {
   document.getElementById(id).classList.add("hidden");
+  if (id === "password-modal") {
+    // Do not leave a passphrase in the hidden input after cancel/Escape/backdrop.
+    document.getElementById("password-input").value = "";
+    document.getElementById("password-save").checked = false;
+    state.pendingProfile = null;
+    state.pendingHadSavedPassword = false;
+  }
 }
 
 let toastTimer = null;

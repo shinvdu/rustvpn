@@ -11,15 +11,15 @@
 //! * deciding whether a connecting process may use the daemon.
 //!
 //! Threat model: the daemon runs as LocalSystem and can change host network
-//! state.  The pipe is therefore restricted to SYSTEM, Administrators and
-//! either INTERACTIVE users or an explicit RustVPN group.  A client PID is
+//! state.  The pipe is restricted to SYSTEM, Administrators, the daemon's own
+//! account, and an explicit local group when one is configured.  INTERACTIVE
+//! is deliberately never granted: a missing group is a fail-closed condition,
+//! not a reason to widen access to every logged-in user.  A client PID is
 //! checked against the same policy before the Hello handshake.  A same-user
 //! malicious process is still in the trusted set; the pipe DACL cannot
 //! distinguish it, and it can also create extra pipe instances because
 //! GENERIC_WRITE implies FILE_CREATE_PIPE_INSTANCE on a pipe object.  The
-//! first-instance flag blocks a squatter that starts before the daemon; a
-//! same-user process starting later can still race a GUI connection until M4
-//! adds server-image/Authenticode verification.
+//! GUI therefore also verifies the server image, publisher and token user.
 
 use std::ffi::{c_void, OsStr};
 use std::io;
@@ -35,7 +35,7 @@ use windows_sys::Win32::Security::Authorization::{
 };
 use windows_sys::Win32::Security::{
     CreateWellKnownSid, GetLengthSid, GetSecurityDescriptorDacl, GetTokenInformation, TokenGroups,
-    TokenUser, WinBuiltinAdministratorsSid, WinInteractiveSid, ACL, DACL_SECURITY_INFORMATION,
+    TokenUser, WinBuiltinAdministratorsSid, ACL, DACL_SECURITY_INFORMATION,
     PROTECTED_DACL_SECURITY_INFORMATION, PSID, SECURITY_ATTRIBUTES, SECURITY_MAX_SID_SIZE,
     TOKEN_GROUPS, TOKEN_QUERY, TOKEN_USER,
 };
@@ -110,14 +110,14 @@ pub fn local_group_exists(name: &str) -> bool {
 }
 
 /// SDDL DACL used for the pipe.  `SY` is LocalSystem, `BA` is the built-in
-/// Administrators group, and `IU` is the INTERACTIVE group.  When a dedicated
-/// group SID string is supplied the `IU` entry is replaced by that group so a
-/// non-member interactive user cannot open the pipe at all.
+/// Administrators group.  When a dedicated group SID string is supplied it is
+/// granted client access; otherwise only the daemon's own user is added.
+/// INTERACTIVE is never granted, so a missing group fails closed.
 ///
 /// `daemon_user` is the SID of the account running the daemon.  It is added
-/// explicitly so a `--console` daemon started over SSH (whose token need not
-/// carry the INTERACTIVE SID) can be reached by its own user.  For a SYSTEM
-/// service the SID is `S-1-5-18` and is already covered by `SY`.
+/// explicitly so a `--console` daemon started over SSH can be reached by its
+/// own user.  For a SYSTEM service the SID is `S-1-5-18` and is already
+/// covered by `SY`.
 pub fn pipe_sddl(group_sid: Option<&str>, daemon_user: Option<&str>) -> String {
     // SYSTEM/Administrators keep FILE_ALL_ACCESS (they may create instances
     // and manage the object).  Clients get FILE_GENERIC_READ|FILE_GENERIC_WRITE
@@ -125,12 +125,11 @@ pub fn pipe_sddl(group_sid: Option<&str>, daemon_user: Option<&str>) -> String {
     // 0x4 is FILE_CREATE_PIPE_INSTANCE and is part of the generic write
     // mapping, so this does not stop an allowed same-user process from
     // creating an extra instance; FIRST_PIPE_INSTANCE blocks a pre-existing
-    // squatter at daemon start and M4 adds server-image verification.
+    // squatter at daemon start and the GUI verifies the server identity.
     const CLIENT_RIGHTS: &str = "0x12019F";
     let mut aces = vec!["(A;;FA;;;SY)".to_string(), "(A;;FA;;;BA)".to_string()];
-    match group_sid {
-        Some(sid) => aces.push(format!("(A;;{CLIENT_RIGHTS};;;{sid})")),
-        None => aces.push(format!("(A;;{CLIENT_RIGHTS};;;IU)")),
+    if let Some(sid) = group_sid {
+        aces.push(format!("(A;;{CLIENT_RIGHTS};;;{sid})"));
     }
     if let Some(user) = daemon_user {
         let already_covered = aces.iter().any(|ace| ace.contains(&format!(";;;{user})")))
@@ -156,13 +155,13 @@ pub fn pipe_sddl(group_sid: Option<&str>, daemon_user: Option<&str>) -> String {
 ///
 /// This does **not** weaken the GUI's identity policy: it only makes the
 /// read-only image query possible, and still exposes no memory, handle
-/// duplication or terminate rights to ordinary users.
+/// duplication or terminate rights to ordinary users.  INTERACTIVE is never
+/// granted; without a dedicated group only the daemon's own account can query.
 pub fn process_sddl(group_sid: Option<&str>, daemon_user: Option<&str>) -> String {
     let query = format!("(A;;0x{PROCESS_QUERY_LIMITED_INFORMATION:X};;;");
     let mut aces = vec!["(A;;FA;;;SY)".to_string(), "(A;;FA;;;BA)".to_string()];
-    match group_sid {
-        Some(sid) => aces.push(format!("{query}{sid})")),
-        None => aces.push(format!("{query}IU)")),
+    if let Some(sid) = group_sid {
+        aces.push(format!("{query}{sid})"));
     }
     if let Some(user) = daemon_user {
         let already_covered = aces.iter().any(|ace| ace.contains(&format!(";;;{user})")))
@@ -332,16 +331,14 @@ pub struct ClientPolicy {
 
 impl ClientPolicy {
     /// Build the policy.  `group` is an explicit local group name (already
-    /// resolved by the daemon); `None` allows INTERACTIVE users.
+    /// resolved by the daemon).  Without one, only the daemon's own account
+    /// and Administrators are allowed; there is no INTERACTIVE fallback.
     pub fn new(group: Option<&str>) -> io::Result<Self> {
         // SAFETY: `GetCurrentProcessId` has no preconditions.
         let own_user = process_user_sid(unsafe { GetCurrentProcessId() })?;
         let mut allowed = vec![well_known_sid(WinBuiltinAdministratorsSid)?];
-        match group {
-            // A dedicated group replaces the INTERACTIVE fallback, matching
-            // the pipe DACL.
-            Some(group) => allowed.push(group_sid_bytes(group)?),
-            None => allowed.push(well_known_sid(WinInteractiveSid)?),
+        if let Some(group) = group {
+            allowed.push(group_sid_bytes(group)?);
         }
         Ok(Self { own_user, allowed })
     }
@@ -358,6 +355,22 @@ impl ClientPolicy {
             Ok(()) => "allowed".into(),
             Err(reason) => reason,
         }
+    }
+
+    /// Whether the peer token has an enabled Administrators group.  Used for
+    /// privileged requests such as Shutdown; a UAC-filtered admin token has
+    /// the SID deny-only and is correctly rejected.
+    pub fn is_administrator(&self, pid: u32) -> bool {
+        let Ok(token) = open_process_token(pid) else {
+            return false;
+        };
+        let Ok(groups) = token_group_sids(&token) else {
+            return false;
+        };
+        let Ok(admin) = well_known_sid(WinBuiltinAdministratorsSid) else {
+            return false;
+        };
+        groups.iter().any(|group| group == &admin)
     }
 
     fn evaluate(&self, pid: u32) -> Result<(), String> {
@@ -397,10 +410,16 @@ impl ClientPolicy {
 }
 
 /// String SID of the account running this process (used in the pipe DACL).
-pub(crate) fn current_user_sid_string() -> io::Result<String> {
+pub fn current_user_sid_string() -> io::Result<String> {
     // SAFETY: `GetCurrentProcessId` has no preconditions.
     let sid = process_user_sid(unsafe { GetCurrentProcessId() })?;
     sid_to_string(&sid)
+}
+
+/// String SID of the account running `pid`.  The GUI uses this together with
+/// the image/publisher check before sending a passphrase.
+pub fn process_user_sid_string(pid: u32) -> io::Result<String> {
+    sid_to_string(&process_user_sid(pid)?)
 }
 
 /// PID of the process on the other end of a connected server pipe.
@@ -573,13 +592,14 @@ mod tests {
     }
 
     #[test]
-    fn default_dacl_has_no_world_or_anonymous_ace() {
+    fn default_dacl_has_no_interactive_world_or_anonymous_ace() {
         let sddl = pipe_sddl(None, None);
         assert!(sddl.contains("(A;;FA;;;SY)"), "{sddl}");
         assert!(sddl.contains("(A;;FA;;;BA)"), "{sddl}");
-        assert!(sddl.contains(";;;IU)"), "{sddl}");
-        // Clients get only the generic read/write mapping, not WRITE_DAC/DELETE.
-        assert!(sddl.contains("(A;;0x12019F;;;IU)"), "{sddl}");
+        assert!(
+            !sddl.contains(";;;IU)"),
+            "INTERACTIVE must not be granted: {sddl}"
+        );
         assert!(!sddl.contains("WD"), "world must not be granted: {sddl}");
         assert!(
             !sddl.contains("AN"),
@@ -598,9 +618,13 @@ mod tests {
     }
 
     #[test]
-    fn daemon_user_is_added_once() {
+    fn daemon_user_is_added_once_and_is_the_only_client_ace_without_a_group() {
         let sddl = pipe_sddl(None, Some("S-1-5-21-9-9-9-1001"));
-        assert!(sddl.contains(";;;S-1-5-21-9-9-9-1001)"), "{sddl}");
+        assert!(
+            sddl.contains("(A;;0x12019F;;;S-1-5-21-9-9-9-1001)"),
+            "{sddl}"
+        );
+        assert!(!sddl.contains(";;;IU)"), "{sddl}");
         // SYSTEM is already covered by the SY alias.
         let system = pipe_sddl(None, Some("S-1-5-18"));
         assert!(!system.contains(";;;S-1-5-18)"), "{system}");
@@ -619,12 +643,13 @@ mod tests {
     }
 
     #[test]
-    fn process_dacl_grants_only_query_to_interactive_users() {
-        let sddl = process_sddl(None, None);
+    fn process_dacl_has_no_interactive_grant_and_daemon_user_gets_query_only() {
+        let sddl = process_sddl(None, Some("S-1-5-21-9-9-9-1001"));
         assert!(sddl.starts_with("D:P"), "{sddl}");
         assert!(sddl.contains("(A;;FA;;;SY)"), "{sddl}");
         assert!(sddl.contains("(A;;FA;;;BA)"), "{sddl}");
-        assert!(sddl.contains("(A;;0x1000;;;IU)"), "{sddl}");
+        assert!(sddl.contains("(A;;0x1000;;;S-1-5-21-9-9-9-1001)"), "{sddl}");
+        assert!(!sddl.contains(";;;IU)"), "{sddl}");
         // No write/terminate-style access for ordinary users.
         assert!(!sddl.contains("0x1F"), "{sddl}");
         assert!(!sddl.contains("WD"), "{sddl}");

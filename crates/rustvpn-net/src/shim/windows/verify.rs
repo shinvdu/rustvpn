@@ -8,6 +8,7 @@
 use std::fmt;
 use std::fs;
 use std::io::Read;
+use std::os::windows::fs::OpenOptionsExt;
 use std::path::Path;
 
 use sha2::{Digest, Sha256};
@@ -97,22 +98,55 @@ pub fn to_hex(bytes: &[u8]) -> String {
     out
 }
 
-/// SHA-256 of a file's contents.
-pub fn sha256_file(path: &Path) -> Result<[u8; 32], DllPinError> {
-    let mut file =
-        fs::File::open(path).map_err(|e| DllPinError::Io(format!("{}: {e}", path.display())))?;
+fn sha256_reader(mut file: impl Read, label: &str) -> Result<[u8; 32], DllPinError> {
     let mut hasher = Sha256::new();
     let mut buffer = [0u8; 64 * 1024];
     loop {
         let read = file
             .read(&mut buffer)
-            .map_err(|e| DllPinError::Io(format!("{}: {e}", path.display())))?;
+            .map_err(|e| DllPinError::Io(format!("{label}: {e}")))?;
         if read == 0 {
             break;
         }
         hasher.update(&buffer[..read]);
     }
     Ok(hasher.finalize().into())
+}
+
+/// SHA-256 of a file's contents.
+pub fn sha256_file(path: &Path) -> Result<[u8; 32], DllPinError> {
+    let file =
+        fs::File::open(path).map_err(|e| DllPinError::Io(format!("{}: {e}", path.display())))?;
+    sha256_reader(file, &path.display().to_string())
+}
+
+/// Open, verify and keep the DLL file locked against writes/deletes until the
+/// returned handle is dropped.  `LoadLibrary` may open the same file for read
+/// while this handle is alive, but a swap between hashing and loading is
+/// denied by the sharing mode.
+pub fn open_verified_wintun_dll(path: &Path, expected: &[u8; 32]) -> Result<fs::File, DllPinError> {
+    if !path.is_absolute() {
+        return Err(DllPinError::RelativePath(path.display().to_string()));
+    }
+    let metadata =
+        fs::metadata(path).map_err(|e| DllPinError::Io(format!("{}: {e}", path.display())))?;
+    if !metadata.is_file() {
+        return Err(DllPinError::NotAFile(path.display().to_string()));
+    }
+    // FILE_SHARE_READ only: deny concurrent write/delete while loaded.
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0x1)
+        .open(path)
+        .map_err(|e| DllPinError::Io(format!("{}: {e}", path.display())))?;
+    let actual = sha256_reader(&file, &path.display().to_string())?;
+    if &actual != expected {
+        return Err(DllPinError::HashMismatch {
+            expected: to_hex(expected),
+            actual: to_hex(&actual),
+        });
+    }
+    Ok(file)
 }
 
 /// Ensure the DLL is an absolute path to a regular file and that its SHA-256

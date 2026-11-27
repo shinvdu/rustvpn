@@ -88,6 +88,14 @@ function Test-Signature([string]$Path) {
     return ((Invoke-SignTool @('verify', '/pa', '/q', $Path)) -eq 0)
 }
 
+function Get-SignatureStatus([string]$Path) {
+    try {
+        return (Get-AuthenticodeSignature -LiteralPath $Path -ErrorAction Stop).Status.ToString()
+    } catch {
+        return 'Unknown'
+    }
+}
+
 $thumb = if ($Thumbprint) { $Thumbprint.Trim() } else { '' }
 $configured = ($thumb -ne '') -or ($PfxFile -ne '')
 
@@ -103,8 +111,9 @@ if ($configured -and $thumb -eq '' -and [string]::IsNullOrEmpty($PfxPassword)) {
 
 if (-not $configured) {
     foreach ($file in $Files) {
-        if (Test-Signature $file) {
-            throw "no certificate is configured, but $file already carries a valid signature; refusing to label an untracked artifact as unsigned"
+        $status = Get-SignatureStatus $file
+        if ($status -ne 'NotSigned') {
+            throw "no certificate is configured, but $file has signature status $status; refusing to label it unsigned (import the signer or build a clean binary)"
         }
     }
     if ($RequireSigned) {
@@ -131,28 +140,47 @@ if (-not $configured) {
     exit 0
 }
 
-foreach ($file in $Files) {
-    if ($thumb -ne '') {
-        $signArguments = @('sign', '/sha1', $thumb, '/fd', 'SHA256')
-    } else {
-        if (-not (Test-Path -LiteralPath $PfxFile)) {
-            throw "certificate file does not exist: $PfxFile"
-        }
-        $signArguments = @('sign', '/f', $PfxFile, '/p', $PfxPassword, '/fd', 'SHA256')
+# A PFX password must never appear in the signtool argv (visible to process
+# telemetry).  Import it into CurrentUser/My with a SecureString, sign by
+# thumbprint, then remove the temporary certificate.
+$importedThumb = $null
+if ($configured -and $thumb -eq '') {
+    if (-not (Test-Path -LiteralPath $PfxFile)) {
+        throw "certificate file does not exist: $PfxFile"
     }
-    if (-not $skipTimestamp) {
-        $signArguments += @('/tr', $TimestampUrl, '/td', 'SHA256')
-    }
-    $signArguments += $file
+    $securePassword = ConvertTo-SecureString -String $PfxPassword -AsPlainText -Force
+    $imported = Import-PfxCertificate -FilePath $PfxFile `
+        -CertStoreLocation Cert:\CurrentUser\My -Password $securePassword -ErrorAction Stop
+    $importedThumb = $imported.Thumbprint
+    $thumb = $importedThumb
+    Write-Host 'imported the PFX temporarily into CurrentUser\My for thumbprint signing'
+}
 
-    $exit = Invoke-SignTool $signArguments
-    if ($exit -ne 0) {
-        throw "signtool sign failed for $file (exit $exit)"
+try {
+    foreach ($file in $Files) {
+        if ($thumb -ne '') {
+            $signArguments = @('sign', '/sha1', $thumb, '/fd', 'SHA256')
+        } else {
+            throw 'no signing certificate is configured'
+        }
+        if (-not $skipTimestamp) {
+            $signArguments += @('/tr', $TimestampUrl, '/td', 'SHA256')
+        }
+        $signArguments += $file
+
+        $exit = Invoke-SignTool $signArguments
+        if ($exit -ne 0) {
+            throw "signtool sign failed for $file (exit $exit)"
+        }
+        if (-not (Test-Signature $file)) {
+            throw "signtool verify failed for $file"
+        }
+        Write-Host "signed and verified: $file"
     }
-    if (-not (Test-Signature $file)) {
-        throw "signtool verify failed for $file"
+} finally {
+    if ($importedThumb) {
+        Remove-Item -LiteralPath "Cert:\CurrentUser\My\$importedThumb" -Force -ErrorAction SilentlyContinue
     }
-    Write-Host "signed and verified: $file"
 }
 
 if ($UnsignedMarker -and (Test-Path -LiteralPath $UnsignedMarker)) {

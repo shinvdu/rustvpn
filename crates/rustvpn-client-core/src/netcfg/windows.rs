@@ -31,7 +31,8 @@ use windows_sys::Win32::Security::Authorization::{
     ConvertStringSecurityDescriptorToSecurityDescriptorW, SetNamedSecurityInfoW, SE_FILE_OBJECT,
 };
 use windows_sys::Win32::Security::{
-    GetSecurityDescriptorDacl, DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
+    GetSecurityDescriptorDacl, DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
+    PSECURITY_DESCRIPTOR,
 };
 use windows_sys::Win32::System::Threading::{
     GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
@@ -229,7 +230,7 @@ fn apply_restrictive_acl(path: &Path) -> Result<()> {
         SetNamedSecurityInfoW(
             wide_path.as_ptr(),
             SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
             std::ptr::null_mut(),
             std::ptr::null_mut(),
             dacl,
@@ -246,9 +247,15 @@ fn apply_restrictive_acl(path: &Path) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn ensure_secure_state_dir(dir: &Path) -> Result<()> {
+pub fn ensure_secure_state_dir(dir: &Path) -> Result<()> {
     std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
     apply_restrictive_acl(dir)
+}
+
+/// Apply the restrictive state-file DACL to an already-created file.  Used by
+/// the daemon log so `%ProgramData%\RustVPN\clientd.log` is SYSTEM/admin-only.
+pub fn harden_state_file(path: &Path) -> Result<()> {
+    apply_restrictive_acl(path)
 }
 
 /// Write a state file with the restrictive DACL applied before publishing the
@@ -366,7 +373,7 @@ impl ConnectionCleanup {
         Self::default()
     }
 
-    pub async fn finish_after_close(self, closed: bool) {
+    pub async fn finish_after_close(self, closed: bool, adapter_created: bool) {
         if let Some(report) = self.report {
             for action in &report.actions {
                 eprintln!("net: {action}");
@@ -375,16 +382,40 @@ impl ConnectionCleanup {
                 eprintln!("warning: Windows pre-close cleanup incomplete: {error}");
             }
         }
-        if closed {
-            eprintln!(
-                "net: host-route cleanup deferred to the next connect/daemon start; \
-                 netstate.json kept"
-            );
-        } else {
+        if !closed {
             eprintln!(
                 "warning: adapter was not closed; network state and netstate.json kept for \
                  the next start"
             );
+            return;
+        }
+        if adapter_created {
+            eprintln!(
+                "net: host-route cleanup deferred to the next connect/daemon start; \
+                 netstate.json kept"
+            );
+            return;
+        }
+
+        // A pre-existing Wintun adapter is not removed by WintunCloseAdapter.
+        // Its address and connected/default/split routes therefore survive the
+        // close.  The session is gone now, so the full cleanup is safe and
+        // must run here rather than leaving the host pointing at a dead
+        // adapter until the next connect/start.
+        match cleanup_owned_network().await {
+            Ok(report) => {
+                for action in &report.actions {
+                    eprintln!("net: post-close cleanup: {action}");
+                }
+                for error in &report.errors {
+                    eprintln!(
+                        "warning: post-close cleanup incomplete; state kept for retry: {error}"
+                    );
+                }
+            }
+            Err(error) => {
+                eprintln!("warning: post-close cleanup failed; state kept for retry: {error:#}")
+            }
         }
     }
 }

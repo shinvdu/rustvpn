@@ -40,7 +40,7 @@ use windows_sys::Win32::System::Threading::{
     OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
 };
 
-use crate::daemon_identity;
+use crate::daemon_identity::{self, Trust};
 
 /// A successfully verified pipe server.
 #[derive(Debug)]
@@ -50,7 +50,9 @@ pub struct ProcessImage {
     pub image: String,
     /// Authenticode signer subject, when the image is signed and trusted.
     pub publisher: Option<String>,
-    pub trust: daemon_identity::Trust,
+    /// Account SID of the server process.
+    pub user_sid: String,
+    pub trust: Trust,
 }
 
 /// Verify the server process that owns the connected named pipe.
@@ -83,10 +85,16 @@ pub fn verify_pipe_server(pid: u32) -> Result<ProcessImage, String> {
         gui_exe.as_deref(),
         &installed_dirs,
     )?;
+    let user_sid = rustvpn_client_ipc::windows::process_user_sid_string(pid)
+        .map_err(|error| format!("read the account SID of the pipe server: {error}"))?;
+    let current_sid = rustvpn_client_ipc::windows::current_user_sid_string()
+        .map_err(|error| format!("read the current user SID: {error}"))?;
+    daemon_identity::check_daemon_user(&user_sid, &current_sid, trust == Trust::Installed)?;
     Ok(ProcessImage {
         pid,
         image,
         publisher,
+        user_sid,
         trust,
     })
 }

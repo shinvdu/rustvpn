@@ -276,6 +276,12 @@ $exes = @(
 $marker = Join-Path $output 'UNSIGNED.txt'
 $signed = $false
 if ($SkipSign) {
+    foreach ($exe in $exes) {
+        $signature = Get-AuthenticodeSignature -LiteralPath $exe -ErrorAction Stop
+        if ($signature.Status -ne 'NotSigned') {
+            throw "refusing -SkipSign: $exe already has signature status $($signature.Status); build a clean binary or configure signing"
+        }
+    }
     Write-Step 'signing skipped (-SkipSign); artifacts will be marked unsigned'
     $signingStatus = 'Unsigned development build (signing skipped)'
     @(
@@ -381,9 +387,12 @@ $info = @(
 ) -join [Environment]::NewLine
 Set-Content -LiteralPath (Join-Path $output 'BUILD-INFO.txt') -Value $info -Encoding ASCII
 
-$checksums = foreach ($file in @($msi) + $exes) {
-    $hash = (Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash.ToLowerInvariant()
-    "$hash  $([IO.Path]::GetFileName($file))"
+# Only checksum files that actually exist in the release directory.  The staged
+# executables are embedded in the MSI and are not separate release assets.
+$checksums = foreach ($file in Get-ChildItem -LiteralPath $output -File |
+        Where-Object { $_.Name -ne 'SHA256SUMS.txt' } | Sort-Object Name) {
+    $hash = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+    "$hash  $($file.Name)"
 }
 Set-Content -LiteralPath (Join-Path $output 'SHA256SUMS.txt') -Value $checksums -Encoding ASCII
 

@@ -129,11 +129,14 @@ impl WintunAdapter {
     pub fn open_or_create(cfg: &AdapterConfig) -> Result<Self, String> {
         cfg.validate()?;
 
-        // Absolute path + pinned SHA-256 before any code is loaded.
-        verify::verify_wintun_dll(&cfg.wintun_file, &cfg.wintun_sha256)
+        // Absolute path + pinned SHA-256 before any code is loaded.  The file
+        // handle is held with FILE_SHARE_READ so the bytes cannot be swapped
+        // between hashing and LoadLibrary.
+        let _dll_guard = verify::open_verified_wintun_dll(&cfg.wintun_file, &cfg.wintun_sha256)
             .map_err(|e| e.to_string())?;
         let wintun = unsafe { wintun_bindings::load_from_path(&cfg.wintun_file) }
             .map_err(|e| format!("load wintun.dll from {}: {e}", cfg.wintun_file.display()))?;
+        drop(_dll_guard);
 
         let mut notes = Vec::new();
         // Only "adapter not found" may fall back to creation; permission,

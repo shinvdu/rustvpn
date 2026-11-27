@@ -55,5 +55,6 @@ pub use linux::{
 };
 #[cfg(windows)]
 pub use windows::{
-    cleanup_owned_network, cleanup_stale_network, ConnectionCleanup, InstallFailure, NetworkGuard,
+    cleanup_owned_network, cleanup_stale_network, ensure_secure_state_dir, harden_state_file,
+    ConnectionCleanup, InstallFailure, NetworkGuard,
 };

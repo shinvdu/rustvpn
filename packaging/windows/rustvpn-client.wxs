@@ -4,7 +4,7 @@
 
   This is deliberately a standalone WiX project instead of a Tauri bundler
   fragment: the bundle owns the GUI product, upgrade identity and WiX main
-  template, while M5 needs a LocalSystem service, delayed auto-start, failure
+  template, while M5 needs a LocalSystem service, automatic start, failure
   recovery, a local group helper and upgrade/stop ordering.  Building the MSI
   directly with candle/light keeps every table explicit and verifiable.
 
@@ -215,26 +215,18 @@
 
     <!--
       Create the local group and add the installing user before StartServices.
-      The helper is deliberately tolerant: it rolls back only a group it
-      created when membership could not be applied, so an existing INTERACTIVE
-      fallback is preserved instead of locking standard users out.
+      The helper is deliberately tolerant of installation failure, but the
+      daemon is not: it rolls back only a group it created, and service mode
+      then fails closed if RustVPN is missing.  There is no INTERACTIVE fallback.
     -->
     <!--
       The Windows Installer ServiceConfig / ServiceConfigFailureActions tables
       are documented as unreliable and Error 1939 appeared on Windows 10.
-      Apply the same settings with sc.exe after the service is installed and
-      before it is started: delayed automatic start and restart-on-failure
-      after 5 s, 10 s and 30 s.
+      Apply failure recovery with sc.exe after the service is installed and
+      before it is started: restart after 5 s, 10 s and 30 s.  Start type stays
+      automatic (not delayed) so the service owns the production pipe before
+      interactive logon.
     -->
-    <CustomAction Id="SetDaemonStartModeCommand"
-                  Property="RunDaemonStartMode"
-                  Value="&quot;[System64Folder]sc.exe&quot; config rustvpn-clientd start= delayed-auto" />
-    <CustomAction Id="RunDaemonStartMode"
-                  BinaryKey="WixCA"
-                  DllEntry="WixQuietExec"
-                  Execute="deferred"
-                  Impersonate="no"
-                  Return="check" />
     <CustomAction Id="SetDaemonFailureActionsCommand"
                   Property="RunDaemonFailureActions"
                   Value="&quot;[System64Folder]sc.exe&quot; failure rustvpn-clientd reset= 86400 actions= restart/5000/restart/10000/restart/30000" />
@@ -244,6 +236,16 @@
                   Execute="deferred"
                   Impersonate="no"
                   Return="check" />
+
+    <CustomAction Id="SetDaemonCleanupCommand"
+                  Property="RunDaemonCleanup"
+                  Value="&quot;[INSTALLDIR]rustvpn-clientd.exe&quot; --cleanup" />
+    <CustomAction Id="RunDaemonCleanup"
+                  BinaryKey="WixCA"
+                  DllEntry="WixQuietExec"
+                  Execute="deferred"
+                  Impersonate="no"
+                  Return="ignore" />
 
     <CustomAction Id="SetRustVPNUser"
                   Property="RUSTVPN_USER"
@@ -268,11 +270,11 @@
       <Custom Action="RunRustVPNGroupSetup" Before="StartServices">
         NOT Installed
       </Custom>
-      <Custom Action="SetDaemonStartModeCommand" Before="RunDaemonStartMode">
-        NOT Installed
+      <Custom Action="SetDaemonCleanupCommand" Before="RunDaemonCleanup">
+        REMOVE="ALL"
       </Custom>
-      <Custom Action="RunDaemonStartMode" Before="StartServices">
-        NOT Installed
+      <Custom Action="RunDaemonCleanup" Before="RemoveFiles">
+        REMOVE="ALL"
       </Custom>
       <Custom Action="SetDaemonFailureActionsCommand" Before="RunDaemonFailureActions">
         NOT Installed

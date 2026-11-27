@@ -144,8 +144,12 @@ impl WindowsTap {
     /// Tunnel -> OS. ARP frames are consumed locally; IPv4 frames are written
     /// to Wintun after the shim lock is released.
     pub fn send(&self, buf: &[u8]) -> io::Result<usize> {
-        self.pump.send(buf)?;
-        Ok(buf.len())
+        match self.pump.send(buf)? {
+            crate::shim::SendOutcome::Written(written) => Ok(written),
+            // ARP and locally-dropped frames were consumed but did not reach
+            // the OS.  Do not report a successful write for them.
+            crate::shim::SendOutcome::Consumed => Ok(0),
+        }
     }
 }
 

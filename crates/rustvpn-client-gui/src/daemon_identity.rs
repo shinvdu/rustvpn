@@ -149,6 +149,34 @@ fn parent_dir(path: &str) -> Option<String> {
     path.rsplit_once('\\').map(|(parent, _)| parent.to_string())
 }
 
+/// Whether the pipe server's account may receive the passphrase.
+///
+/// The image check alone is insufficient: any standard user can execute the
+/// installed daemon in console mode.  A real service must be SYSTEM (or the
+/// configured service account, which this client does not yet support); a
+/// console/portable daemon must run as the same user as the GUI.  The image
+/// must already be trusted before a SYSTEM server is accepted.
+pub fn check_daemon_user(
+    server_user: &str,
+    current_user: &str,
+    trusted_installed: bool,
+) -> Result<(), String> {
+    let server_user = server_user.trim();
+    let current_user = current_user.trim();
+    if server_user.is_empty() || current_user.is_empty() {
+        return Err("named-pipe server or GUI user SID is empty".into());
+    }
+    if server_user.eq_ignore_ascii_case(current_user) {
+        return Ok(());
+    }
+    if trusted_installed && server_user.eq_ignore_ascii_case("S-1-5-18") {
+        return Ok(());
+    }
+    Err(format!(
+        "named-pipe server belongs to account {server_user}, not the current user;          refusing to send the passphrase"
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -263,5 +291,13 @@ mod tests {
                 "unexpectedly accepted {image:?}"
             );
         }
+    }
+
+    #[test]
+    fn server_user_must_match_or_be_system_for_installed_service() {
+        assert!(check_daemon_user("S-1-5-21-1", "S-1-5-21-1", false).is_ok());
+        assert!(check_daemon_user("S-1-5-18", "S-1-5-21-1", true).is_ok());
+        assert!(check_daemon_user("S-1-5-18", "S-1-5-21-1", false).is_err());
+        assert!(check_daemon_user("S-1-5-21-2", "S-1-5-21-1", true).is_err());
     }
 }

@@ -25,8 +25,9 @@ The MSI installs to `Program Files\RustVPN` for all users:
 
 It also creates:
 
-- service `rustvpn-clientd`: LocalSystem, automatic **delayed** start, own
-  process, image path `"...\rustvpn-clientd.exe" --service`;
+- service `rustvpn-clientd`: LocalSystem, **automatic** start (not delayed),
+  own process, image path `"...\rustvpn-clientd.exe" --service`; automatic
+  start ensures the service owns the production pipe before interactive logon;
 - failure recovery: restart after 5 s, 10 s and 30 s, counter reset after one day;
 - Start Menu shortcut under `RustVPN`;
 - local group `RustVPN` and membership for the account that ran the installer;
@@ -90,7 +91,7 @@ Expected service query (`sc.exe qc rustvpn-clientd`) includes:
 ```text
 BINARY_PATH_NAME   : "C:\Program Files\RustVPN\rustvpn-clientd.exe" --service
 SERVICE_START_NAME : LocalSystem
-START_TYPE         : 2   AUTO_START (DELAYED)
+START_TYPE         : 2   AUTO_START
 ```
 
 `sc.exe qfailure rustvpn-clientd` shows three restart actions. The service
@@ -107,8 +108,9 @@ never elevates.
 Access to the local named pipe `\\.\pipe\rustvpn-clientd` is limited to:
 
 - SYSTEM and Administrators;
-- the local `RustVPN` group when it exists, otherwise INTERACTIVE users;
-- the daemon's own account (so a development `--console` daemon is reachable).
+- the local `RustVPN` group (required by service mode; a missing group makes
+  the service fail closed instead of falling back to INTERACTIVE);
+- the daemon's own account for a console-mode development daemon.
 
 The installer creates `RustVPN` and adds the installing account. Group
 membership is captured in the account's logon token, so **log out and back in**
@@ -123,9 +125,8 @@ net localgroup RustVPN <user> /add
 ```
 
 If the installer cannot create the group or add the user (for example a
-domain policy), `installer\setup-group.ps1` rolls back a group it created and
-leaves the daemon on the INTERACTIVE fallback, so non-admin interactive users
-are not locked out. The reason is logged to
+domain policy), `installer\setup-group.ps1` rolls back a group it created; the
+service then fails closed until the group exists. The reason is logged to
 `%TEMP%\RustVPN-setup-group.log`. If a pre-existing group cannot accept the
 user, add the user manually and re-login.
 
@@ -207,7 +208,7 @@ Install the newer MSI normally (interactive or `/qn`). The package uses
 1. the old service is stopped before files are replaced;
 2. old components are removed and the new binaries/Wintun DLL installed;
 3. the group helper re-runs (idempotent);
-4. the new service is started and failure recovery/delayed start reapplied.
+4. the new service is started and failure recovery reapplied.
 
 The GUI is closed by the MSI (`CloseApplication`, 10 s timeout) so its exe can
 be replaced. Profiles, Credential Manager entries and the `RustVPN` group are
@@ -334,18 +335,21 @@ The MSI:
 
 1. sends a stop to `rustvpn-clientd` and waits (the daemon removes its
    transient routes/DNS/NRPT/IPv6 rules as on a normal stop);
-2. removes the service registration and `Program Files\RustVPN`;
-3. removes the Start Menu/desktop shortcuts and the MSI registry values.
+2. runs the install-only `--cleanup` helper before files are removed, which
+   clears the deferred anti-loop route and `netstate.json` left by the normal
+   stop;
+3. removes the service registration and `Program Files\RustVPN`;
+4. removes the Start Menu/desktop shortcuts and the MSI registry values.
 
 Preserved by design:
 
 - per-user profiles in `%LOCALAPPDATA%\RustVPN\profiles`;
 - per-user Credential Manager entries;
 - the local `RustVPN` group and membership;
-- `%ProgramData%\RustVPN` (daemon log and crash-recovery state). The state file
-  is normally absent after a clean stop; if present it is only used to clean
-  an owner that is dead on the next start. Administrators can remove the
-  directory manually.
+- `%ProgramData%\RustVPN` (daemon log). The uninstall `--cleanup` action
+  removes the crash-recovery state file and deferred host route when it can;
+  the hardened log directory itself is preserved. Administrators can remove
+  the directory manually.
 
 Uninstall does **not** remove Wintun adapters that are still open by another
 process; RustVPN closes its own adapter on stop. If a crash left an adapter or
@@ -359,7 +363,7 @@ checks.
 Minimal post-install checks that do not connect a tunnel:
 
 ```powershell
-# service + recovery + delayed start
+# service + recovery + automatic start
 sc.exe qc rustvpn-clientd
 sc.exe qfailure rustvpn-clientd
 
@@ -389,8 +393,8 @@ MSI static inspection (no service install):
 
 This performs `msiexec /a` extraction, checks the payload, and queries the
 `ProductVersion`, `ALLUSERS`, `ServiceInstall` and `ServiceControl` tables;
-`dark.exe` output is checked for the `sc.exe` delayed-start/failure-recovery
-commands plus the shortcut/group/upgrade elements.
+`dark.exe` output is checked for the `--cleanup` uninstall action, the
+`sc.exe` failure-recovery commands, and the shortcut/group/upgrade elements.
 
 ---
 
@@ -405,7 +409,7 @@ commands plus the shortcut/group/upgrade elements.
 | Service fails to start after upgrade | Read `%ProgramData%\RustVPN\clientd.log` and Event Viewer; the failure policy retries three times. Check that the previous service stopped. |
 | MSI upgrade blocked | A newer ProductVersion is installed; uninstall it or build with an explicit higher `-MsiVersion`. |
 | Unsigned build warning | Expected without a certificate; see section 6. |
-| GUI connects to a `--console` daemon during development | The daemon grants its own user query access; the M4 debug sibling rule permits an unsigned sibling only in debug builds. |
+| GUI connects to a development daemon | Console mode must use a non-production `-socket`; point the GUI at the same pipe with `RUSTVPN_CLIENTD_SOCKET`. The daemon grants its own user query access; the debug sibling rule permits an unsigned sibling only in debug builds. |
 
 Logs: `%ProgramData%\RustVPN\clientd.log` (service), stderr (console). The
 installer group helper logs to `%TEMP%\RustVPN-setup-group.log`.

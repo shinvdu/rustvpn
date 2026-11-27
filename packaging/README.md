@@ -126,8 +126,10 @@ Secret Service (GNOME Keyring or KWallet). See
 
 The Windows client is packaged as a per-machine MSI. The Tauri GUI binary is
 unchanged (`bundle.active` stays `false`); a standalone WiX 3.14 project adds a
-LocalSystem service, delayed auto-start/failure recovery, the local `RustVPN`
-group, Start Menu shortcut and the Wintun DLL/license.
+LocalSystem service, automatic start/failure recovery, the local `RustVPN`
+group, Start Menu shortcut and the Wintun DLL/license.  Uninstall runs a
+`--cleanup` action before removing files to clear deferred host routes and
+the crash-recovery state file.
 
 ```powershell
 $env:CARGO_TARGET_DIR = 'D:\rustvpn-dev\target-m5'

@@ -4,8 +4,9 @@
 # the group and restricts the named pipe to it.  The script never fails the
 # installation:
 #   * if the group already exists it is reused;
-#   * if the user cannot be added, a group created by this run is deleted so
-#     the daemon keeps the INTERACTIVE fallback instead of locking users out;
+#   * if the user cannot be added, a group created by this run is deleted; the
+#     service then fails closed (missing RustVPN group), never falling back to
+#     INTERACTIVE users;
 #   * membership becomes effective at the next logon for an account whose
 #     token was created before this run (a re-login is documented).
 param(
@@ -66,7 +67,7 @@ $skip = @('', 'SYSTEM', '$', 'LocalSystem', 'NT AUTHORITY\SYSTEM',
     'NT AUTHORITY\LOCAL SERVICE', 'NT AUTHORITY\NETWORK SERVICE')
 if ($skip -contains $User) {
     if (-not (Test-Group $group)) {
-        Write-Log 'no interactive user; not creating the RustVPN group (daemon will use INTERACTIVE)'
+        Write-Log 'no interactive user; not creating the RustVPN group (service will fail closed until the group exists)'
     } else {
         Write-Log 'no interactive user to add; existing RustVPN group left unchanged'
     }
@@ -81,7 +82,7 @@ $created = $false
 if (-not (Test-Group $group)) {
     & $net localgroup $group /add /comment:"RustVPN client users" *>> $log
     if ($LASTEXITCODE -ne 0 -or -not (Test-Group $group)) {
-        Write-Log 'cannot create the RustVPN group (domain policy?); daemon will use INTERACTIVE'
+        Write-Log 'cannot create the RustVPN group (domain policy?); service will fail closed until the group exists'
         exit 0
     }
     $created = $true
@@ -107,7 +108,7 @@ if ($created) {
     if (Test-Group $group) {
         Write-Log 'could not roll back the RustVPN group; add users manually with net localgroup'
     } else {
-        Write-Log 'rolled back the RustVPN group so INTERACTIVE access remains available'
+        Write-Log 'rolled back the RustVPN group; service remains fail-closed until the group exists'
     }
 }
 exit 0

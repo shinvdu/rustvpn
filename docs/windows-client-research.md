@@ -269,6 +269,8 @@ Wintun 适配器 MTU 设置为 `ip_mtu`。Windows 应在 `ip_mtu < 576` 时拒�
 
 - 管道名：`\\.\pipe\rustvpn-clientd`；`-socket` 或
   `RUSTVPN_CLIENTD_SOCKET` 可覆盖，裸名称会展开为 `\\.\pipe\<name>`。
+  服务模式使用生产管道；console 模式必须使用非生产 `-socket`，否则拒绝
+  启动，避免普通用户通过安装目录里的 daemon 冒充服务或抢占生产管道。
 - 字节模式；`PIPE_REJECT_REMOTE_CLIENTS`；首次实例用
   `FILE_FLAG_FIRST_PIPE_INSTANCE`，已存在同名管道（抢占/重复实例）直接
   失败。
@@ -281,33 +283,29 @@ Wintun 适配器 MTU 设置为 `ip_mtu`。Windows 应在 `ip_mtu < 576` 时拒�
 ### 5.3 访问控制与威胁模型
 
 - 用 `windows-sys` 构造 SDDL，通过 Tokio
-  `ServerOptions::create_with_security_attributes_raw` 创建管道。默认
-  DACL 为 `SYSTEM + Administrators + INTERACTIVE`，并额外显式加入运行
-  daemon 的当前用户 SID（这样通过 SSH 启动的 `-console` 守护进程即使
-  token 不含 INTERACTIVE 也能被本用户连接）。显式拒绝 Everyone /
-  Anonymous；没有 null DACL。
-- 专用组：`-pipe-group <name>` 指定本地组时，DACL 用该组的 SID 取代
-  `INTERACTIVE`。Windows 服务模式下若本机存在 `RustVPN` 本地组则自动
-  启用；M5 安装器创建该组并把用户加入。控制台模式默认仍允许
-  `INTERACTIVE`，避免安装器尚未存在时把开发者锁在外面。
+  `ServerOptions::create_with_security_attributes_raw` 创建管道。DACL
+  只授予 `SYSTEM + Administrators`、服务配置的 `RustVPN` 组，以及
+  daemon 自身账户；**不再回退到 INTERACTIVE**。服务模式缺少 `RustVPN`
+  组时拒绝启动（fail closed），console 模式只允许 daemon 自身用户。
+  显式拒绝 Everyone / Anonymous；没有 null DACL。
+- 专用组：`-pipe-group <name>` 可显式指定本地组；M5 安装器创建
+  `RustVPN` 组并把安装用户加入。服务端还必须校验客户端所在用户组。
 - 服务端在 Hello 之前用 `GetNamedPipeClientProcessId` 取客户端 PID，并
   `OpenProcessToken(TOKEN_QUERY)` 校验：
   - 与 daemon 自身用户 SID 相同，或
-  - token 组包含 Administrators，以及 INTERACTIVE（未配置专用组时）
-    或配置的专用组（此时不再把 INTERACTIVE 计入）。
+  - token 组包含 Administrators，或配置的专用 `RustVPN` 组。
+  不再接受 INTERACTIVE 回退。
   Deny-only 组（UAC 过滤 token 里的 Administrators）不计为放行；任何
   API 失败按拒绝处理。
 - 已知限制：同用户的恶意进程仍在信任集合内；DACL + PID 校验无法区分它。
   另外，管道对象上的 GENERIC_WRITE 映射包含 `FILE_CREATE_PIPE_INSTANCE`
-  （同一个 0x4 位），所以被允许的同用户进程仍能创建额外实例；首次实例
-  标志只能挡住 daemon 启动前已存在的抢占，启动后的竞态要等 M4 的服务端
-  镜像/签名校验。
-- 服务端身份校验（GUI 发送口令前）已在 M4 实现：IPC 提供
+  （同一个 0x4 位），所以被允许的同用户进程仍能创建额外实例。
+- 服务端身份校验（GUI 使用所有 IPC 命令前）已在 M4/M6 实现：IPC 提供
   `Client::server_pid()`，GUI 用 `QueryFullProcessImageNameW` 读镜像路径、
-  `WinVerifyTrust` 校验 Authenticode 并取 signer publisher；只接受安装目录
-  内、签名 subject 含 RustVPN、或 debug 同目录未签名 daemon，其余拒绝发送
-  口令（详见 `windows-client-status.md` 2.9）。管道抢占仍由首次实例标志和
-  DACL 先挡住一部分。
+  `WinVerifyTrust` 校验 Authenticode、并读取服务端 token user SID；只接受
+  安装目录内且属于 SYSTEM 的服务，或与 GUI 同用户的 console/portable
+  daemon，其余拒绝。status/logs/events 也先完成同一校验。console 模式禁止
+  绑定生产管道，首次实例标志减少启动前的抢占窗口。
 - 控制台管道的 `Local\`/`Global\` 与多用户策略：请勿在共享机上以普通
   用户长期运行；生产以服务 + 专用组为准。
 
@@ -468,24 +466,25 @@ Product/Feature/UpgradeCode 与打包资源布局；M5 需要服务注册、延�
 - per-machine 安装到 `Program Files\RustVPN\`，安装 GUI、daemon、
   `wintun.dll`、文档和许可证；不打包用户 profile/keychain。
 - `ServiceInstall`：LocalSystem、own process、`--service`、自动启动；
-- 服务启动方式与失败恢复：安装期 `sc.exe config ... start= delayed-auto`
-  和 `sc.exe failure ... actions= restart/5000/restart/10000/restart/30000`
-  （Windows Installer 的 `ServiceConfig*` 表在实机触发 Error 1939）；
+- 服务启动方式与失败恢复：`ServiceInstall` 使用 automatic（非 delayed），
+  安装期用 `sc.exe failure ... actions= restart/5000/restart/10000/restart/30000`
+  配置失败恢复（Windows Installer 的 `ServiceConfig*` 表在实机触发 Error 1939）；
 - `ServiceControl Stop="both" Start="install" Remove="uninstall" Wait="yes"`：
   升级/卸载前停止、安装后启动、卸载删除 SCM 项；
 - 开始菜单快捷方式；桌面快捷方式由 `INSTALLDESKTOPSHORTCUT=1` 开启；
-- 卸载停止服务、删除文件/快捷方式/注册表/SCM，保留用户 profile/钥匙串、
-  `RustVPN` 组和 `%ProgramData%\RustVPN`；
+- 卸载停止服务，在删除文件前运行 `rustvpn-clientd.exe --cleanup` 清理
+  deferred 反环路/netstate，然后删除文件/快捷方式/注册表/SCM；保留用户
+  profile/钥匙串、`RustVPN` 组和 `%ProgramData%\RustVPN` 日志目录；
 - 升级流程：停止服务 → 清理网络（daemon 正常停止路径）→ 替换文件 →
   重新创建/加入组 → 启动服务。
 
 ### 8.2 组、服务访问与进程查询
 
 - 安装器在 `StartServices` 前运行 `installer\setup-group.ps1`，创建本地
-  `RustVPN` 组并把 `[LogonUser]`（或 `RUSTVPN_USER`）加入；失败时只回滚
-  本次创建的组，保留 INTERACTIVE 回退，避免锁死非管理员用户。
+  `RustVPN` 组并把 `[LogonUser]`（或 `RUSTVPN_USER`）加入；失败时回滚
+  本次创建的组；服务模式缺少该组时拒绝启动，而不是回退到 INTERACTIVE。
 - daemon 的 pipe DACL 使用该组；M2 的客户端 token 校验也在同一组上。
-- daemon 启动时给同一组/INTERACTIVE 授予
+- daemon 启动时给同一组与 daemon 自身账户授予
   `PROCESS_QUERY_LIMITED_INFORMATION`（仅 0x1000），使 M4 GUI 能在发送
   口令前解析 LocalSystem 服务镜像并校验 Authenticode；不授予内存、句柄
   或终止权限。
@@ -629,7 +628,7 @@ M3 已按第 6 节实现；kill-switch 明确拒绝、MSS 推迟。Windows 实�
 | 目标架构 | x64 还是同时 ARM64 | 先 x64，ARM64 后置 |
 | 是否接受服务 + 驱动 | Wintun 需要管理员安装 | 必须接受；这是 Windows 的权限模型 |
 | L2 是否硬需求 | 需要 VLAN/广播发现/非 IP 协议时 Wintun 不够 | 默认 Wintun；真 L2 再评估 tap-windows6 |
-| 服务访问控制 | 所有交互用户 vs 专用组 | 专用本地组；MVP 可先 INTERACTIVE |
+| 服务访问控制 | 专用组；禁止 INTERACTIVE 回退 | 专用本地组；服务模式缺组时 fail closed |
 | 签名证书 | 无证书会被 SmartScreen 拦截 | 开发版可未签名；正式版准备 EV 证书 |
 | IPv6 | 当前协议/profile 不支持 | 首版阻断/告警，后续单独立项 |
 | 更新方式 | Tauri updater 不适合替换服务 | 走签名 MSI，关闭 Windows 自更新 |

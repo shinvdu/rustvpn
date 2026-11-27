@@ -19,12 +19,15 @@ $ErrorActionPreference = 'Stop'
 
 if (-not (Test-Path -LiteralPath $MsiPath)) { throw "MSI not found: $MsiPath" }
 $msi = (Resolve-Path -LiteralPath $MsiPath).Path
-$work = if ($ExtractDir) {
+$explicitExtract = -not [string]::IsNullOrWhiteSpace($ExtractDir)
+$work = if ($explicitExtract) {
     [IO.Path]::GetFullPath($ExtractDir)
 } else {
     Join-Path ([IO.Path]::GetTempPath()) ("rustvpn-msi-inspect-" + [guid]::NewGuid().ToString('N'))
 }
-Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $work
+if (-not $explicitExtract) {
+    Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $work
+}
 New-Item -ItemType Directory -Force -Path $work | Out-Null
 $extract = Join-Path $work 'payload'
 $darkOut = Join-Path $work 'dark'
@@ -103,7 +106,7 @@ $checks = [ordered]@{
     'stop before replace' = 'Stop="both"'
     'start after install' = 'Start="install"'
     'remove service on uninstall' = 'Remove="uninstall"'
-    'delayed automatic start' = 'start= delayed-auto'
+    'uninstall network cleanup' = '--cleanup'
     'failure recovery 5s' = 'restart/5000'
     'failure recovery 10s' = 'restart/10000'
     'failure recovery 30s' = 'restart/30000'

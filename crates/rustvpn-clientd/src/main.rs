@@ -29,6 +29,8 @@ use zeroize::Zeroizing;
 
 const DAEMON_VERSION: &str = env!("CARGO_PKG_VERSION");
 const MAX_LOG_LINES: usize = 2000;
+const MAX_LOG_LINE_CHARS: usize = 2048;
+const MAX_LOGS_RESPONSE_LINES: usize = 400;
 const DEFAULT_HELLO_TIMEOUT_SECS: u64 = 5;
 const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 300;
 const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -46,10 +48,19 @@ static LOG_FILE: OnceLock<Mutex<std::fs::File>> = OnceLock::new();
 /// sink until Event Log integration is added in M5.
 macro_rules! dlog {
     ($($arg:tt)*) => {{
-        let line = format!($($arg)*);
+        let line = $crate::truncate_log_line(&format!($($arg)*));
         eprintln!("{line}");
         $crate::write_log_file(&line);
     }};
+}
+
+fn truncate_log_line(line: &str) -> String {
+    if line.chars().count() <= MAX_LOG_LINE_CHARS {
+        return line.to_string();
+    }
+    let mut text: String = line.chars().take(MAX_LOG_LINE_CHARS).collect();
+    text.push('…');
+    text
 }
 
 fn write_log_file(line: &str) {
@@ -95,7 +106,22 @@ fn init_service_log() {
             std::env::var_os("ProgramData")
                 .map(|dir| PathBuf::from(dir).join("RustVPN").join("clientd.log"))
         });
-    init_log_file(path);
+    let Some(path) = path else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        if let Err(error) = rustvpn_client_core::netcfg::ensure_secure_state_dir(parent) {
+            eprintln!("refusing to write the service log under an insecure directory: {error:#}");
+            return;
+        }
+    }
+    init_log_file(Some(path.clone()));
+    if let Err(error) = rustvpn_client_core::netcfg::harden_state_file(&path) {
+        eprintln!(
+            "cannot restrict the service log ACL {}: {error:#}",
+            path.display()
+        );
+    }
 }
 
 #[cfg(windows)]
@@ -163,6 +189,7 @@ struct Args {
     no_host_dns: bool,
     help: bool,
     version: bool,
+    cleanup: bool,
 }
 
 fn usage() -> ! {
@@ -216,6 +243,7 @@ fn parse_args() -> Args {
         no_host_dns: false,
         help: false,
         version: false,
+        cleanup: false,
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -247,6 +275,7 @@ fn parse_args() -> Args {
                 args.idle_timeout = Duration::from_secs(parse_secs(&value, "idle-timeout"));
             }
             "no-host-dns" => args.no_host_dns = true,
+            "cleanup" => args.cleanup = true,
             "console" => args.console = true,
             "service" | "windows-service" => args.service = true,
             "version" => args.version = true,
@@ -283,9 +312,13 @@ pub(crate) struct RunConfig {
     idle_timeout: Duration,
     no_host_dns: bool,
     wait_for_signals: bool,
+    service_mode: bool,
+    ready: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
 pub(crate) fn build_config(args: &Args, wait_for_signals: bool) -> Result<RunConfig> {
+    #[cfg(windows)]
+    validate_console_endpoint(args)?;
     #[cfg(unix)]
     let gid = if args.socket_group.is_empty() {
         None
@@ -297,36 +330,62 @@ pub(crate) fn build_config(args: &Args, wait_for_signals: bool) -> Result<RunCon
     Ok(RunConfig {
         socket: args.socket.clone(),
         gid,
-        pipe_group: resolve_pipe_group(args),
+        pipe_group: resolve_pipe_group(args)?,
         hello_timeout: args.hello_timeout,
         idle_timeout: args.idle_timeout,
         no_host_dns: args.no_host_dns,
         wait_for_signals,
+        service_mode: args.service && !args.console,
+        ready: None,
     })
 }
 
-/// Explicit group wins.  In Windows service mode, prefer an existing
-/// `RustVPN` local group over INTERACTIVE users; console mode keeps the
-/// INTERACTIVE default so a developer is not locked out before M5 creates the
-/// group and adds members.
+/// Explicit group wins.  Service mode requires the dedicated local group;
+/// a missing group is a fail-closed configuration error, never an
+/// INTERACTIVE fallback.  Console mode without a group is restricted to the
+/// daemon's own account by the pipe/process DACLs.
 #[cfg(windows)]
-fn resolve_pipe_group(args: &Args) -> Option<String> {
+fn resolve_pipe_group(args: &Args) -> Result<Option<String>> {
     if let Some(group) = &args.pipe_group {
-        return Some(group.clone());
+        return Ok(Some(group.clone()));
     }
-    if args.service
-        && rustvpn_client_ipc::windows::local_group_exists(
+    if args.service {
+        if rustvpn_client_ipc::windows::local_group_exists(
             rustvpn_client_ipc::windows::DEDICATED_GROUP,
-        )
-    {
-        return Some(rustvpn_client_ipc::windows::DEDICATED_GROUP.into());
+        ) {
+            return Ok(Some(rustvpn_client_ipc::windows::DEDICATED_GROUP.into()));
+        }
+        bail!(
+            "Windows service mode requires the local RustVPN group; refusing the \
+             INTERACTIVE fallback (reinstall the MSI or create the group and retry)"
+        );
     }
-    None
+    Ok(None)
 }
 
 #[cfg(not(windows))]
-fn resolve_pipe_group(_args: &Args) -> Option<String> {
-    None
+fn resolve_pipe_group(_args: &Args) -> Result<Option<String>> {
+    Ok(None)
+}
+
+/// Console mode must never own the production pipe.  A standard user running
+/// the installed daemon could otherwise impersonate the service to the GUI or
+/// block the real service from starting.
+#[cfg(windows)]
+fn validate_console_endpoint(args: &Args) -> Result<()> {
+    if args.service && !args.console {
+        return Ok(());
+    }
+    let normalized = rustvpn_client_ipc::windows::normalize_pipe_path(&args.socket)
+        .with_context(|| format!("validate console endpoint {:?}", args.socket))?;
+    if normalized == std::path::Path::new(rustvpn_client_ipc::windows::DEFAULT_PIPE_NAME) {
+        bail!(
+            "console mode must not bind the production pipe {}; pass a development \
+             -socket name (and RUSTVPN_CLIENTD_SOCKET to the GUI) or run the service",
+            rustvpn_client_ipc::windows::DEFAULT_PIPE_NAME
+        );
+    }
+    Ok(())
 }
 
 /// Let the pipe's audience open this process for a read-only image query.
@@ -362,6 +421,8 @@ struct Shared {
     events: broadcast::Sender<Event>,
     commands: mpsc::Sender<Command>,
     shutdown: CancellationToken,
+    #[cfg_attr(unix, allow(dead_code))]
+    service_mode: bool,
 }
 
 fn main() {
@@ -369,6 +430,17 @@ fn main() {
     if args.version {
         println!("rustvpn-clientd {DAEMON_VERSION}");
         return;
+    }
+
+    #[cfg(windows)]
+    if args.cleanup {
+        match run_cleanup() {
+            Ok(()) => return,
+            Err(error) => {
+                eprintln!("cleanup failed: {error:#}");
+                process::exit(1);
+            }
+        }
     }
 
     #[cfg(windows)]
@@ -382,6 +454,11 @@ fn main() {
     #[cfg(not(windows))]
     if args.service {
         eprintln!("-service is only supported on Windows; use -console");
+        process::exit(2);
+    }
+    #[cfg(not(windows))]
+    if args.cleanup {
+        eprintln!("-cleanup is only supported on Windows");
         process::exit(2);
     }
 
@@ -411,7 +488,32 @@ fn main() {
     }
 }
 
-async fn run(config: RunConfig, shutdown: CancellationToken) -> Result<()> {
+#[cfg(windows)]
+fn run_cleanup() -> Result<()> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("create cleanup runtime")?;
+    let report = runtime.block_on(rustvpn_client_core::netcfg::cleanup_stale_network())?;
+    for action in &report.actions {
+        println!("cleanup: {action}");
+    }
+    for error in &report.errors {
+        eprintln!("cleanup warning: {error}");
+    }
+    if report.skipped_live_owner {
+        eprintln!("cleanup skipped: another live RustVPN owner still owns network state");
+    }
+    if !report.errors.is_empty() {
+        bail!(
+            "cleanup left {} error(s); state kept for the next start",
+            report.errors.len()
+        );
+    }
+    Ok(())
+}
+
+async fn run(mut config: RunConfig, shutdown: CancellationToken) -> Result<()> {
     let socket_path = &config.socket;
 
     #[cfg(unix)]
@@ -489,6 +591,7 @@ async fn run(config: RunConfig, shutdown: CancellationToken) -> Result<()> {
         events: events_tx.clone(),
         commands: commands_tx,
         shutdown: shutdown.clone(),
+        service_mode: config.service_mode,
     };
 
     let engine = Engine::spawn_with_options(
@@ -523,6 +626,13 @@ async fn run(config: RunConfig, shutdown: CancellationToken) -> Result<()> {
         "rustvpn-clientd {DAEMON_VERSION} listening on {}",
         socket_path.display()
     );
+
+    // The endpoint is bound: the SCM may now report Running instead of
+    // claiming readiness while a 10-15 s crash-recovery cleanup is still
+    // running.
+    if let Some(ready) = config.ready.take() {
+        let _ = ready.send(());
+    }
 
     let policy = make_peer_policy(&config)?;
     let accept_shared = shared.clone();
@@ -578,7 +688,9 @@ fn spawn_collector(
                         current.traffic = sample;
                     }
                 }
-                Ok(Event::Log(line)) => {
+                Ok(Event::Log(mut line)) => {
+                    line.level = truncate_log_line(&line.level);
+                    line.line = truncate_log_line(&line.line);
                     dlog!("[{}] {}", line.level, line.line);
                     if let Ok(mut ring) = logs.lock() {
                         if ring.len() >= MAX_LOG_LINES {
@@ -640,10 +752,12 @@ async fn accept_loop(
             dlog!("too many IPC connections; dropping client");
             continue;
         };
+        let peer_is_admin = peer_is_administrator(&stream, &policy);
         let shared = shared.clone();
         tokio::spawn(async move {
             let _permit = permit;
-            if let Err(error) = handle_connection(stream, shared, hello_timeout, idle_timeout).await
+            if let Err(error) =
+                handle_connection(stream, shared, hello_timeout, idle_timeout, peer_is_admin).await
             {
                 dlog!("IPC client failed: {error:#}");
             }
@@ -656,6 +770,7 @@ async fn handle_connection(
     shared: Shared,
     hello_timeout: Duration,
     idle_timeout: Duration,
+    peer_is_admin: bool,
 ) -> Result<()> {
     let Some(hello) = read_request(&mut stream, hello_timeout, "client hello").await? else {
         return Ok(());
@@ -740,9 +855,11 @@ async fn handle_connection(
                     .lock()
                     .map(|ring| {
                         let take = if limit == 0 {
-                            ring.len()
+                            ring.len().min(MAX_LOGS_RESPONSE_LINES)
                         } else {
-                            (limit as usize).min(ring.len())
+                            (limit as usize)
+                                .min(ring.len())
+                                .min(MAX_LOGS_RESPONSE_LINES)
                         };
                         ring.iter().skip(ring.len() - take).cloned().collect()
                     })
@@ -750,9 +867,15 @@ async fn handle_connection(
                 Response::Logs { lines }
             }
             Request::Shutdown => {
-                let _ = shared.commands.send(Command::Shutdown).await;
-                shared.shutdown.cancel();
-                Response::Ok
+                if shared.service_mode && !peer_is_admin {
+                    Response::Error {
+                        message: "Shutdown requires an elevated administrator token".into(),
+                    }
+                } else {
+                    let _ = shared.commands.send(Command::Shutdown).await;
+                    shared.shutdown.cancel();
+                    Response::Ok
+                }
             }
             Request::Subscribe => {
                 write_value(&mut stream, &Response::Subscribed).await?;
@@ -871,6 +994,19 @@ fn peer_allowed(stream: &Connection, gid: &PeerPolicy) -> bool {
         return false;
     }
     cred.uid() == unsafe { libc::geteuid() }
+}
+
+#[cfg(unix)]
+fn peer_is_administrator(_stream: &Connection, _policy: &PeerPolicy) -> bool {
+    // Unix Shutdown retains the historical same-user/root policy.
+    true
+}
+
+#[cfg(windows)]
+fn peer_is_administrator(stream: &Connection, policy: &PeerPolicy) -> bool {
+    stream
+        .peer_pid()
+        .is_ok_and(|pid| policy.is_administrator(pid))
 }
 
 #[cfg(windows)]
@@ -1099,5 +1235,13 @@ mod tests {
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn log_lines_are_bounded_before_entering_the_ring() {
+        let long = "x".repeat(MAX_LOG_LINE_CHARS + 500);
+        let line = truncate_log_line(&long);
+        assert_eq!(line.chars().count(), MAX_LOG_LINE_CHARS + 1);
+        assert!(line.ends_with('…'));
     }
 }

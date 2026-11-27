@@ -185,7 +185,7 @@
           <ul class="plain-list">
             <li>Wintun DLL 或驱动缺失：确认安装包包含 wintun.dll，开发时检查 RUSTVPN_WINTUN_DLL 绝对路径。</li>
             <li>路由冲突：关闭其他 VPN 或默认路由程序，并移除与配置冲突的静态路由。</li>
-            <li>服务未安装或未启动：M5 安装器会注册服务；开发时可运行 rustvpn-clientd.exe --console。</li>
+            <li>服务未安装或未启动：M5 安装器会注册服务；开发时用 --console 指定非生产管道。</li>
             <li>管道权限被拒绝：把账户加入本地组 RustVPN（M5 安装器创建），或以守护进程用户身份运行。</li>
             <li>kill-switch 与 MSS clamp 在 Windows 版不可用；界面只显示真实应用状态。</li>
           </ul>

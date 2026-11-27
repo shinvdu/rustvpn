@@ -198,8 +198,8 @@
     "命名管道": "Named pipe",
     "命名管道 DACL；发送口令前校验服务端 PID、镜像路径与 Authenticode 签名":
       "Named-pipe DACL; the server PID, image path and Authenticode signature are verified before the passphrase is sent",
-    "Windows 服务未安装或未启动时，开发模式可运行 rustvpn-clientd.exe --console；M5 安装器负责注册服务。":
-      "If the Windows service is not installed or running, use rustvpn-clientd.exe --console in development; the M5 installer registers the service.",
+    "Windows 服务未安装或未启动时，开发模式需运行 rustvpn-clientd.exe --console -socket <非生产管道>，并用 RUSTVPN_CLIENTD_SOCKET 指向同一管道；M5 安装器负责注册服务。":
+      "If the Windows service is not installed or running, run rustvpn-clientd.exe --console -socket <dev-pipe> and point RUSTVPN_CLIENTD_SOCKET at it; the M5 installer registers the service.",
     "Windows 使用当前用户的 Run 注册表项；登录时最小化到托盘，不会自动连接。":
       "Windows uses the current user's Run registry entry; it starts minimized to the tray at login and never connects automatically.",
     "RustVPN 客户端 · GPL-3.0-or-later · Tauri 2 + WebView2":
@@ -221,12 +221,22 @@
       "Missing Wintun DLL or driver: verify the package includes wintun.dll; in development check the absolute RUSTVPN_WINTUN_DLL path.",
     "路由冲突：关闭其他 VPN 或默认路由程序，并移除与配置冲突的静态路由。":
       "Route conflict: stop other VPN or default-route software and remove static routes that conflict with the profile.",
-    "服务未安装或未启动：M5 安装器会注册服务；开发时可运行 rustvpn-clientd.exe --console。":
-      "Service not installed or running: the M5 installer registers it; for development run rustvpn-clientd.exe --console.",
+    "服务未安装或未启动：M5 安装器会注册服务；开发时用 --console -socket <非生产管道>。":
+      "Service not installed or running: the M5 installer registers it; for development use --console with a non-production -socket.",
+    "服务未安装或未启动：M5 安装器会注册服务；开发时用 --console 指定非生产管道。":
+      "Service not installed or running: the M5 installer registers it; for development use --console with a non-production pipe.",
     "管道权限被拒绝：把账户加入本地组 RustVPN（M5 安装器创建），或以守护进程用户身份运行。":
       "Pipe access denied: add the account to the local RustVPN group (created by the M5 installer) or run as the daemon user.",
     "kill-switch 与 MSS clamp 在 Windows 版不可用；界面只显示真实应用状态。":
       "kill-switch and MSS clamp are unavailable on Windows; the UI shows only the actually applied state.",
+    "编辑": "Edit",
+    "删除": "Delete",
+    "服务器、verifier 与地址分配；口令不会落盘。":
+      "Server, verifier and address allocation; passphrases are never written to disk.",
+    "守护进程的连接、路由与重连记录。等级过滤只影响显示。":
+      "Daemon connection, route and reconnect records. Level filtering only affects display.",
+    "守护进程位置、安全边界与版本信息。":
+      "Daemon location, security boundary and version information.",
   };
 
   const RU = {
@@ -409,8 +419,8 @@
     "命名管道": "Именованный канал",
     "命名管道 DACL；发送口令前校验服务端 PID、镜像路径与 Authenticode 签名":
       "DACL именованного канала; перед отправкой пароля проверяются PID сервера, путь к образу и подпись Authenticode",
-    "Windows 服务未安装或未启动时，开发模式可运行 rustvpn-clientd.exe --console；M5 安装器负责注册服务。":
-      "Если служба Windows не установлена или не запущена, в разработке используйте rustvpn-clientd.exe --console; установщик M5 регистрирует службу.",
+    "Windows 服务未安装或未启动时，开发模式需运行 rustvpn-clientd.exe --console -socket <非生产管道>，并用 RUSTVPN_CLIENTD_SOCKET 指向同一管道；M5 安装器负责注册服务。":
+      "Если служба Windows не установлена или не запущена, запустите rustvpn-clientd.exe --console -socket <dev-pipe> и укажите его в RUSTVPN_CLIENTD_SOCKET; установщик M5 регистрирует службу.",
     "Windows 使用当前用户的 Run 注册表项；登录时最小化到托盘，不会自动连接。":
       "Windows использует раздел Run текущего пользователя; при входе приложение сворачивается в трей и никогда не подключается автоматически.",
     "RustVPN 客户端 · GPL-3.0-or-later · Tauri 2 + WebView2":
@@ -432,12 +442,22 @@
       "Нет DLL или драйвера Wintun: убедитесь, что пакет содержит wintun.dll; в разработке проверьте абсолютный путь RUSTVPN_WINTUN_DLL.",
     "路由冲突：关闭其他 VPN 或默认路由程序，并移除与配置冲突的静态路由。":
       "Конфликт маршрутов: остановите другие VPN или программы, меняющие маршрут по умолчанию, и удалите конфликтующие статические маршруты.",
-    "服务未安装或未启动：M5 安装器会注册服务；开发时可运行 rustvpn-clientd.exe --console。":
-      "Служба не установлена или не запущена: установщик M5 регистрирует её; в разработке запускайте rustvpn-clientd.exe --console.",
+    "服务未安装或未启动：M5 安装器会注册服务；开发时用 --console -socket <非生产管道>。":
+      "Служба не установлена или не запущена: установщик M5 регистрирует её; в разработке используйте --console с непроизводственным -socket.",
+    "服务未安装或未启动：M5 安装器会注册服务；开发时用 --console 指定非生产管道。":
+      "Служба не установлена или не запущена: установщик M5 регистрирует её; в разработке используйте --console с непроизводственным каналом.",
     "管道权限被拒绝：把账户加入本地组 RustVPN（M5 安装器创建），或以守护进程用户身份运行。":
       "Доступ к каналу запрещён: добавьте учётную запись в локальную группу RustVPN (создаётся установщиком M5) или работайте от имени пользователя демона.",
     "kill-switch 与 MSS clamp 在 Windows 版不可用；界面只显示真实应用状态。":
       "kill-switch и MSS clamp недоступны в Windows; интерфейс показывает только фактически применённое состояние.",
+    "编辑": "Изменить",
+    "删除": "Удалить",
+    "服务器、verifier 与地址分配；口令不会落盘。":
+      "Сервер, verifier и распределение адресов; пароли не записываются на диск.",
+    "守护进程的连接、路由与重连记录。等级过滤只影响显示。":
+      "Записи подключений, маршрутов и переподключений демона. Фильтр уровня влияет только на отображение.",
+    "守护进程位置、安全边界与版本信息。":
+      "Расположение демона, граница безопасности и сведения о версии.",
   };
 
   const MESSAGES = { en: EN, ru: RU };

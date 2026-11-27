@@ -810,6 +810,25 @@ impl FileStateStore {
     }
 }
 
+/// Move an unreadable state file aside instead of bricking every connect.
+/// The unknown contents cannot be cleaned safely, so the operator keeps a
+/// backup for diagnosis while the client continues with an empty state.
+fn quarantine_state(path: &std::path::Path, reason: &str) {
+    let backup = path.with_file_name(format!("netstate.json.corrupt-{}", unix_now()));
+    match std::fs::rename(path, &backup) {
+        Ok(()) => eprintln!(
+            "warning: quarantined unreadable Windows network state {} ({reason}) as {}",
+            path.display(),
+            backup.display()
+        ),
+        Err(error) => eprintln!(
+            "warning: cannot quarantine unreadable Windows network state {} ({reason}): {error}; \
+             treating it as absent",
+            path.display()
+        ),
+    }
+}
+
 impl StateStore for FileStateStore {
     fn load(&self) -> Result<Option<PersistedState>> {
         let path = Self::state_path(&self.dir);
@@ -818,15 +837,22 @@ impl StateStore for FileStateStore {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error).with_context(|| format!("read {}", path.display())),
         };
-        let state: PersistedState = serde_json::from_str(&text)
-            .with_context(|| format!("parse state file {}", path.display()))?;
+        let state: PersistedState = match serde_json::from_str(&text) {
+            Ok(state) => state,
+            Err(error) => {
+                quarantine_state(&path, &format!("parse error: {error}"));
+                return Ok(None);
+            }
+        };
         if state.schema != STATE_SCHEMA {
-            bail!(
-                "state file {} has schema {} but this client understands {}; refusing to guess",
-                path.display(),
-                state.schema,
-                STATE_SCHEMA
+            quarantine_state(
+                &path,
+                &format!(
+                    "unsupported schema {} (this client understands {STATE_SCHEMA})",
+                    state.schema
+                ),
             );
+            return Ok(None);
         }
         Ok(Some(state))
     }
@@ -946,8 +972,15 @@ pub fn decide_route(
                 // Physical default routes are expected; they are not modified.
                 return Ok(RouteDecision::Add);
             }
-            if exact && owned_exact {
-                return Ok(RouteDecision::Idempotent);
+            if exact {
+                // A state-file loss can leave our own exact tunnel default
+                // behind.  Reuse it rather than bricking every reconnect; it
+                // is never deleted unless recorded as owned.
+                return Ok(if owned_exact {
+                    RouteDecision::Idempotent
+                } else {
+                    RouteDecision::Reuse
+                });
             }
             Err(conflict(planned, &on_tunnel))
         }
@@ -955,8 +988,12 @@ pub fn decide_route(
             if same_dest.is_empty() {
                 return Ok(RouteDecision::Add);
             }
-            if exact && owned_exact {
-                return Ok(RouteDecision::Idempotent);
+            if exact {
+                return Ok(if owned_exact {
+                    RouteDecision::Idempotent
+                } else {
+                    RouteDecision::Reuse
+                });
             }
             Err(conflict(planned, &same_dest))
         }
@@ -1432,8 +1469,7 @@ async fn install_steps(
                 ctx.store.save(state)?;
                 existing_routes.push(entry(&default_route));
             }
-            RouteDecision::Idempotent => {}
-            RouteDecision::Reuse => bail!("an unowned identical default route already exists"),
+            RouteDecision::Idempotent | RouteDecision::Reuse => {}
             RouteDecision::SkipConnected => unreachable!("default routes are never skipped"),
         }
     }
@@ -1762,8 +1798,8 @@ pub async fn cleanup_state_with(
                     )),
                     Err(error) => report.errors.push(format!("read DNS servers: {error:#}")),
                 },
-                Err(error) => report.actions.push(format!(
-                    "skip DNS restore on interface {}: {error:#}",
+                Err(error) => report.errors.push(format!(
+                    "read DNS servers on interface {}; keeping state for retry: {error:#}",
                     dns.ifindex
                 )),
             }
@@ -1889,8 +1925,8 @@ pub async fn cleanup_state_with(
                     )),
                     Err(error) => report.errors.push(format!("read addresses: {error:#}")),
                 },
-                Err(error) => report.actions.push(format!(
-                    "skip address removal on interface {}: {error:#}",
+                Err(error) => report.errors.push(format!(
+                    "read addresses on interface {}; keeping state for retry: {error:#}",
                     address.ifindex
                 )),
             }
@@ -2145,7 +2181,14 @@ mod tests {
             decide_route(&planned, &existing, &owned, None).unwrap(),
             RouteDecision::Idempotent
         );
-        let conflict = decide_route(&planned, &existing, &[], None).unwrap_err();
+        // An unowned exact route (for example after losing netstate.json) is
+        // reused rather than treated as a conflict.
+        assert_eq!(
+            decide_route(&planned, &existing, &[], None).unwrap(),
+            RouteDecision::Reuse
+        );
+        let different = vec![route("192.168.50.0/24", 7, "0.0.0.0", 51)];
+        let conflict = decide_route(&planned, &different, &[], None).unwrap_err();
         assert!(
             conflict.to_string().contains("refusing to overwrite"),
             "{conflict}"
@@ -2186,7 +2229,12 @@ mod tests {
             RouteDecision::Add
         );
         let on_tunnel = vec![route("0.0.0.0/0", 7, "10.88.0.1", 0)];
-        assert!(decide_route(&planned, &on_tunnel, &[], None).is_err());
+        assert_eq!(
+            decide_route(&planned, &on_tunnel, &[], None).unwrap(),
+            RouteDecision::Reuse
+        );
+        let different = vec![route("0.0.0.0/0", 7, "10.88.0.1", 99)];
+        assert!(decide_route(&planned, &different, &[], None).is_err());
     }
 
     #[test]
@@ -3634,6 +3682,17 @@ mod tests {
         let mut value: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         value["schema"] = Value::from(99);
         std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
-        assert!(store.load().is_err());
+        assert!(
+            store.load().unwrap().is_none(),
+            "unsupported schema is quarantined"
+        );
+        assert!(!path.exists(), "the unreadable state file is moved aside");
+        assert!(
+            std::fs::read_dir(store.path().parent().unwrap())
+                .unwrap()
+                .flatten()
+                .any(|entry| entry.file_name().to_string_lossy().contains(".corrupt-")),
+            "a diagnostic backup must be retained"
+        );
     }
 }

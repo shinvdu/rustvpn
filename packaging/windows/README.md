@@ -22,7 +22,7 @@ directly with `cargo build --release` plus `candle.exe`/`light.exe`.
 
 The Tauri bundler's WiX main template owns the Product/Feature/UpgradeCode
 layout and is designed around a single GUI executable. M5 additionally needs a
-LocalSystem service with delayed auto-start, failure recovery, stop-before-
+LocalSystem service with automatic start, failure recovery, stop-before-
 replace/start-after-install ordering, a local-group helper that runs before
 the service starts, and an explicit upgrade policy for pre-release versions.
 Extending Tauri's generated template with those tables is possible but couples
@@ -113,9 +113,9 @@ in `%LOCALAPPDATA%\RustVPN\profiles` and passphrases in Credential Manager.
 `ServiceInstall` registers `rustvpn-clientd`:
 
 - account `LocalSystem`, own process, `--service`;
-- automatic start, changed to delayed auto-start by `sc.exe config` during
-  installation (the Windows Installer `ServiceConfig*` tables are unreliable
-  and produced Error 1939 on Windows 10);
+- automatic start (not delayed, so the production pipe is owned before
+  interactive logon); the Windows Installer `ServiceConfig*` tables are
+  unreliable and produced Error 1939 on Windows 10;
 - failure recovery via `sc.exe failure`: restart after 5 s, 10 s and 30 s;
   reset after one day;
 - `ServiceControl Stop="both" Start="install" Remove="uninstall" Wait="yes"`:
@@ -127,8 +127,9 @@ before `StartServices`. It creates the local `RustVPN` group if needed and adds
 `[LogonUser]` (override with the public `RUSTVPN_USER` property). The daemon
 then auto-detects the group (M2) and restricts the pipe to SYSTEM,
 Administrators and that group. If membership cannot be applied, the helper
-rolls back a group it created so the daemon keeps the INTERACTIVE fallback;
-otherwise the account needs a re-login before its token carries the group.
+rolls back a group it created; service mode then fails closed until the group
+exists. Otherwise the account needs a re-login before its token carries the
+group.  There is no INTERACTIVE fallback.
 
 At startup the daemon also applies a process DACL that grants
 `PROCESS_QUERY_LIMITED_INFORMATION` (0x1000) to the same pipe audience. The M4
@@ -254,8 +255,8 @@ It performs an administrative install (`msiexec /a`) into a temporary folder,
 checks the payload and queries the MSI database directly for
 `ProductVersion`, `ALLUSERS`, the `ServiceInstall` row (name, auto start type,
 LocalSystem, `--service`) and the `ServiceControl` event bits. It also
-decompiles with WiX `dark.exe` and checks the `sc.exe` delayed-start and
-5/10/30-second failure-recovery custom actions.
+decompiles with WiX `dark.exe` and checks the `--cleanup` uninstall action and
+the 5/10/30-second failure-recovery custom actions.
 
 Manual end-to-end acceptance (service install, standard-user probe, uninstall)
 is documented in [`docs/windows-install.md`](../../docs/windows-install.md).
