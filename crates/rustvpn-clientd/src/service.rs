@@ -9,6 +9,7 @@
 
 use std::ffi::OsString;
 use std::process;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
@@ -46,10 +47,23 @@ fn service_main(_arguments: Vec<OsString>) {
 
     let shutdown = CancellationToken::new();
     let handler_shutdown = shutdown.clone();
+    let shared_status: Arc<Mutex<Option<service_control_handler::ServiceStatusHandle>>> =
+        Arc::new(Mutex::new(None));
+    let handler_status = shared_status.clone();
     let status = match service_control_handler::register(SERVICE_NAME, move |control| {
         match control {
             ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
             ServiceControl::Stop | ServiceControl::Shutdown => {
+                if let Ok(guard) = handler_status.lock() {
+                    if let Some(handle) = guard.as_ref() {
+                        let _ = handle.set_service_status(service_status(
+                            ServiceState::StopPending,
+                            ServiceControlAccept::empty(),
+                            ServiceExitCode::NO_ERROR,
+                            1,
+                        ));
+                    }
+                }
                 // Cancelling is the only action needed: `run` performs the
                 // engine shutdown, listener close and clean marker handling,
                 // exactly like the console SIGTERM path.
@@ -65,6 +79,10 @@ fn service_main(_arguments: Vec<OsString>) {
             process::exit(1);
         }
     };
+
+    if let Ok(mut guard) = shared_status.lock() {
+        *guard = Some(status);
+    }
 
     if let Err(error) = status.set_service_status(service_status(
         ServiceState::StartPending,

@@ -60,10 +60,9 @@
 
 | 问题 | 症状 | 下一步 |
 |---|---|---|
-| WIN-012 | 已连接状态下 `last_handshake_unix` 仍为 null | 追踪守护进程 Status 路径与流量采样器发布逻辑；增加实时时间戳测试 |
 | WIN-013 | 反向 iperf3 约 150 Mbit/s，出现 193 次重传 | 抓包、与 MSS clamp 对比、检查 Wintun RX/队列计数器 |
 | WIN-014 | 崩溃清理需约 10-15 秒才允许重连 | 替换或批量执行重度依赖 PowerShell 的启动清理；发布清理进度 |
-| WIN-027（剩余） | 服务被显式停止后，普通用户仍可抢占 global pipe | 增加服务 bind 有界重试/端点不可预测化 |
+| WIN-027（剩余） | 服务被显式停止后，普通用户仍可抢占 global pipe | 已加 60×2s bind 重试；后续可再做端点不可预测化 |
 | WIN-043（剩余） | CI 下载 WiX 未 pin SHA-256 | 取得官方 zip 固定摘要后增加校验 |
 | WIN-045 | Windows 安全/并发 E2E 缺口 | 在自托管 runner 增加跨用户、假 pipe、既有 adapter、并发 shutdown 回归 |
 
@@ -109,14 +108,13 @@
 
 ## 9. 后续行动
 
-1. 追踪实时状态路径并修复 WIN-012（`last_handshake_unix`），附带回归测试。
-2. 抓取反向 iperf3 流量，评估 MSS/路径影响以处理 WIN-013。
-3. 批量化或替换重度依赖 PowerShell 的启动清理，以缩短 WIN-014 的窗口。
-4. 在一次性物理硬件上验证睡眠/恢复（WIN-016）。
-5. 为自托管 Windows E2E 注册受保护 runner，并让 workflow 进入默认分支（WIN-018 剩余项）。
-6. 获取 EV/OV 证书，签名 GUI/守护进程/MSI，启用发布时间戳并固定 publisher/certificate（WIN-019 剩余项）。
-7. 完成 WIN-043 的 WiX 摘要固定，并在一次性 Windows 环境执行 WIN-045 的安全/并发 E2E。
-8. 仅在具备足够容量的外层路径可用后，再重新评估 encless/TCP（WIN-015）。
+1. 抓取反向 iperf3 流量，评估 MSS/路径影响以处理 WIN-013。
+2. 批量化或替换重度依赖 PowerShell 的启动清理，以缩短 WIN-014 的窗口。
+3. 在一次性物理硬件上验证睡眠/恢复（WIN-016）。
+4. 为自托管 Windows E2E 注册受保护 runner，并让 workflow 进入默认分支（WIN-018 剩余项）。
+5. 获取 EV/OV 证书，签名 GUI/守护进程/MSI，启用发布时间戳并固定 publisher/certificate（WIN-019 剩余项）。
+6. 完成 WIN-043 的 WiX 摘要固定，并在一次性 Windows 环境执行 WIN-045 的安全/并发 E2E。
+7. 仅在具备足够容量的外层路径可用后，再重新评估 encless/TCP（WIN-015）。
 
 ## 10. 更新节奏
 

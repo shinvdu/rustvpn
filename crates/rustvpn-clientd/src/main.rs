@@ -604,13 +604,38 @@ async fn run(mut config: RunConfig, shutdown: CancellationToken) -> Result<()> {
     );
     spawn_collector(events_tx.clone(), status.clone(), logs.clone());
 
-    let listener = transport::Listener::bind(
-        socket_path,
-        &transport::ListenOptions {
-            group: config.pipe_group.clone(),
-        },
-    )
-    .with_context(|| format!("bind {}", socket_path.display()))?;
+    // In service mode retry a squatted endpoint instead of exiting on the
+    // first first-instance collision.  A bounded retry keeps a transient
+    // squatter/SCM race from taking the service down permanently; console
+    // mode keeps its immediate error.
+    let mut bind_attempt = 0u32;
+    let listener = loop {
+        if shutdown.is_cancelled() {
+            return Ok(());
+        }
+        match transport::Listener::bind(
+            socket_path,
+            &transport::ListenOptions {
+                group: config.pipe_group.clone(),
+            },
+        ) {
+            Ok(listener) => break listener,
+            Err(error) if config.service_mode && bind_attempt < 60 => {
+                bind_attempt += 1;
+                dlog!(
+                    "bind {} failed: {error}; retrying in 2s ({bind_attempt}/60)",
+                    socket_path.display()
+                );
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_secs(2)) => {}
+                    _ = shutdown.cancelled() => return Ok(()),
+                }
+            }
+            Err(error) => {
+                return Err(error).with_context(|| format!("bind {}", socket_path.display()));
+            }
+        }
+    };
 
     #[cfg(unix)]
     {

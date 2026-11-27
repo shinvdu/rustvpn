@@ -945,6 +945,7 @@ async fn run_connection(
                 attempt = 0;
                 connected_status.state = "connected".into();
                 connected_status.since_unix = Some(unix_now());
+                connected_status.last_handshake_unix = Some(unix_now());
                 let _ = events.send(Event::State(connected_status.clone()));
                 emit_log(&events, "info", "session established");
 
@@ -1322,6 +1323,11 @@ async fn session_loop(
                 status.rates_available = true;
                 status.rate_window_sec = Some(1);
                 status.traffic = traffic.clone();
+                // The daemon's status collector updates only `traffic` from
+                // Event::Traffic.  Publish the full state as well so
+                // endpoint/heartbeat/last_handshake fields do not stay at
+                // their initial null values for the whole connection.
+                let _ = events.send(Event::State(status.clone()));
                 let _ = events.send(Event::Traffic(traffic));
             }
         }

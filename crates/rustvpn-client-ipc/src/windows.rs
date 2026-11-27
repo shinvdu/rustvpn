@@ -676,6 +676,14 @@ mod tests {
     }
 
     #[test]
+    fn process_user_sid_string_matches_the_current_process() {
+        let current = current_user_sid_string().expect("current user SID");
+        let own = process_user_sid_string(std::process::id()).expect("own process SID");
+        assert_eq!(own, current);
+        assert!(own.starts_with("S-1-"));
+    }
+
+    #[test]
     fn looked_up_sid_bytes_match_the_sid_header_length() {
         // LookupAccountNameW does not reliably update cbSid on success
         // (Windows 10 leaves the input capacity), so group_sid_bytes must derive
