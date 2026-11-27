@@ -304,10 +304,18 @@ pub fn script_for(command: &WinCommand) -> String {
              Select-Object Name,DisplayName | ConvertTo-Json -Compress",
             ps_quote(display)
         ),
-        WinCommand::RemoveNrpt { name } => format!(
-            "Remove-DnsClientNrptRule -Name {} -Force -ErrorAction Stop",
-            ps_quote(name)
-        ),
+        WinCommand::RemoveNrpt { name } => {
+            // Idempotent: PowerShell exits 1 for an already-absent rule even
+            // under -ErrorAction SilentlyContinue, and the runner treats any
+            // non-zero exit as fatal.  Guard the removal, keep a strict Remove
+            // on the present path (so a real removal failure still surfaces),
+            // and force a success exit when there was nothing to remove.
+            let quoted = ps_quote(name);
+            format!(
+                "if (Get-DnsClientNrptRule -Name {quoted} -ErrorAction SilentlyContinue) {{ \
+                 Remove-DnsClientNrptRule -Name {quoted} -Force -ErrorAction Stop }}; exit 0"
+            )
+        }
         WinCommand::AddIpv6Block { name } => format!(
             "New-NetFirewallRule -Name {} -DisplayName 'RustVPN IPv6 leak block' \
              -Description 'Blocks global/ULA IPv6 egress while the RustVPN full tunnel is up' \
@@ -316,10 +324,20 @@ pub fn script_for(command: &WinCommand) -> String {
             ps_quote(name),
             ps_array(&["2000::/3", "fc00::/7"])
         ),
-        WinCommand::RemoveFirewallRule { name } => format!(
-            "Remove-NetFirewallRule -Name {} -ErrorAction SilentlyContinue",
-            ps_quote(name)
-        ),
+        WinCommand::RemoveFirewallRule { name } => {
+            // Idempotent stale-clear: Remove-NetFirewallRule exits 1 when the
+            // rule is already absent (even with -ErrorAction SilentlyContinue),
+            // which the runner treats as fatal.  This broke the full-tunnel
+            // stale clear on a clean machine.  Guard the removal so an absent
+            // rule exits 0, while a strict Remove still fails on a real error.
+            // Install-time stale clears, normal teardown and deferred/crash
+            // cleanup all share this command.
+            let quoted = ps_quote(name);
+            format!(
+                "if (Get-NetFirewallRule -Name {quoted} -ErrorAction SilentlyContinue) {{ \
+                 Remove-NetFirewallRule -Name {quoted} -ErrorAction Stop }}; exit 0"
+            )
+        }
     }
 }
 
@@ -2222,6 +2240,52 @@ mod tests {
     }
 
     #[test]
+    fn firewall_removal_is_idempotent_so_an_absent_rule_is_not_fatal() {
+        // Regression: Remove-NetFirewallRule exits 1 when the rule is already
+        // absent even under -ErrorAction SilentlyContinue, and the runner
+        // treats non-zero as fatal.  This broke the full-tunnel stale-clear on
+        // a clean machine.  The generated script must guard the removal and
+        // force a success exit, without a removal pipeline or -PolicyStore.
+        let script = script_for(&WinCommand::RemoveFirewallRule {
+            name: IPV6_BLOCK_RULE.to_string(),
+        });
+        assert!(
+            script.contains(
+                "Get-NetFirewallRule -Name 'RustVPN-IPv6-LeakBlock' \
+                 -ErrorAction SilentlyContinue"
+            ),
+            "{script}"
+        );
+        assert!(
+            script.contains(
+                "Remove-NetFirewallRule -Name 'RustVPN-IPv6-LeakBlock' -ErrorAction Stop"
+            ),
+            "{script}"
+        );
+        assert!(script.trim_end().ends_with("exit 0"), "{script}");
+        assert!(!script.contains('|'), "{script}");
+        assert!(!script.contains("-PolicyStore"), "{script}");
+    }
+
+    #[test]
+    fn nrpt_removal_is_idempotent_so_an_absent_rule_is_not_fatal() {
+        let script = script_for(&WinCommand::RemoveNrpt {
+            name: "rule-0".into(),
+        });
+        assert!(
+            script.contains("Get-DnsClientNrptRule -Name 'rule-0' -ErrorAction SilentlyContinue"),
+            "{script}"
+        );
+        assert!(
+            script.contains("Remove-DnsClientNrptRule -Name 'rule-0' -Force -ErrorAction Stop"),
+            "{script}"
+        );
+        assert!(script.trim_end().ends_with("exit 0"), "{script}");
+        assert!(!script.contains('|'), "{script}");
+        assert!(!script.contains("-PolicyStore"), "{script}");
+    }
+
+    #[test]
     fn scripts_quote_every_interpolated_value() {
         let script = script_for(&WinCommand::AddRoute(RouteSpec::new(
             "0.0.0.0/0",
@@ -2551,7 +2615,22 @@ mod tests {
                             .collect::<Vec<_>>(),
                     )),
                     WinCommand::RemoveNrpt { name } => {
-                        self.nrpt.lock().unwrap().retain(|(rule, _)| rule != name);
+                        // Emulate PowerShell: removing an already-absent rule
+                        // exits 1 unless the generated script guards it and
+                        // forces a success exit.  This keeps the idempotency
+                        // fix covered by a regression test.
+                        let present = {
+                            let mut nrpt = self.nrpt.lock().unwrap();
+                            let before = nrpt.len();
+                            nrpt.retain(|(rule, _)| rule != name);
+                            nrpt.len() != before
+                        };
+                        if !present && !script_for(command).contains("exit 0") {
+                            bail!(
+                                "PowerShell command failed (exit code: 1): \
+                                 remove absent NRPT rule"
+                            );
+                        }
                         Ok(String::new())
                     }
                     WinCommand::AddIpv6Block { name } => {
@@ -2562,7 +2641,15 @@ mod tests {
                         Ok(String::new())
                     }
                     WinCommand::RemoveFirewallRule { name } => {
-                        self.firewall.lock().unwrap().remove(name);
+                        // PowerShell's Remove-NetFirewallRule exits 1 for an
+                        // absent rule; only the guarded script exits 0.
+                        let present = self.firewall.lock().unwrap().remove(name);
+                        if !present && !script_for(command).contains("exit 0") {
+                            bail!(
+                                "PowerShell command failed (exit code: 1): \
+                                 remove absent firewall rule"
+                            );
+                        }
                         Ok(String::new())
                     }
                 }
