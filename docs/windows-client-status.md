@@ -2,8 +2,8 @@
 
 > **最后更新：** 2026-11-27
 > **分支：** `feature/client-ui`
-> **HEAD：** `96fbf93 docs(windows): simplify status and index issues locally`
-> **同步状态：** 领先 `origin/feature/client-ui` 4 个提交；尚未推送
+> **HEAD：** 以 `git log -1` 为准
+> **同步状态：** 以 `git status` 为准；当前未推送
 > **工作区：** 仅有文档改动，无代码改动
 > **问题索引：** `docs/windows-client-dev/windows-client-issues.xlsx`（仅本地）
 > **问题详情：** `docs/windows-client-dev/issues/WIN-<NNN>-<slug>.md`（仅本地）
