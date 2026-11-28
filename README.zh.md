@@ -1,8 +1,8 @@
-# RustVPN — 与 GoVPN 5.7 线兼容的 Rust 重写
+# RustVPN —— 自托管 VPN
 
 [English](README.md) | **中文** | [Русский](README.ru.md)
 
-RustVPN 是从零开始用 Rust 实现的 GoVPN 5.7 协议。它不是一套新的 VPN 设计：它使用完全相同的线格式（wire format），因此其 `rustvpn-server`、`rustvpn-client` 和 `rustvpn-verifier` 可执行文件可以替换现有部署中任意一侧的 Go 程序。
+RustVPN 是与 GoVPN 5.7 兼容的自托管 VPN，从零用 Rust 实现。它不是一套新的 VPN 设计：它使用完全相同的线格式（wire format），因此其 `rustvpn-server`、`rustvpn-client` 和 `rustvpn-verifier` 可执行文件可以替换现有部署中任意一侧的 Go 程序。
 
 本仓库包含独立的 RustVPN 实现。上游 Go 代码树不包含在本仓库中、也不会被修改，仅用作差分测试的对照基准（oracle）。
 

@@ -2,9 +2,9 @@
 
 **English** | [中文](../zh/index.md) | [Русский](../ru/index.md)
 
-RustVPN is a wire-compatible reimplementation of GoVPN 5.7 in Rust. This
-manual describes how to build, configure, deploy and understand it. It is
-adapted from the original GoVPN manual, with every command, flag and
+RustVPN is a self-hosted VPN compatible with GoVPN 5.7, implemented in Rust.
+This manual describes how to build, configure, deploy and understand it. It
+is adapted from the original GoVPN manual, with every command, flag and
 default checked against the Rust code.
 
 ## What it is

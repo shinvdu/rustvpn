@@ -1,11 +1,11 @@
-# RustVPN — a wire-compatible GoVPN 5.7 rewrite in Rust
+# RustVPN — a self-hosted VPN
 
 **English** | [中文](README.zh.md) | [Русский](README.ru.md)
 
-RustVPN is a from-scratch Rust implementation of the GoVPN 5.7 protocol.
-It is not a new VPN design: it speaks the exact same wire format, so its
-`rustvpn-server`, `rustvpn-client` and `rustvpn-verifier` binaries can replace
-the Go ones on either side of an existing deployment.
+RustVPN is a self-hosted VPN compatible with GoVPN 5.7, implemented from
+scratch in Rust. It is not a new VPN design: it speaks the exact same wire
+format, so its `rustvpn-server`, `rustvpn-client` and `rustvpn-verifier`
+binaries can replace the Go ones on either side of an existing deployment.
 
 This repository contains the standalone RustVPN implementation. The
 upstream GoVPN tree is not included or modified; it is used only as a
