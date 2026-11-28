@@ -602,6 +602,116 @@ pub fn parse_found_route(text: &str) -> Result<FoundRoute> {
 }
 
 // ---------------------------------------------------------------------------
+// IP Helper fast-path helpers
+// ---------------------------------------------------------------------------
+//
+// `iphlpapi.dll` returns binary rows; the Windows executor converts them into
+// the same neutral entries as the PowerShell parser and serialises them with
+// these helpers, so the crash-recovery/cleanup logic in this module is shared
+// by both backends and keeps its exact-match safety rules.
+
+/// Render a route destination in the canonical `a.b.c.d/prefix` form used by
+/// both PowerShell (`DestinationPrefix`) and the state file.
+pub fn format_route_dest(address: Ipv4Addr, prefix_len: u8) -> String {
+    format!("{address}/{prefix_len}")
+}
+
+/// Parse a recorded route destination into its network address and prefix
+/// length.  Rejecting malformed strings keeps `RemoveRoute` from ever passing
+/// an unverified destination to an OS delete call.
+pub fn parse_route_dest(dest: &str) -> Result<(Ipv4Addr, u8)> {
+    let net: IpNet = dest
+        .parse()
+        .with_context(|| format!("invalid route destination {dest:?}"))?;
+    let IpNet::V4(v4) = net else {
+        bail!("route destination {dest:?} is not IPv4");
+    };
+    Ok((v4.trunc().addr(), v4.prefix_len()))
+}
+
+/// Exact recorded-route identity: destination/prefix, interface index, next
+/// hop and metric must all match.  This is the guard shared by the PowerShell
+/// cleanup path and the IP Helper fast path; the physical default route can
+/// never match because its interface index, next hop and metric differ.
+pub fn route_matches(
+    dest: &str,
+    ifindex: u32,
+    next_hop: Ipv4Addr,
+    metric: u32,
+    entry: &RouteEntry,
+) -> Result<bool> {
+    let (address, prefix_len) = parse_route_dest(dest)?;
+    let (entry_address, entry_prefix_len) = parse_route_dest(&entry.dest)?;
+    Ok(entry_address == address
+        && entry_prefix_len == prefix_len
+        && entry.ifindex == ifindex
+        && entry.next_hop == next_hop
+        && entry.metric == metric)
+}
+
+/// Serialise routes in the PowerShell `Get-NetRoute | ConvertTo-Json` shape so
+/// `parse_routes` accepts either backend's output.
+pub fn render_routes_json(routes: &[RouteEntry]) -> String {
+    let rows: Vec<Value> = routes
+        .iter()
+        .map(|route| {
+            serde_json::json!({
+                "DestinationPrefix": route.dest,
+                "InterfaceIndex": route.ifindex,
+                "NextHop": route.next_hop.to_string(),
+                "RouteMetric": route.metric,
+            })
+        })
+        .collect();
+    Value::Array(rows).to_string()
+}
+
+/// Serialise unicast addresses in the `Get-NetIPAddress` JSON shape.
+pub fn render_addresses_json(addresses: &[AddressEntry]) -> String {
+    let rows: Vec<Value> = addresses
+        .iter()
+        .map(|address| {
+            serde_json::json!({
+                "IPAddress": address.address.to_string(),
+                "PrefixLength": address.prefix_len,
+            })
+        })
+        .collect();
+    Value::Array(rows).to_string()
+}
+
+/// Serialise interfaces in the `Get-NetIPInterface` JSON shape.
+pub fn render_interfaces_json(interfaces: &[InterfaceEntry]) -> String {
+    let rows: Vec<Value> = interfaces
+        .iter()
+        .map(|iface| {
+            serde_json::json!({
+                "InterfaceIndex": iface.ifindex,
+                "InterfaceMetric": iface.metric,
+                "AutomaticMetric": iface.automatic,
+                "ConnectionState": if iface.connected { "Connected" } else { "Disconnected" },
+                "NlMtu": iface.mtu,
+            })
+        })
+        .collect();
+    Value::Array(rows).to_string()
+}
+
+/// Serialise adapters in the `Get-NetAdapter` JSON shape.
+pub fn render_adapters_json(adapters: &[AdapterNameEntry]) -> String {
+    let rows: Vec<Value> = adapters
+        .iter()
+        .map(|adapter| {
+            serde_json::json!({
+                "ifIndex": adapter.ifindex,
+                "Name": adapter.name,
+            })
+        })
+        .collect();
+    Value::Array(rows).to_string()
+}
+
+// ---------------------------------------------------------------------------
 // Profile parsing helpers
 // ---------------------------------------------------------------------------
 
@@ -2204,6 +2314,60 @@ mod tests {
         .unwrap();
         assert_eq!(found.ifindex, 12);
         assert_eq!(found.next_hop, Ipv4Addr::new(192, 168, 1, 1));
+    }
+
+    #[test]
+    fn iphelper_mapping_round_trips_and_matches_exact_identity() {
+        // Destination parsing/formatting is the shared guard for the IP Helper
+        // delete path: prefixes are normalised to the network address.
+        let (address, prefix_len) = parse_route_dest("192.168.50.7/24").unwrap();
+        assert_eq!(address, Ipv4Addr::new(192, 168, 50, 0));
+        assert_eq!(prefix_len, 24);
+        assert_eq!(format_route_dest(address, prefix_len), "192.168.50.0/24");
+        assert!(parse_route_dest("not-a-route").is_err());
+        assert!(parse_route_dest("2001:db8::/32").is_err());
+        assert!(parse_route_dest("192.168.50.0/33").is_err());
+
+        // The tunnel default is never mistaken for the physical default: all
+        // four identity fields must match.
+        let default = route("0.0.0.0/0", 7, "0.0.0.0", 0);
+        assert_eq!(
+            parse_routes(&render_routes_json(std::slice::from_ref(&default))).unwrap(),
+            vec![default.clone()]
+        );
+        assert!(route_matches("0.0.0.0/0", 7, Ipv4Addr::UNSPECIFIED, 0, &default).unwrap());
+        assert!(
+            !route_matches("0.0.0.0/0", 12, Ipv4Addr::new(192, 168, 1, 1), 25, &default).unwrap()
+        );
+        assert!(!route_matches("0.0.0.0/0", 7, Ipv4Addr::UNSPECIFIED, 1, &default).unwrap());
+        assert!(
+            !route_matches("0.0.0.0/0", 7, Ipv4Addr::new(192, 168, 1, 1), 0, &default).unwrap()
+        );
+        assert!(!route_matches("10.88.0.0/24", 7, Ipv4Addr::UNSPECIFIED, 0, &default).unwrap());
+
+        let addresses = vec![AddressEntry {
+            address: Ipv4Addr::new(10, 88, 0, 2),
+            prefix_len: 24,
+        }];
+        assert_eq!(
+            parse_addresses(&render_addresses_json(&addresses)).unwrap(),
+            addresses
+        );
+
+        let interfaces = vec![iface(7, 1)];
+        assert_eq!(
+            parse_interfaces(&render_interfaces_json(&interfaces)).unwrap(),
+            interfaces
+        );
+
+        let adapters = vec![AdapterNameEntry {
+            ifindex: 7,
+            name: "RustVPN".into(),
+        }];
+        assert_eq!(
+            parse_adapters(&render_adapters_json(&adapters)).unwrap(),
+            adapters
+        );
     }
 
     #[test]

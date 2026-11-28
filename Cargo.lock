@@ -3846,7 +3846,7 @@ checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
 
 [[package]]
 name = "rustvpn-admin"
-version = "0.2.0-beta.2"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "argon2",
@@ -3877,7 +3877,7 @@ dependencies = [
 
 [[package]]
 name = "rustvpn-client"
-version = "0.2.0-beta.2"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -3897,7 +3897,7 @@ dependencies = [
 
 [[package]]
 name = "rustvpn-client-core"
-version = "0.2.0-beta.2"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -3920,7 +3920,7 @@ dependencies = [
 
 [[package]]
 name = "rustvpn-client-gui"
-version = "0.2.0-beta.2"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "keyring",
@@ -3939,7 +3939,7 @@ dependencies = [
 
 [[package]]
 name = "rustvpn-client-ipc"
-version = "0.2.0-beta.2"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "ipnet",
@@ -3953,7 +3953,7 @@ dependencies = [
 
 [[package]]
 name = "rustvpn-clientd"
-version = "0.2.0-beta.2"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "libc",
@@ -3968,7 +3968,7 @@ dependencies = [
 
 [[package]]
 name = "rustvpn-control"
-version = "0.2.0-beta.2"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "hex",
@@ -3980,7 +3980,7 @@ dependencies = [
 
 [[package]]
 name = "rustvpn-crypto"
-version = "0.2.0-beta.2"
+version = "0.2.0"
 dependencies = [
  "argon2",
  "base64 0.22.1",
@@ -4002,7 +4002,7 @@ dependencies = [
 
 [[package]]
 name = "rustvpn-net"
-version = "0.2.0-beta.2"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -4031,7 +4031,7 @@ dependencies = [
 
 [[package]]
 name = "rustvpn-proto"
-version = "0.2.0-beta.2"
+version = "0.2.0"
 dependencies = [
  "curve25519-dalek",
  "ed25519-dalek",
@@ -4050,7 +4050,7 @@ dependencies = [
 
 [[package]]
 name = "rustvpn-server"
-version = "0.2.0-beta.2"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "hex",
@@ -4067,7 +4067,7 @@ dependencies = [
 
 [[package]]
 name = "rustvpn-verifier"
-version = "0.2.0-beta.2"
+version = "0.2.0"
 dependencies = [
  "getrandom 0.2.17",
  "rand_core",

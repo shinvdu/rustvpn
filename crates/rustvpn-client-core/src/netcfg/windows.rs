@@ -38,6 +38,7 @@ use windows_sys::Win32::System::Threading::{
     GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
 };
 
+use super::iphelper;
 use super::winplan::{
     self, CleanupReport, InstallContext, OwnerProbe, OwnerToken, PersistedState, StateStore,
     WinCommand, WinRunner,
@@ -49,6 +50,16 @@ const STATE_DIR_ENV: &str = "RUSTVPN_STATE_DIR";
 /// Restrict the state directory/file to SYSTEM and Administrators only.
 const STATE_SDDL: &str = "D:P(A;;FA;;;SY)(A;;FA;;;BA)";
 const POWERSHELL_TIMEOUT: Duration = Duration::from_secs(30);
+/// Force UTF-8 on the redirected stdout pipe.
+///
+/// Windows PowerShell 5.1 otherwise writes in the OEM code page (for example
+/// GBK on a Chinese system).  `String::from_utf8_lossy` then replaces every
+/// non-ASCII adapter alias with U+FFFD, which breaks alias-based
+/// interface-index reuse checks and made the IP Helper backend (which returns
+/// correct UTF-8) disagree with install-time records.  Verified to work under
+/// `CREATE_NO_WINDOW`; the guard keeps an exotic host from failing the command.
+const POWERSHELL_UTF8_PREFIX: &str =
+    "try { [Console]::OutputEncoding=[Text.Encoding]::UTF8 } catch {}; ";
 
 /// Absolute PowerShell executable.
 pub struct PowerShellRunner {
@@ -85,7 +96,7 @@ impl PowerShellRunner {
 impl WinRunner for PowerShellRunner {
     fn run<'a>(&'a self, command: &'a WinCommand) -> winplan::RunnerFuture<'a, Result<String>> {
         Box::pin(async move {
-            let script = winplan::script_for(command);
+            let script = format!("{POWERSHELL_UTF8_PREFIX}{}", winplan::script_for(command));
             let mut process = Command::new(&self.exe);
             process
                 .args([
@@ -119,6 +130,126 @@ impl WinRunner for PowerShellRunner {
                 bail!("PowerShell command failed ({}): {detail}", output.status);
             }
             Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+        })
+    }
+}
+
+/// Cleanup fast path: IP Helper for the hot route/address/interface-metric
+/// commands, PowerShell for DNS/NRPT/firewall and as a fallback when an API
+/// read or set fails.
+///
+/// Additive install commands (`New-Net*`, `Set-Dns*`) are still driven by a
+/// plain [`PowerShellRunner`] so install semantics stay byte-for-byte the same;
+/// only teardown, crash recovery and stale-state cleanup run through here.
+pub(crate) struct HybridRunner {
+    powershell: PowerShellRunner,
+}
+
+impl HybridRunner {
+    pub fn new() -> Result<Self> {
+        Ok(Self {
+            powershell: PowerShellRunner::new()?,
+        })
+    }
+
+    /// Reuse the PowerShell runner that performed the install, so the teardown
+    /// uses the same validated absolute `powershell.exe` path.
+    pub fn from_powershell(powershell: PowerShellRunner) -> Self {
+        Self { powershell }
+    }
+}
+
+impl WinRunner for HybridRunner {
+    fn run<'a>(&'a self, command: &'a WinCommand) -> winplan::RunnerFuture<'a, Result<String>> {
+        Box::pin(async move {
+            // Read commands fall back to PowerShell on API failure: the
+            // planner then applies the same safety rules to the same data.
+            match command {
+                WinCommand::ListIpv4Routes => match iphelper::list_routes_json() {
+                    Ok(text) => Ok(text),
+                    Err(error) => {
+                        eprintln!(
+                            "net: IP Helper route read failed; falling back to PowerShell: {error:#}"
+                        );
+                        self.powershell.run(command).await
+                    }
+                },
+                WinCommand::ListIpv4Interfaces => match iphelper::list_interfaces_json() {
+                    Ok(text) => Ok(text),
+                    Err(error) => {
+                        eprintln!(
+                            "net: IP Helper interface read failed; falling back to PowerShell: \
+                             {error:#}"
+                        );
+                        self.powershell.run(command).await
+                    }
+                },
+                WinCommand::ListAdapters => match iphelper::list_adapters_json() {
+                    Ok(text) => Ok(text),
+                    Err(error) => {
+                        eprintln!(
+                            "net: IP Helper adapter read failed; falling back to PowerShell: \
+                             {error:#}"
+                        );
+                        self.powershell.run(command).await
+                    }
+                },
+                WinCommand::GetIpv4Addresses(ifindex) => {
+                    match iphelper::list_addresses_json(*ifindex) {
+                        Ok(text) => Ok(text),
+                        Err(error) => {
+                            eprintln!(
+                                "net: IP Helper address read failed; falling back to PowerShell: \
+                                 {error:#}"
+                            );
+                            self.powershell.run(command).await
+                        }
+                    }
+                }
+                // Deletions do not fall back: the IP Helper call either
+                // verified-and-deleted the exact recorded identity or reported
+                // an error that keeps the state file for the next retry.
+                // Falling back could delete a route the failed call race
+                // removed, or mask a real failure.
+                WinCommand::RemoveRoute {
+                    dest,
+                    ifindex,
+                    next_hop,
+                    metric,
+                } => {
+                    iphelper::remove_route(dest, *ifindex, *next_hop, *metric)?;
+                    Ok(String::new())
+                }
+                WinCommand::RemoveIpAddress { ifindex, address } => {
+                    iphelper::remove_address(*ifindex, *address)?;
+                    Ok(String::new())
+                }
+                WinCommand::SetInterfaceMetric { ifindex, metric } => {
+                    match iphelper::set_interface_metric(*ifindex, *metric) {
+                        Ok(()) => Ok(String::new()),
+                        Err(error) => {
+                            eprintln!(
+                                "net: IP Helper interface-metric write failed; falling back to \
+                                 PowerShell: {error:#}"
+                            );
+                            self.powershell.run(command).await
+                        }
+                    }
+                }
+                WinCommand::SetAutomaticMetric(ifindex) => {
+                    match iphelper::set_automatic_metric(*ifindex) {
+                        Ok(()) => Ok(String::new()),
+                        Err(error) => {
+                            eprintln!(
+                                "net: IP Helper automatic-metric write failed; falling back to \
+                                 PowerShell: {error:#}"
+                            );
+                            self.powershell.run(command).await
+                        }
+                    }
+                }
+                _ => self.powershell.run(command).await,
+            }
         })
     }
 }
@@ -421,7 +552,9 @@ impl ConnectionCleanup {
 }
 
 pub struct NetworkGuard {
-    runner: PowerShellRunner,
+    /// Cleanup runner only; the install path below uses the plain
+    /// [`PowerShellRunner`] it was constructed from.
+    runner: HybridRunner,
     state: Option<PersistedState>,
 }
 
@@ -440,12 +573,14 @@ impl NetworkGuard {
         inner_mtu: usize,
         options: NetOptions,
     ) -> std::result::Result<Self, InstallFailure> {
-        let runner = PowerShellRunner::new().map_err(InstallFailure::before)?;
+        let powershell = PowerShellRunner::new().map_err(InstallFailure::before)?;
         let store = SecureStateStore::new().map_err(InstallFailure::before)?;
         let probe = WinOwnerProbe;
+        // Install keeps the pure PowerShell backend: only teardown/stale
+        // cleanup use the IP Helper fast path.
         match winplan::install_with_partial(
             InstallContext {
-                runner: &runner,
+                runner: &powershell,
                 store: &store,
                 probe: &probe,
                 owner: WinOwnerProbe::current(),
@@ -458,10 +593,11 @@ impl NetworkGuard {
         .await
         {
             Ok(state) => Ok(Self {
-                runner,
+                runner: HybridRunner::from_powershell(powershell),
                 state: Some(state),
             }),
             Err(partial) => {
+                let runner = HybridRunner::from_powershell(powershell);
                 let guard = partial.state.map(|state| {
                     Box::new(Self {
                         runner,
@@ -517,7 +653,7 @@ impl NetworkGuard {
 /// state owned by a live process is left alone, and only entries recorded in
 /// the state file are removed (each is verified before deletion).
 pub async fn cleanup_stale_network() -> Result<CleanupReport> {
-    let runner = PowerShellRunner::new()?;
+    let runner = HybridRunner::new()?;
     let store = SecureStateStore::new()?;
     let probe = WinOwnerProbe;
     winplan::cleanup_stale_with(&runner, &store, &probe).await
@@ -528,7 +664,7 @@ pub async fn cleanup_stale_network() -> Result<CleanupReport> {
 /// Unlike [`cleanup_stale_network`], this never touches state recorded by a
 /// different live owner.
 pub async fn cleanup_owned_network() -> Result<CleanupReport> {
-    let runner = PowerShellRunner::new()?;
+    let runner = HybridRunner::new()?;
     let store = SecureStateStore::new()?;
     winplan::cleanup_owned_with(&runner, &store, &WinOwnerProbe::current()).await
 }
@@ -577,6 +713,26 @@ mod tests {
         assert!(STATE_SDDL.contains(";;;BA"));
         assert!(!STATE_SDDL.contains(";;;WD"));
         assert!(!STATE_SDDL.contains(";;;BU"));
+    }
+
+    #[tokio::test]
+    async fn power_shell_runner_returns_utf8_adapter_aliases() {
+        // On a non-English system the OEM code page would corrupt aliases; the
+        // UTF-8 prefix must prevent U+FFFD replacement here.  This keeps
+        // install-time records and the IP Helper alias check comparable.
+        let runner = PowerShellRunner::new().expect("PowerShell on Windows");
+        let text = runner
+            .run(&WinCommand::ListAdapters)
+            .await
+            .expect("list adapters through PowerShell");
+        let adapters = winplan::parse_adapters(&text).expect("parse adapter JSON");
+        assert!(!adapters.is_empty());
+        assert!(
+            adapters
+                .iter()
+                .all(|adapter| !adapter.name.contains('\u{FFFD}')),
+            "adapter aliases were lossy-decoded: {adapters:?}"
+        );
     }
 
     #[test]

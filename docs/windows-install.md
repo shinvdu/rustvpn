@@ -62,14 +62,14 @@ standalone MSI does not silently download anything during installation.
 Interactive (recommended first install):
 
 ```powershell
-msiexec /i .\RustVPN-0.2.0-beta.2-x64.msi
+msiexec /i .\RustVPN-0.2.0-x64.msi
 ```
 
 Silent, adding the deploying account explicitly (otherwise `LogonUser` is
 used):
 
 ```powershell
-msiexec /i .\RustVPN-0.2.0-beta.2-x64.msi /qn /l*v install.log `
+msiexec /i .\RustVPN-0.2.0-x64.msi /qn /l*v install.log `
     RUSTVPN_USER="$env:USERDOMAIN\$env:USERNAME"
 ```
 
@@ -185,16 +185,15 @@ adapter creation; no reboot is required.
 
 ### Mapping
 
-Cargo/Tauri use `0.2.0-beta.2`; MSI `ProductVersion` is numeric:
+Cargo/Tauri use `0.2.0`; MSI `ProductVersion` is numeric:
 
 | Semantic version | MSI ProductVersion |
 | --- | --- |
-| `0.2.0-beta.2` | `0.1.99.1` |
 | `0.2.0` | `0.2.0.0` |
+| `0.2.0-beta.2` | `0.1.99.1` (previous beta) |
 | later beta | explicit increasing `-MsiVersion` |
 
-Pre-releases map below the corresponding stable release, so `0.2.0` upgrades
-`0.2.0-beta.2`. Windows Installer ignores the fourth field for ordering; if
+`0.2.0` upgrades the previous `0.2.0-beta.2` build. Windows Installer ignores the fourth field for ordering; if
 two pre-release builds must upgrade in a specific order, pass an increasing
 `-MsiVersion`. The semantic version is displayed in the Product name,
 `HKLM\Software\RustVPN\Client\Version`, the GUI, `docs\VERSION.txt` and the
@@ -328,7 +327,7 @@ hardening item.
 ## 7. Uninstall and what is preserved
 
 ```powershell
-msiexec /x .\RustVPN-0.2.0-beta.2-x64.msi /qn /l*v uninstall.log
+msiexec /x .\RustVPN-0.2.0-x64.msi /qn /l*v uninstall.log
 ```
 
 The MSI:
@@ -381,15 +380,15 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\verify-client-access.ps1
 
 # signing status
 & '<Windows SDK>\signtool.exe' verify /pa 'C:\Program Files\RustVPN\rustvpn-clientd.exe'
-& '<Windows SDK>\signtool.exe' verify /pa .\RustVPN-0.2.0-beta.2-x64.msi
+& '<Windows SDK>\signtool.exe' verify /pa .\RustVPN-0.2.0-x64.msi
 ```
 
 MSI static inspection (no service install):
 
 ```powershell
 .\packaging\windows\verify-msi.ps1 `
-    -MsiPath .\dist\windows\RustVPN-0.2.0-beta.2-x64.msi `
-    -ExpectedMsiVersion 0.1.99.1
+    -MsiPath .\dist\windows\RustVPN-0.2.0-x64.msi `
+    -ExpectedMsiVersion 0.2.0.0
 ```
 
 This performs `msiexec /a` extraction, checks the payload, and queries the

@@ -3,7 +3,7 @@
 > 日期：2026-11-26
 > 状态：调研完成，尚未实现
 > 目标：Windows 10/11 x64 桌面客户端（GUI + 本地服务）
-> 基线：`feature/client-ui`（v0.2.0-beta.2；复审修复见后续提交）
+> 基线：`feature/client-ui`（v0.2.0；复审修复见后续提交）
 > 原则：不改线协议、不改服务端、不破坏现有 Linux 客户端
 
 ---
@@ -404,11 +404,12 @@ Wintun 适配器 MTU 设置为 `ip_mtu`。Windows 应在 `ip_mtu < 576` 时拒�
 - 内容：PID + 进程创建时间、接口、Wintun 索引、地址、路由（dest/ifindex/
   next-hop/metric/kind）、接口 metric 原值、DNS 原值/应用值、NRPT
   DisplayName、IPv6 防火墙规则名。
-- 每完成一个可回滚操作就原子写状态（临时文件 + rename）。删除路由前重新
-  `Get-NetRoute` 核对完整四元组，并用 `Get-NetAdapter` 校验接口名，检测
-  Windows 接口索引复用（索引被其他适配器复用时跳过该接口上的路由/地址/
-  DNS/metric）；DNS 只在仍等于应用值时恢复；metric 只在仍是设置值时恢复；
-  NRPT/防火墙按唯一名称/DisplayName 删除。
+- 每完成一个可回滚操作就原子写状态（临时文件 + rename）。清理热路径
+  （路由/地址/接口 metric）通过 IP Helper MIB 表读取并删除，删除前重新核对
+  完整四元组；接口名通过 `GetIfTable2` alias 校验，检测 Windows 接口索引
+  复用（索引被其他适配器复用时跳过该接口上的路由/地址/DNS/metric）。NRPT、
+  DNS、防火墙仍通过 PowerShell；DNS 只在仍等于应用值时恢复；metric 只在仍是
+  设置值时恢复；NRPT/防火墙按唯一名称/DisplayName 删除。
 - daemon 启动（Engine 启动路径）读取状态：owner 仍存活则跳过；已死亡则只
   清理记录项并删除状态文件。正常断开/停止清理后删除状态文件。
 - 清理顺序：NRPT → DNS → 路由（先隧道、后防环）→ 地址 → 接口 metric →
@@ -507,7 +508,7 @@ Product/Feature/UpgradeCode 与打包资源布局；M5 需要服务注册、自�
 
 ### 8.4 版本、升级与签名
 
-- Cargo/Tauri `0.2.0-beta.2` → MSI `ProductVersion 0.1.99.1`；semver 保留在
+- Cargo/Tauri `0.2.0` → MSI `ProductVersion 0.2.0.0`；semver 保留在
   Product name、GUI、`HKLM\Software\RustVPN\Client\Version`、
   `docs\VERSION.txt` 与产物名。
 - `MajorUpgrade AllowSameVersionUpgrades="yes"`：同数字版本的 beta 重建可用

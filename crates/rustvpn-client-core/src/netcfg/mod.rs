@@ -37,6 +37,8 @@ pub struct NetOptions {
     pub no_host_dns: bool,
 }
 
+#[cfg(windows)]
+mod iphelper;
 #[cfg(unix)]
 mod linux;
 #[cfg(windows)]

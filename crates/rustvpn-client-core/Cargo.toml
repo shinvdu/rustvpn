@@ -32,4 +32,11 @@ windows-sys = { version = "0.61", features = [
     "Win32_Security_Authorization",
     "Win32_Storage_FileSystem",
     "Win32_System_Threading",
+    # IP Helper fast path for route/address/interface-metric cleanup.  The
+    # MIB_*_ROW2 types also require the Ndis (NET_LUID_LH) and WinSock
+    # (SOCKADDR_INET) features.
+    "Win32_NetworkManagement",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_Networking_WinSock",
 ] }
