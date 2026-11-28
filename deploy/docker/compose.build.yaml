@@ -1,0 +1,28 @@
+# Local source-build override.  Use together with compose.yaml:
+#
+#   docker compose --env-file .env -f compose.yaml -f compose.build.yaml build
+#   docker compose --env-file .env -f compose.yaml -f compose.build.yaml --profile admin up -d
+#
+# RUSTVPN_SOURCE_DIR must be the repository root when these files are copied
+# outside the checkout (quickstart.sh sets it for standalone runs).
+services:
+  server:
+    image: ${RUSTVPN_SERVER_IMAGE:-rustvpn-server:dev}
+    build:
+      context: ${RUSTVPN_SOURCE_DIR:-../..}
+      dockerfile: deploy/docker/Dockerfile.server
+      args:
+        VERSION: ${RUSTVPN_IMAGE_TAG:-dev}
+        HTTP_PROXY: ${HTTP_PROXY:-}
+        HTTPS_PROXY: ${HTTPS_PROXY:-}
+        NO_PROXY: ${NO_PROXY:-}
+  admind:
+    image: ${RUSTVPN_ADMIN_IMAGE:-rustvpn-admind:dev}
+    build:
+      context: ${RUSTVPN_SOURCE_DIR:-../..}
+      dockerfile: deploy/docker/Dockerfile.admind
+      args:
+        VERSION: ${RUSTVPN_IMAGE_TAG:-dev}
+        HTTP_PROXY: ${HTTP_PROXY:-}
+        HTTPS_PROXY: ${HTTPS_PROXY:-}
+        NO_PROXY: ${NO_PROXY:-}

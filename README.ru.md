@@ -127,6 +127,7 @@ alice:
 - [Справочник по конфигурации](docs/ru/configuration.md)
 - [Протокол](docs/ru/protocol.md)
 - [Эксплуатация и развёртывание](docs/ru/operations.md)
+- [Развёртывание в Docker / Compose (на английском)](docs/en/docker.md)
 - [Безопасность](docs/ru/security.md)
 - [FAQ](docs/ru/faq.md)
 - [Дизайн](docs/ru/design.md)

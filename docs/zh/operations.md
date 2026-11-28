@@ -4,6 +4,8 @@
 
 本页展示一种生产风格的 Linux 部署，使用 systemd、专用的非特权用户以及 Linux capabilities。同一套布局也适用于 RustVPN↔GoVPN 混合部署；只是可执行文件不同。
 
+如果希望一条命令拉起服务端并生成 Windows 客户端配置，见 [Docker / Compose 部署](docker.md)。
+
 ## 部署模型
 
 以非 root 服务用户运行两个守护进程，只授予它们所需的 capabilities：

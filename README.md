@@ -139,6 +139,7 @@ English pages:
 - [Configuration reference](docs/en/configuration.md)
 - [Protocol](docs/en/protocol.md)
 - [Operations and deployment](docs/en/operations.md)
+- [Docker / Compose deployment (one command + Windows client profile)](docs/en/docker.md)
 - [Security](docs/en/security.md)
 - [FAQ](docs/en/faq.md)
 - [Design](docs/en/design.md)

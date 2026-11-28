@@ -54,6 +54,17 @@ jobs:
           dpkg-deb --contents dist/rustvpn-client_*.deb
           rpm -qpl dist/rustvpn-client-*.rpm
 
+      - name: Check container deployment files
+        run: |
+          bash -n deploy/docker/quickstart.sh
+          bash -n deploy/docker/selftest.sh
+          bash -n deploy/docker/server-entrypoint.sh
+          docker compose --env-file deploy/docker/.env.example \
+            -f deploy/docker/compose.yaml config -q
+          docker compose --profile admin \
+            --env-file deploy/docker/.env.example \
+            -f deploy/docker/compose.yaml config -q
+
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 

@@ -1,0 +1,45 @@
+#
+# Admin image: rustvpn-admind + rustvpn-admin-passwd.  Runs as uid/gid 10001
+# without capabilities; it reaches the server over a Unix control socket on a
+# shared volume and writes peers.yaml through the mounted config directory.
+
+FROM rust:1.90-bookworm AS build
+WORKDIR /src
+COPY . .
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/src/target \
+    cargo build --locked --release -p rustvpn-admin --bins \
+ && install -Dm0755 target/release/rustvpn-admind /out/rustvpn-admind \
+ && install -Dm0755 target/release/rustvpn-admin-passwd /out/rustvpn-admin-passwd
+
+FROM debian:bookworm-slim
+
+ARG VERSION=0.0.0
+LABEL org.opencontainers.image.title="RustVPN admin daemon" \
+      org.opencontainers.image.description="RustVPN web administration daemon" \
+      org.opencontainers.image.version="$VERSION" \
+      org.opencontainers.image.licenses="GPL-3.0-or-later"
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates curl \
+ && rm -rf /var/lib/apt/lists/* \
+ && groupadd --system --gid 10001 rustvpn-adm \
+ && useradd --system --uid 10001 --gid 10001 --no-create-home \
+        --shell /usr/sbin/nologin rustvpn-admin \
+ && install -d -m 0755 -o root -g root /usr/share/rustvpn/scripts \
+ && install -d -m 0750 -o 10001 -g 10001 /var/lib/rustvpn /etc/rustvpn
+
+COPY --from=build /out/rustvpn-admind /out/rustvpn-admin-passwd /usr/local/bin/
+COPY --chmod=0644 COPYING /usr/share/doc/rustvpn/COPYING
+
+USER 10001:10001
+EXPOSE 8080
+
+ENTRYPOINT ["rustvpn-admind"]
+CMD ["-listen", "127.0.0.1:8080", \
+     "-control", "/run/rustvpn/control.sock", \
+     "-db", "/var/lib/rustvpn/admin.db", \
+     "-conf", "/etc/rustvpn/peers.yaml", \
+     "-backup-dir", "/var/lib/rustvpn/backups", \
+     "-script-dir", "/usr/share/rustvpn/scripts"]

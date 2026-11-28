@@ -1,0 +1,54 @@
+#
+# Data-plane image: rustvpn-server plus the client/verifier used by the
+# bootstrap script and for debugging.  TAP creation, forwarding and NAT all
+# happen inside the container network namespace; the host only publishes the
+# VPN port.
+
+FROM rust:1.90-bookworm AS build
+WORKDIR /src
+COPY . .
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/src/target \
+    cargo build --locked --release \
+        -p rustvpn-server -p rustvpn-client -p rustvpn-verifier \
+ && install -Dm0755 target/release/rustvpn-server /out/rustvpn-server \
+ && install -Dm0755 target/release/rustvpn-client /out/rustvpn-client \
+ && install -Dm0755 target/release/rustvpn-verifier /out/rustvpn-verifier
+
+FROM debian:bookworm-slim
+
+ARG VERSION=0.0.0
+LABEL org.opencontainers.image.title="RustVPN server" \
+      org.opencontainers.image.description="GoVPN 5.7-compatible RustVPN data plane" \
+      org.opencontainers.image.version="$VERSION" \
+      org.opencontainers.image.licenses="GPL-3.0-or-later"
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+        ca-certificates curl iproute2 iputils-ping nftables \
+ && rm -rf /var/lib/apt/lists/* \
+ && groupadd --system --gid 10001 rustvpn-adm \
+ && install -d -m 0755 -o root -g root /usr/share/rustvpn/scripts \
+ && install -d -m 0750 -o root -g 10001 /run/rustvpn /etc/rustvpn
+
+COPY --from=build /out/rustvpn-server /out/rustvpn-client /out/rustvpn-verifier /usr/local/bin/
+COPY --chmod=0755 deploy/docker/server-entrypoint.sh /usr/local/bin/server-entrypoint.sh
+COPY --chmod=0644 COPYING /usr/share/doc/rustvpn/COPYING
+
+# Docker's default seccomp profile may reject io_uring syscalls; the TAP
+# backend falls back to epoll when this is disabled.
+ENV GOVPN_IO_URING=0
+ENV RUSTVPN_NAT=1
+
+EXPOSE 1194/udp
+EXPOSE 1194/tcp
+
+ENTRYPOINT ["/usr/local/bin/server-entrypoint.sh"]
+CMD ["-bind", "0.0.0.0:1194", \
+     "-proto", "all", \
+     "-conf", "/etc/rustvpn/peers.yaml", \
+     "-stats", "127.0.0.1:1294", \
+     "-control", "/run/rustvpn/control.sock", \
+     "-control-group", "10001", \
+     "-script-dir", "/usr/share/rustvpn/scripts"]

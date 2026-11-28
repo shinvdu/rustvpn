@@ -6,6 +6,9 @@ This page shows a production-style Linux deployment with systemd, a
 dedicated unprivileged user and Linux capabilities. The same layout works
 for a RustVPN↔GoVPN mixed deployment; only the binary changes.
 
+For a one-command server plus generated Windows-client profile, see
+[Docker / Compose deployment](docker.md).
+
 ## Deployment model
 
 Run both daemons as a non-root service user with only the capabilities

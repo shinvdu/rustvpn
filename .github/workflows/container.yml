@@ -1,0 +1,119 @@
+name: Container images
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      publish_version:
+        description: "Cargo version to publish as a stable image tag (e.g. 0.2.0)"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: container-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: rustvpn-server
+            dockerfile: deploy/docker/Dockerfile.server
+          - image: rustvpn-admind
+            dockerfile: deploy/docker/Dockerfile.admind
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve image version
+        id: version
+        env:
+          REQUESTED: ${{ github.event.inputs.publish_version }}
+        run: |
+          set -eu
+          cargo_version="$(awk -F'"' '/^version = /{print $2; exit}' Cargo.toml)"
+          tag=""
+          stable=false
+          if [ -n "$REQUESTED" ]; then
+            if [ "$REQUESTED" != "$cargo_version" ]; then
+              echo "requested version $REQUESTED does not match Cargo.toml ($cargo_version)" >&2
+              exit 1
+            fi
+            tag="$cargo_version"
+            stable=true
+          elif [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            tag="${GITHUB_REF_NAME#v}"
+            if [ "$tag" != "$cargo_version" ]; then
+              echo "tag $GITHUB_REF_NAME does not match Cargo.toml ($cargo_version)" >&2
+              exit 1
+            fi
+            stable=true
+          else
+            tag="edge"
+          fi
+          case "$tag" in
+            *-*) stable=false ;;
+          esac
+          minor=""
+          if [ "$stable" = "true" ]; then minor="${tag%.*}"; fi
+          {
+            echo "tag=$tag"
+            echo "stable=$stable"
+            echo "minor=$minor"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Compute image tags
+        id: tags
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+          STABLE: ${{ steps.version.outputs.stable }}
+          MINOR: ${{ steps.version.outputs.minor }}
+          IMAGE: ${{ matrix.image }}
+        run: |
+          set -eu
+          base="ghcr.io/${GITHUB_REPOSITORY,,}/${IMAGE}"
+          {
+            echo "tags<<EOF"
+            echo "$base:$TAG"
+            echo "$base:sha-${GITHUB_SHA}"
+            if [ "$STABLE" = "true" ]; then
+              echo "$base:latest"
+              echo "$base:$MINOR"
+            fi
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.tags.outputs.tags }}
+          build-args: |
+            VERSION=${{ steps.version.outputs.tag }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.version=${{ steps.version.outputs.tag }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.licenses=GPL-3.0-or-later
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: true
+          sbom: true

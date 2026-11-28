@@ -52,6 +52,7 @@ RustVPN 是一个小型虚拟专用网守护进程，通过加密、认证的隧
 | [配置](configuration.md) | 所有 CLI 标志、`peers.yaml`、脚本、MTU/timeout/CPR/stats/proxy。 |
 | [协议](protocol.md) | 验证器/PAKE、握手消息、传输格式、noise、encless。 |
 | [运维](operations.md) | systemd 部署、capabilities、轮换、故障排查。 |
+| [Docker / Compose 部署](docker.md) | 一条命令拉起 server + admin，并生成 Windows 客户端 profile。 |
 | [安全](security.md) | 威胁模型、注意事项、密钥处理、加固清单。 |
 | [常见问题](faq.md) | 设计问题以及"何时该使用 X"的解答。 |
 | [设计](design.md) | 架构、数据路径、兼容性不变量、测试。 |

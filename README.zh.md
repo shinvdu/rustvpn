@@ -95,6 +95,7 @@ alice:
 - [配置参考](docs/zh/configuration.md)
 - [协议](docs/zh/protocol.md)
 - [运维与部署](docs/zh/operations.md)
+- [Docker / Compose 部署（一条命令 + Windows 客户端配置）](docs/zh/docker.md)
 - [安全](docs/zh/security.md)
 - [常见问题](docs/zh/faq.md)
 - [设计](docs/zh/design.md)

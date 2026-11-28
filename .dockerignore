@@ -1,0 +1,17 @@
+# Build context for the container images. Keep the Rust workspace and the
+# deployment files; exclude local build outputs, docs, and private notes.
+target/
+dist/
+.git/
+.github/
+prototypes/
+testdata/
+docs/
+packaging/
+scripts/
+DEPLOYMENT.local.md
+*.local.md
+*.xlsx
+*.pfx
+*.cer
+*.pass

@@ -77,6 +77,7 @@ Design goals, inherited from GoVPN:
 | [Configuration](configuration.md) | All CLI flags, `peers.yaml`, scripts, MTU/timeout/CPR/stats/proxy. |
 | [Protocol](protocol.md) | Verifier/PAKE, handshake messages, transport format, noise, encless. |
 | [Operations](operations.md) | systemd deployment, capabilities, rotation, troubleshooting. |
+| [Docker / Compose deployment](docker.md) | One command starts the server + admin and generates a Windows client profile. |
 | [Security](security.md) | Threat model, precautions, key handling, hardening checklist. |
 | [FAQ](faq.md) | Design questions and "when should I use X" answers. |
 | [Design](design.md) | Architecture, data path, compatibility invariants, tests. |

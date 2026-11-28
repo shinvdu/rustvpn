@@ -1,0 +1,90 @@
+name: ${RUSTVPN_PROJECT:-rustvpn}
+
+services:
+  server:
+    image: ${RUSTVPN_SERVER_IMAGE:-ghcr.io/shinvdu/rustvpn/rustvpn-server:0.2.0}
+    restart: unless-stopped
+    # Root inside the container is required to create the TAP and configure
+    # the namespace; the capability set is reduced to the minimum.
+    user: "0:0"
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+      # Group ownership of the control socket (-control-group 10001).
+      - CHOWN
+      # Root in the container has no DAC_OVERRIDE by default.  The admin
+      # daemon rewrites peers.yaml as uid 10001, and the server only needs to
+      # read it; READ_SEARCH is narrower than DAC_OVERRIDE.
+      - DAC_READ_SEARCH
+    security_opt:
+      - no-new-privileges:true
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    sysctls:
+      net.ipv4.ip_forward: "1"
+    environment:
+      GOVPN_IO_URING: "0"
+      RUSTVPN_NAT: "${RUSTVPN_NAT:-1}"
+      RUSTVPN_TUNNEL_POOL: "${RUSTVPN_TUNNEL_POOL:-10.88.0.0/16}"
+    ports:
+      - "${RUSTVPN_LISTEN_IP:-0.0.0.0}:${RUSTVPN_PORT:-1194}:1194/udp"
+      - "${RUSTVPN_LISTEN_IP:-0.0.0.0}:${RUSTVPN_PORT:-1194}:1194/tcp"
+    volumes:
+      - "${RUSTVPN_DATA_DIR:-./data}/conf:/etc/rustvpn:ro"
+      - "${RUSTVPN_DATA_DIR:-./data}/run:/run/rustvpn"
+    healthcheck:
+      test: ["CMD-SHELL", "rustvpn-server status --json -control /run/rustvpn/control.sock >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 5s
+    stop_grace_period: 20s
+
+  admind:
+    profiles: ["admin"]
+    image: ${RUSTVPN_ADMIN_IMAGE:-ghcr.io/shinvdu/rustvpn/rustvpn-admind:0.2.0}
+    restart: unless-stopped
+    # Host networking lets the daemon bind the host loopback; access it through
+    # an SSH tunnel or a TLS reverse proxy, never by publishing the port.
+    network_mode: host
+    user: "10001:10001"
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    depends_on:
+      server:
+        condition: service_started
+    volumes:
+      - "${RUSTVPN_DATA_DIR:-./data}/conf:/etc/rustvpn"
+      - "${RUSTVPN_DATA_DIR:-./data}/state:/var/lib/rustvpn"
+      - "${RUSTVPN_DATA_DIR:-./data}/run:/run/rustvpn"
+    command:
+      - "-listen"
+      - "127.0.0.1:${RUSTVPN_ADMIN_PORT:-8080}"
+      - "-control"
+      - "/run/rustvpn/control.sock"
+      - "-db"
+      - "/var/lib/rustvpn/admin.db"
+      - "-conf"
+      - "/etc/rustvpn/peers.yaml"
+      - "-disabled-conf"
+      - "/etc/rustvpn/peers.disabled.yaml"
+      - "-backup-dir"
+      - "/var/lib/rustvpn/backups"
+      - "-script-dir"
+      - "/usr/share/rustvpn/scripts"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:${RUSTVPN_ADMIN_PORT:-8080}/readyz >/dev/null"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 5s
