@@ -3,7 +3,7 @@
 > 日期：2026-11-26
 > 状态：调研完成，尚未实现
 > 目标：Windows 10/11 x64 桌面客户端（GUI + 本地服务）
-> 基线：`feature/client-ui`（v0.2.0-beta.1）
+> 基线：`feature/client-ui`（v0.2.0-beta.2；复审修复见后续提交）
 > 原则：不改线协议、不改服务端、不破坏现有 Linux 客户端
 
 ---
@@ -457,7 +457,7 @@ Wintun 适配器 MTU 设置为 `ip_mtu`。Windows 应在 `ip_mtu < 576` 时拒�
 
 选择 **独立 WiX 3.14 项目**（`packaging/windows/rustvpn-client.wxs`），
 不使用 NSIS，也不启用 Tauri bundler 的 WiX 模板。Tauri 模板拥有
-Product/Feature/UpgradeCode 与打包资源布局；M5 需要服务注册、延迟自启、
+Product/Feature/UpgradeCode 与打包资源布局；M5 需要服务注册、自动启动、
 失败恢复、组助手和升级停启顺序，独立 `.wxs` 更显式、可静态检查，并复用
 同一 GUI exe。`bundle.active` 保持 `false`。
 
@@ -507,7 +507,7 @@ Product/Feature/UpgradeCode 与打包资源布局；M5 需要服务注册、延�
 
 ### 8.4 版本、升级与签名
 
-- Cargo/Tauri `0.2.0-beta.1` → MSI `ProductVersion 0.1.99.0`；semver 保留在
+- Cargo/Tauri `0.2.0-beta.2` → MSI `ProductVersion 0.1.99.1`；semver 保留在
   Product name、GUI、`HKLM\Software\RustVPN\Client\Version`、
   `docs\VERSION.txt` 与产物名。
 - `MajorUpgrade AllowSameVersionUpgrades="yes"`：同数字版本的 beta 重建可用

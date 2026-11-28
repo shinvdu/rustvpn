@@ -38,7 +38,7 @@
 | M3 网络配置 | `cac143a`, `06a092b` | 完成 | 地址/路由/DNS/NRPT/IPv6 防护、防环路路由、ACL 受限的 netstate、崩溃清理。真实 Windows 契约缺陷已修复，分流隧道路由在 M6 中验证。 |
 | M4 GUI 适配 | `7b73a82` | 完成 | 配置 ACL、Credential Manager、HKCU 自启动、区域设置、命名管道信息、密码前守护进程身份校验。RDP 验证通过。 |
 | M5 打包 | `cb39124` | 完成 | MSI、LocalSystem 服务、RustVPN 组、进程查询 DACL、Wintun 固定、签名钩子。安装、同版本升级、卸载以及标准用户访问均已验证。 |
-| M6 加固 + E2E | `06a092b` … `ffe9657` | 基本完成 | 分流/全隧道 plain+noise、DNS/NRPT、IPv6 阻断、断连修复、rekey/重连、链路抖动、强杀恢复、fuzz、iperf3；VPS 全隧道互联网出口通过；Windows CI 已真实运行并通过。2026-11-27/28 三轮代码复审与 Windows 实机验证新增登记 WIN-025…052；其中 27 项已修复（跨用户守护进程冒充、状态/事件通道校验、既有 Wintun 清理、pipe 抢占、IPC 资源上限、空地址查询与卸载 cleanup 竞态等）；WIN-013/014/045 仍待专项。受条件阻塞的项列于下文。 |
+| M6 加固 + E2E | `06a092b` … `25426e3` | 基本完成 | 分流/全隧道 plain+noise、DNS/NRPT、IPv6 阻断、断连修复、rekey/重连、链路抖动、强杀恢复、fuzz、iperf3；VPS 全隧道互联网出口通过；Windows CI 已真实运行并通过。2026-11-27/28 三轮代码复审与 Windows 实机验证新增登记 WIN-025…052；其中 27 项已修复（跨用户守护进程冒充、状态/事件通道校验、既有 Wintun 清理、pipe 抢占、IPC 资源上限、空地址查询与卸载 cleanup 竞态等）；WIN-013/014/045 仍待专项。受条件阻塞的项列于下文。 |
 
 ## 3. 已在 Windows 上验证
 
@@ -51,9 +51,9 @@
 - **崩溃恢复：** 两次强制终止守护进程后，SCM 重启并执行启动时路由/netstate 清理；默认路由两次均正确。2026-11-28 VM：SCM 5.25 秒重启，netstate 12.34 秒后消失，物理默认路由保持（WIN-014 窗口仍约 12 秒）。
 - **性能：** 2026-11-28 VM split 隧道 forward iperf3 8 秒约 264 Mbit/s；此前反向约 150 Mbit/s 且出现重传（WIN-013），本次反向受测试环境限制未完成。
 - **互联网出口：** 全隧道经临时 VPS NAT 验证；`ifconfig.me` 返回 VPS 公网 IP，`example.com` HTTP 200，1 MiB 下载完整；VPS TAP/NAT/防火墙已清理。
-- **Windows CI：** `windows-client` workflow 已真实运行并通过（format/check/clippy/test/MSI/inspect/upload），commit `ffe9657`，run 45995988463。
+- **Windows CI：** `windows-client` workflow 曾真实运行并通过（format/check/clippy/test/MSI/inspect/upload），commit `ffe9657`，run 45995988463；后续复审提交尚待下一次 CI。
 - **自签 Authenticode：** `CN=RustVPN Development` 证书签名 GUI/daemon/MSI；导入 CER 到 VM Root + TrustedPublisher 后，`signtool verify /pa` 与 `Get-AuthenticodeSignature` 均为 Valid，服务/管道与 GUI 服务端身份校验通过。
-- **Fuzz：** 7 个确定性 shim fuzz 测试；`rustvpn-net` 报告 118 个通过测试。
+- **Fuzz：** 7 个确定性 shim fuzz 测试；Windows 10 物理机上 core/ipc/clientd/net 共 229 个测试通过（另有 1 个 manual Wintun smoke 以 `--ignored` 单独通过）。
 - **打包：** MSI 静态检查、真实安装、服务/组状态、标准用户管道访问、非成员拒绝、同版本升级、卸载并保留配置。2026-11-28 在 VM 重新验证：automatic 服务、owner SID `S-1-5-32-544` probe、Wintun smoke、split/full tunnel、`--cleanup` 等待 StopPending 约 15 秒后清空 netstate/anti-loop。
 
 ## 4. 未决排查
@@ -61,7 +61,7 @@
 | 问题 | 症状 | 下一步 |
 |---|---|---|
 | WIN-013 | 反向 iperf3 约 150 Mbit/s，出现 193 次重传 | 抓包、与 MSS clamp 对比、检查 Wintun RX/队列计数器 |
-| WIN-014 | 崩溃清理需约 10-15 秒才允许重连 | 替换或批量执行重度依赖 PowerShell 的启动清理；发布清理进度 |
+| WIN-014 | 2026-11-28 VM 实测约 12.3 秒清空 netstate（SCM 5.25 秒重启） | 替换或批量执行重度依赖 PowerShell 的启动清理；发布清理进度 |
 | WIN-027（剩余） | 服务被显式停止后，普通用户仍可抢占 global pipe | 已加 30×2s bind 重试；console 生产管道 guard 已在 VM 验证拒绝 |
 | WIN-045 | Windows 安全/并发 E2E 缺口 | 在自托管 runner 增加跨用户、假 pipe、既有 adapter、并发 shutdown 回归 |
 

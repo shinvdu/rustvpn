@@ -142,13 +142,13 @@ would fail closed. The grant adds no memory, handle or terminate rights.
 
 ## Version mapping
 
-Cargo/Tauri use `0.2.0-beta.1`; MSI `ProductVersion` must be numeric:
+Cargo/Tauri use `0.2.0-beta.2`; MSI `ProductVersion` must be numeric:
 
 | SemVer | MSI ProductVersion |
 | --- | --- |
-| `0.2.0-beta.1` | `0.1.99.0` (this release) |
+| `0.2.0-beta.2` | `0.1.99.1` (this release) |
 | `0.2.0` | `0.2.0.0` |
-| `0.2.0-beta.2` with `-MsiVersion 0.1.99.1` | `0.1.99.1` |
+| later beta | explicit increasing `-MsiVersion` |
 
 Pre-releases are deliberately below the stable release so `0.2.0` upgrades a
 beta. Windows Installer ignores the fourth field for ordering, so two betas
@@ -249,8 +249,8 @@ No service is installed by `verify-msi.ps1`:
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File packaging\windows\verify-msi.ps1 `
-    -MsiPath dist\windows\RustVPN-0.2.0-beta.1-x64.msi `
-    -ExpectedMsiVersion 0.1.99.0
+    -MsiPath dist\windows\RustVPN-0.2.0-beta.2-x64.msi `
+    -ExpectedMsiVersion 0.1.99.1
 ```
 
 It performs an administrative install (`msiexec /a`) into a temporary folder,
